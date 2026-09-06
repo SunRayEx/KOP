@@ -6,11 +6,15 @@ KOP 的音视频管线子系统，第一优先级。本文记录 MVP 已实现�
 
 - **图（Graph）**：节点 + 有向链路。节点实现（C++）经 `KopawNodeDesc` 注册；
   引擎（Rust）持有全部链路与队列。
-- **节点**：三种形态
+- **节点**：四种形态
   - **源节点**（无入边）：引擎线程运行其 `vtable.run`，主动生产（demuxer）；
-  - **响应式节点**：引擎线程从其唯一入边队列拉帧，调 `vtable.send`（解码器、音频汇聚）；
-  - **自驱动节点**（`self_driven`）：引擎线程运行 `run`，节点用 `kopaw_node_recv` 拉取
-    并自持节奏（视频渲染节点）。
+  - **响应式节点**：引擎线程从入边队列拉帧，调 `vtable.send`（解码器、音频汇聚）；
+    多入边响应式节点（P2/ABI 5.2，需提供 `vtable.send_port`）：引擎单线程轮询
+    各端口队列并按端口投递，节点内串行（混音/合流类节点）；
+  - **自驱动节点**（`self_driven`）：引擎线程运行 `run`，节点用 `kopaw_node_recv(_port)`
+    拉取并自持节奏（视频渲染节点）；
+  - **池调度模式**（`kopaw_graph_set_workers`）：单入边响应式节点改由共享
+    工作窃取线程池执行（串行化 drain），源/自驱动/多入边响应式节点仍各占一线程。
 - **帧（KopawFrame）**：跨 ABI 的独占所有权媒体帧。MVP 布局：
   视频 = RGBA8 打包（stride=width×4）；音频 = f32 交错（48kHz/立体声）。
   `pts`/`dts` 统一为微秒。媒体内存由 `uint64_t dma_buf_handle` 标识：CPU 帧
@@ -48,7 +52,10 @@ KOP 的音视频管线子系统，第一优先级。本文记录 MVP 已实现�
 **tee 与多出边**
 - 同一输出端口可 connect 多条边；emit 逐边阻塞投递（慢消费者整体背压），
   投递第 i>0 条边前 retain；retain 缺失且多边 → 丢弃帧并返回 E_INVALID。
-- 入边仍约束为单条（多入边混音与 pull 式调度属 P2）。
+- 多入边（P2）：每个输入端口至多一条入边；响应式节点多入边需提供
+  `send_port`（ABI 5.2 新增能力位 `KOPAW_CAP_MULTI_INPUT`），自驱动节点
+  直接 `kopaw_node_recv_port` 按端口拉取。EOS 按端口终结：非汇聚节点自行
+  向下游转发（合流节点在全部输入终结后才转发 EOS），汇聚节点延迟记账不变。
 
 **P2 插件与过滤/网络路径**
 - 插件 ABI 位于 `kopaw/abi/include/kopaw_plugin.h`：主/次版本、能力位、结构体大小和
@@ -65,8 +72,43 @@ KOP 的音视频管线子系统，第一优先级。本文记录 MVP 已实现�
 - 探测 = avcodec_get_hw_config 查 hw pix fmt + av_hwdevice_ctx_create；
 - 运行期回退：解码器可能在 hw 初始化失败后以纯软格式列表重新协商 get_format，
   回调接受首个软格式并动态关闭硬解帧路径（mpeg4@FFmpeg8 实测走此路径）；
-  HEVC/H.264 在 Intel TigerLake 上 VAAPI 真硬解直通（帧经
-  av_hwframe_transfer_data 拉回 NV12 → sws → RGBA；零拷贝直通属 P2）。
+  HEVC/H.264 在 Intel TigerLake 上 VAAPI 真硬解直通。
+
+**P2 调度演进与硬解零拷贝（ABI 5.2）**
+
+**多入边与 pull 式节点、工作窃取调度（kopaw-core 调度器演进）**
+- `KopawNodeVTable` 追加可选 `send_port(user, frame, port)`；声明 inputs>1 的
+  响应式节点必须提供。引擎为其单开一线程，轮询各端口有界队列（2ms 粒度）
+  并按端口调用回调——节点回调严格串行，与池模式 drain 的串行化约定一致。
+  池调度（`KOPAW_SCHED=pool`）下多入边节点仍占专线程；其余单入边响应式节点
+  进入 `NodeExec` 池执行体，工作窃取调度器行为不变（全局注入队列 → 本地 → 窃取）。
+- 自驱动节点多端口 pull（`kopaw_node_recv_port`）为既有能力，本轮补齐双端口
+  拉取与混流单测；单元测试覆盖：两源合流（send_port）、池模式多入边、
+  自驱动双端口、EOS 逐端口终结与零泄漏。
+- KopawFrame 追加 `drm_fourcc`（见下），帧结构仍按 `struct_size` 前缀兼容。
+
+**硬解零拷贝：hw frames → DMA-BUF 导出 → Vulkan YCbCr/KOPMS 导入**
+- `VaapiDmabufExporter`（`modules/ffmpeg/vaapi_export.cpp`）：解码表面经
+  `vaExportSurfaceHandle(DRM_PRIME_2, READ_ONLY | COMPOSED_LAYERS)` 导出为
+  单对象双平面 NV12/P010 DMA-BUF；导出前 `vaSyncSurface` 等待解码完成（VAAPI 无
+  sync_file 导出，acquire fence 置 NONE）；帧为 `KOPAW_MEMORY_DMABUF`，
+  携带 `drm_fourcc`/planes[]（fd/offset/stride/modifier）；
+- 表面生命周期：帧持有 `AVFrame` 克隆（`external_release`），最后一个 release
+  先关 fd 再归还解码器表面池——帧不回指节点；单对象布局校验失败/克隆失败
+  直接回退，绝不交付可能被复用的表面；
+- Vulkan 后端导入（`vulkan_backend.cpp::import_yuv`）：external memory fd 导入
+  （对导入 fd 做 `F_DUPFD_CLOEXEC`，避免与帧 release 的关闭双重 close）、
+  DRM modifier 显式布局、整图 YCbCr 视图和每帧导入；槽位复用时经 inflight
+  fence 保证旧导入的 GPU 使用结束后销毁。转换对象采用有限范围
+  BT.709（≥720 行）/BT.601，固定功能输出 RGB 后与 CPU RGBA 复用 `quad.frag`；
+- player `--zero-copy on|off|auto`（默认 auto）：仅在 Vulkan 本地渲染直连
+  或 KOPMS 直通（无滤镜/插件节点）时请求原生输出；`KOPAW_ZERO_COPY=0` 强制关闭。
+  VAAPI 导出失败后解码器永久回退 `av_hwframe_transfer_data` 软拷贝路径；
+  渲染端导入失败则当前帧返回错误，尚未实现运行时把已选原生路径重新协商为 CPU 路径；
+- `KopmsSinkNode` 识别 `KOPAW_MEMORY_DMABUF` 且有 `drm_fourcc` 的帧，直接把
+  planes/fence 包装为 BUS2LAYER `FRAME_SUBMIT`，不会先转成 RGBA 再二次导出；
+- CUVID 原生导出依赖 CUDA-EGL/DMA-BUF 互操作，暂留软拷贝回退；
+  其他 VAAPI 表面格式也走软拷贝回退。
 
 **延迟记账（音频尾部修复）**
 - 汇聚节点不再由引擎在 EOS 交付时自动计数，改为显式 `kopaw_node_sink_done`；
@@ -132,6 +174,35 @@ test_media.mkv (mpeg4+mp2)
 - 音频：SPSC 无锁环形缓冲（`kop/spsc_ring.h`），150ms 预缓冲后起播，
   回调内零锁零分配；欠载计一次告警。
 
+### Vulkan YCbCr 渲染
+
+KOPAW 的 NV12/P010 原生帧使用 `VkSamplerYcbcrConversion` 完成有限范围量化、
+色度重建和 YCbCr→RGB，随后与 RGBA 共用 `quad.frag`；KOPAW 不再使用
+`nv12.frag` 的位深/矩阵 push constants。该着色器仍会被嵌入，因为 KOPMS 使用
+RGB identity 的 YCbCr 转换提取/上采样平面，再在 shader 中应用矩阵。
+当前帧 ABI 未携带色彩元数据，沿用高度 ≥720 为 BT.709、其余为 BT.601
+的约定；这不等同于 FFmpeg 的默认矩阵，也不覆盖 full-range、BT.2020/HDR。
+
+- 设备显式启用 Vulkan 1.3 dynamic rendering 和可选的 sampler YCbCr
+  conversion；DMA-BUF、DRM modifier、foreign queue 扩展缺失时仍可渲染 CPU RGBA。
+- 按实际格式与 DRM modifier 查询采样、色度位置和外部内存导入能力，优先
+  midpoint 与线性过滤，能力不足时选择 cosited/nearest；NV12 与 P010 独立判断。
+- 按格式、modifier、BT.601/709 矩阵缓存转换对象、immutable sampler、布局、
+  管线及描述符池。池容量使用驱动报告的 `combinedImageSamplerDescriptorCount`，
+  交换链重建时同步重建 RGBA 和已缓存的 YCbCr 管线。
+- 导入接受单对象、双平面、显式 modifier（包括 LINEAR=0）、偶数尺寸且生产者
+  已完成同步的 NV12/P010。未知 modifier、多对象或外部 acquire fence 会明确拒绝，
+  不尝试猜测 optimal tiling。图像内存类型取 image requirements 与 fd properties
+  的交集，导入失败时关闭复制的 fd。
+- 每个飞行槽位持有原始帧引用，等待该槽位 fence 后释放，避免解码表面在 GPU
+  采样结束前被回收。图像通过 GENERAL 布局与 foreign queue ownership 转移交接。
+
+回归检查：`cmake --build --preset relwithdebinfo --target kopaw-vk-ycbcr-test`
+和 `ctest --test-dir build/relwithdebinfo -R '^kopaw-vk-ycbcr$' --output-on-failure`。
+该测试模拟驱动能力以覆盖格式独立性、modifier 查询、过滤回退、描述符计数和
+非法帧布局；真实硬解验证使用
+`KOPAW_HWACCEL=vaapi KOPAW_VK_VALIDATION=1 ./build/relwithdebinfo/kopaw/kopaw-player <vaapi-h264-or-hevc-media> --backend vulkan --zero-copy on --no-audio --duration 5`。
+
 ## 5. 停止与生命周期
 
 - 自然结束：全部汇聚节点各入边收到 EOS → 引擎置 FINISHED → 事件回调通知宿主；
@@ -141,16 +212,22 @@ test_media.mkv (mpeg4+mp2)
 - 契约红线见 `docs/architecture.md` 第 4 节（所有权违规是本 MVP 调试中实际踩过的坑，
   已用单元测试 + 端到端运行双重验证）。
 
-## 6. 已知限制（P1 刻意取舍；P3-M3 已消解零拷贝项）
+## 6. 已知限制（P1 刻意取舍；P2/P3 已消解项见上文）
 
-- 单入边（tee 广播已支持，多入边混音与 pull 式节点属 P2 演进）；
+- ~~单入边~~：P2 起响应式节点可声明多入边（`send_port`），自驱动节点多端口
+  `recv_port` 依旧可用；tee 广播保持不变；
 - 帧池对解码输出生效；demuxer 包帧仍为每包分配（体积小）；
-- ~~硬解帧经 av_hwframe_transfer_data 拉回系统内存~~：软解→Vulkan 导出→KOPMS
-  的零拷贝链路已通（P3-M3）；硬解器的原生 DMA-BUF 导出（VAAPI/CUVID）仍待接入；
+- VAAPI 硬解表面可原生导出单对象 NV12/P010 DMA-BUF，直通本地 Vulkan 或
+  KOPMS BUS；导出失败会回退软拷贝。当前本地渲染器尚不能在 DMA-BUF 导入失败后
+  动态切回 CPU 路径，因此 `auto` 不是所有 Vulkan 设备上的导入成功保证；
+- 当前 ABI 没有色彩范围、矩阵或 HDR 元数据，只能按高度选择 BT.601/709 的有限范围
+  转换；full-range、BT.2020 和 HDR 仍待协议与渲染路径共同扩展；
+- CUVID 原生导出（需 CUDA-EGL 互操作）与 NV12/P010 以外的原生表面格式待演进；
 - 图内仍未提供通用编码器节点；编码/封装目前集中在 `kopaw-transcode` 工具。
 - 网络输入已在 transcode 路径可用，复杂协议重连策略和生产级 jitter buffer 仍待演进。
 
 ## 7. 演进路线
 
-见 `docs/roadmap.md`（剩余 P2：多入边/工作窃取调度和硬解器原生 DMA-BUF 导出；
-P3 后续：多平面 YUV 导入、swapchain 流水化、DRM 直出真机验证）。
+见 `docs/roadmap.md`（P2 已完成：多入边/工作窃取调度、VAAPI 原生 DMA-BUF 导出和
+KOPAW YCbCr 导入；后续集中于 CUVID、色彩元数据/动态降级、swapchain 流水化和
+DRM 直出真机验证）。

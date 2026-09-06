@@ -503,11 +503,24 @@ bool make_frame_submit(const KopmsFrameDescriptor* frame, uint32_t frame_id,
     fds->clear();
     fds->reserve(frame->plane_count + 1);
     for (uint32_t i = 0; i < frame->plane_count; ++i) {
-        output->planes[i].fd_index = static_cast<int32_t>(fds->size());
         output->planes[i].offset = frame->planes[i].offset;
         output->planes[i].stride = frame->planes[i].stride;
         output->planes[i].modifier = frame->planes[i].modifier;
-        fds->push_back(frame->planes[i].fd);
+        // 多平面帧共享同一 DRM 对象（NV12 等）：相同 fd 只经 SCM_RIGHTS 发送
+        // 一次并复用 fd_index——否则接收端会为同一 buffer 物化出多个 fd，
+        // 无法识别"平面位于同一 DMA-BUF"的导入约束。
+        int32_t index = -1;
+        for (uint32_t j = 0; j < i; ++j) {
+            if (frame->planes[j].fd == frame->planes[i].fd) {
+                index = output->planes[j].fd_index;
+                break;
+            }
+        }
+        if (index < 0) {
+            index = static_cast<int32_t>(fds->size());
+            fds->push_back(frame->planes[i].fd);
+        }
+        output->planes[i].fd_index = index;
     }
     output->acquire_fence.kind = frame->acquire_fence.kind;
     output->acquire_fence.fd_index = -1;

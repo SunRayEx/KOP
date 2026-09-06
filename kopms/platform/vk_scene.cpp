@@ -24,6 +24,8 @@ extern const uint8_t kopaw_vert_spv[];
 extern const unsigned int kopaw_vert_spv_len;
 extern const uint8_t kopaw_frag_spv[];
 extern const unsigned int kopaw_frag_spv_len;
+extern const uint8_t kopaw_frag_nv12_spv[];
+extern const unsigned int kopaw_frag_nv12_spv_len;
 }
 
 namespace kopms {
@@ -50,7 +52,7 @@ bool vkfail(VkResult r, const char* what, std::string* error) {
     return true;
 }
 
-// DRM fourcc → VkFormat（M3 覆盖单平面 RGBA；多平面 YUV 留待后续）。
+// DRM fourcc → VkFormat（M3 单平面 RGBA；P2 起支持 NV12 两平面 YUV 导入）。
 bool drm_format_to_vk(uint32_t fourcc, VkFormat* out) {
     switch (fourcc) {
         case 0x34325258u:  // XR24 XRGB8888
@@ -61,9 +63,21 @@ bool drm_format_to_vk(uint32_t fourcc, VkFormat* out) {
         case 0x34324241u:  // AB24 ABGR8888（KOPAW 导出格式）
             *out = VK_FORMAT_R8G8B8A8_UNORM;
             return true;
+        case 0x3231564Eu:  // NV12（KOPAW VAAPI 解码原生导出，8bit）
+            *out = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+            return true;
+        case 0x30313050u:  // P010（HEVC Main10 等原生导出，10bit）
+            *out = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+            return true;
         default:
             return false;
     }
+}
+
+// 两平面 YUV 格式：需要双平面视图 + YUV 管线（vkCreateImage 走同一外部内存路径）。
+bool format_is_multiplane(uint32_t fourcc) {
+    return fourcc == 0x3231564Eu ||   // NV12
+           fourcc == 0x30313050u;     // P010
 }
 
 int dup_cloexec(int fd) {
@@ -86,6 +100,15 @@ struct VulkanScene::Impl {
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    // P2 两平面 YUV（NV12/P010）：VkSamplerYcbcrConversion（RGB_IDENTITY）
+    // 完成平面提取与色度上采样，采样返回 rgb=(Y,Cb,Cr)；每格式一套
+    // immutable-sampler 布局 + 管线（push constant 选位深/色域）。
+    VkSamplerYcbcrConversion ycbcr[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkSampler ycbcr_sampler[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSetLayout dsl_yuv[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipelineLayout pipeline_layout_yuv[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipeline pipeline_yuv[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    bool ycbcr_ok = false;
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
@@ -132,6 +155,8 @@ struct VulkanScene::Impl {
         uint32_t w = 0;
         uint32_t h = 0;
         bool layout_done = false;  // UNDEFINED→GENERAL 已转换
+        bool yuv = false;          // 两平面 YUV 导入（pipeline_yuv 绘制）
+        int32_t bits10 = 0;        // 1 = P010（10bit 量化）
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
@@ -248,58 +273,103 @@ struct VulkanScene::Impl {
                       "vkCreateRenderPass", error);
     }
 
-    bool create_pipeline(std::string* error) {
-        VkSamplerCreateInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        si.magFilter = VK_FILTER_LINEAR;
-        si.minFilter = VK_FILTER_LINEAR;
-        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (vkfail(vkCreateSampler(ctx.device, &si, nullptr, &sampler),
-                   "vkCreateSampler", error)) {
-            return false;
+    // P2：为 NV12/P010 创建 VkSamplerYcbcrConversion（RGB_IDENTITY：采样
+    // 返回 rgb=(Y,Cb,Cr)，色度上采样在固定功能完成）+ immutable 采样器布局。
+    // 任一格式缺 YCbCr 采样支持时整体禁用 YUV 导入路径（返回 false 不视为
+    // 致命，场景仍可处理 RGBA 帧）。
+    bool create_ycbcr(std::string* error) {
+        const VkFormat fmts[2] = {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+                                  VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16};
+        for (int i = 0; i < 2; ++i) {
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(ctx.physical, fmts[i], &fp);
+            constexpr VkFormatFeatureFlags need =
+                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+                VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT;
+            if ((fp.optimalTilingFeatures & need) == 0) {
+                KOP_LOG_INFO(kTag, "格式 0x%x 不支持 YCbCr 转换采样，YUV 导入禁用",
+                             static_cast<unsigned>(fmts[i]));
+                return false;
+            }
+            VkSamplerYcbcrConversionCreateInfo yci{};
+            yci.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
+            yci.format = fmts[i];
+            yci.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+            yci.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_FULL;  // identity 下不参与
+            yci.components = {VK_COMPONENT_SWIZZLE_IDENTITY,
+                              VK_COMPONENT_SWIZZLE_IDENTITY,
+                              VK_COMPONENT_SWIZZLE_IDENTITY,
+                              VK_COMPONENT_SWIZZLE_IDENTITY};
+            yci.xChromaOffset = VK_CHROMA_LOCATION_MIDPOINT;
+            yci.yChromaOffset = VK_CHROMA_LOCATION_MIDPOINT;
+            yci.chromaFilter = VK_FILTER_LINEAR;
+            yci.forceExplicitReconstruction = VK_FALSE;
+            if (vkfail(vkCreateSamplerYcbcrConversion(ctx.device, &yci, nullptr,
+                                                      &ycbcr[i]),
+                       "vkCreateSamplerYcbcrConversion", error)) {
+                return false;
+            }
+            VkSamplerYcbcrConversionInfo conv_info{};
+            conv_info.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+            conv_info.conversion = ycbcr[i];
+            VkSamplerCreateInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            si.pNext = &conv_info;
+            si.magFilter = VK_FILTER_LINEAR;
+            si.minFilter = VK_FILTER_LINEAR;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            if (vkfail(vkCreateSampler(ctx.device, &si, nullptr, &ycbcr_sampler[i]),
+                       "vkCreateSampler(ycbcr)", error)) {
+                return false;
+            }
+            // immutable sampler：带 ycbcr 转换的采样器必须以 immutable 形式
+            // 进描述符布局（规范要求）
+            VkDescriptorSetLayoutBinding bind{};
+            bind.binding = 0;
+            bind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bind.descriptorCount = 1;
+            bind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bind.pImmutableSamplers = &ycbcr_sampler[i];
+            VkDescriptorSetLayoutCreateInfo dli{};
+            dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            dli.bindingCount = 1;
+            dli.pBindings = &bind;
+            if (vkfail(vkCreateDescriptorSetLayout(ctx.device, &dli, nullptr,
+                                                   &dsl_yuv[i]),
+                       "vkCreateDescriptorSetLayout(yuv)", error)) {
+                return false;
+            }
         }
-        VkDescriptorSetLayoutBinding bind{};
-        bind.binding = 0;
-        bind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bind.descriptorCount = 1;
-        bind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        VkDescriptorSetLayoutCreateInfo dli{};
-        dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dli.bindingCount = 1;
-        dli.pBindings = &bind;
-        if (vkfail(vkCreateDescriptorSetLayout(ctx.device, &dli, nullptr, &dsl),
-                   "vkCreateDescriptorSetLayout", error)) {
-            return false;
+        return true;
+    }
+
+    // 从片段着色器 + 描述符布局装配管线（共享顶点着色器与固定功能状态）。
+    // push_bytes>0 时在管线布局上声明片段 stage 的 push constant 区。
+    bool build_pipeline(VkShaderModule vs, VkShaderModule fs,
+                        VkDescriptorSetLayout layout, uint32_t push_bytes,
+                        VkPipelineLayout* out_layout, VkPipeline* out_pipeline,
+                        std::string* error) {
+        VkPushConstantRange pc{};
+        if (push_bytes > 0) {
+            pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            pc.offset = 0;
+            pc.size = push_bytes;
         }
         VkPipelineLayoutCreateInfo pli{};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pli.setLayoutCount = 1;
-        pli.pSetLayouts = &dsl;
-        if (vkfail(vkCreatePipelineLayout(ctx.device, &pli, nullptr,
-                                          &pipeline_layout),
+        pli.pSetLayouts = &layout;
+        pli.pushConstantRangeCount = push_bytes > 0 ? 1u : 0u;
+        pli.pPushConstantRanges = push_bytes > 0 ? &pc : nullptr;
+        if (vkfail(vkCreatePipelineLayout(ctx.device, &pli, nullptr, out_layout),
                    "vkCreatePipelineLayout", error)) {
             return false;
         }
 
-        VkShaderModuleCreateInfo smci{};
-        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smci.codeSize = kopaw_vert_spv_len;
-        smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_vert_spv);
-        VkShaderModule vs = VK_NULL_HANDLE;
-        VkShaderModule fs = VK_NULL_HANDLE;
-        if (vkfail(vkCreateShaderModule(ctx.device, &smci, nullptr, &vs),
-                   "vkCreateShaderModule(vs)", error)) {
-            return false;
-        }
-        smci.codeSize = kopaw_frag_spv_len;
-        smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_frag_spv);
-        if (vkfail(vkCreateShaderModule(ctx.device, &smci, nullptr, &fs),
-                   "vkCreateShaderModule(fs)", error)) {
-            vkDestroyShaderModule(ctx.device, vs, nullptr);
-            return false;
-        }
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -349,15 +419,79 @@ struct VulkanScene::Impl {
         pi.pMultisampleState = &ms;
         pi.pColorBlendState = &cb;
         pi.pDynamicState = &dyn;
-        pi.layout = pipeline_layout;
+        pi.layout = *out_layout;
         pi.renderPass = render_pass;
-        const bool failed = vkfail(vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE,
-                                                             1, &pi, nullptr,
-                                                             &pipeline),
-                                   "vkCreateGraphicsPipelines", error);
+        return !vkfail(vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &pi,
+                                                 nullptr, out_pipeline),
+                       "vkCreateGraphicsPipelines", error);
+    }
+
+    bool create_pipeline(std::string* error) {
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkfail(vkCreateSampler(ctx.device, &si, nullptr, &sampler),
+                   "vkCreateSampler", error)) {
+            return false;
+        }
+        VkDescriptorSetLayoutBinding bind{};
+        bind.binding = 0;
+        bind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bind.descriptorCount = 1;
+        bind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo dli{};
+        dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dli.bindingCount = 1;
+        dli.pBindings = &bind;
+        if (vkfail(vkCreateDescriptorSetLayout(ctx.device, &dli, nullptr, &dsl),
+                   "vkCreateDescriptorSetLayout", error)) {
+            return false;
+        }
+        // 两平面 YUV：per-format ycbcr 转换（RGB_IDENTITY）+ immutable 采样器
+        ycbcr_ok = create_ycbcr(error);
+
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = kopaw_vert_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_vert_spv);
+        VkShaderModule vs = VK_NULL_HANDLE;
+        VkShaderModule fs = VK_NULL_HANDLE;
+        VkShaderModule fs_yuv = VK_NULL_HANDLE;
+        if (vkfail(vkCreateShaderModule(ctx.device, &smci, nullptr, &vs),
+                   "vkCreateShaderModule(vs)", error)) {
+            return false;
+        }
+        smci.codeSize = kopaw_frag_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_frag_spv);
+        if (vkfail(vkCreateShaderModule(ctx.device, &smci, nullptr, &fs),
+                   "vkCreateShaderModule(fs)", error)) {
+            vkDestroyShaderModule(ctx.device, vs, nullptr);
+            return false;
+        }
+        smci.codeSize = kopaw_frag_nv12_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_frag_nv12_spv);
+        if (vkfail(vkCreateShaderModule(ctx.device, &smci, nullptr, &fs_yuv),
+                   "vkCreateShaderModule(fs_yuv)", error)) {
+            vkDestroyShaderModule(ctx.device, vs, nullptr);
+            vkDestroyShaderModule(ctx.device, fs, nullptr);
+            return false;
+        }
+        const bool ok_rgba = build_pipeline(vs, fs, dsl, 0, &pipeline_layout,
+                                            &pipeline, error);
+        bool ok_yuv = ok_rgba;
+        for (int i = 0; ok_yuv && ycbcr_ok && i < 2; ++i) {
+            ok_yuv = build_pipeline(vs, fs_yuv, dsl_yuv[i], 8,
+                                    &pipeline_layout_yuv[i], &pipeline_yuv[i],
+                                    error);
+        }
         vkDestroyShaderModule(ctx.device, vs, nullptr);
         vkDestroyShaderModule(ctx.device, fs, nullptr);
-        return failed;  // vkfail 惯例：true = 失败
+        vkDestroyShaderModule(ctx.device, fs_yuv, nullptr);
+        return !(ok_rgba && ok_yuv);  // 惯例：true = 失败
     }
 
     bool create_target(Target& t, std::string* error) {
@@ -591,7 +725,15 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
 #endif
 
     if (!vkutil::create_instance(instance_exts, &s.ctx.instance, error)) return true;
-    if (!vkutil::pick_and_create_device(device_exts, &s.ctx, error)) return true;
+    // P2：NV12 解码帧直通需要 DRM modifier 导入；设备不支持时降级重试
+    // （仅 LINEAR modifier 可导入，KOPAW 直通帧将按格式拒收并回退）。
+    std::vector<const char*> full_exts = device_exts;
+    full_exts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    if (!vkutil::pick_and_create_device(full_exts, &s.ctx, error)) {
+        KOP_LOG_WARN(kTag, "DRM modifier 导入不可用，降级无 modifier 设备（%s）",
+                     error ? error->c_str() : "");
+        if (!vkutil::pick_and_create_device(device_exts, &s.ctx, error)) return true;
+    }
     s.queue = s.ctx.graphics_queue;
 
 #ifdef KOPMS_SCENE_WINDOW
@@ -632,7 +774,8 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
 
     VkDescriptorPoolSize ps{};
     ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps.descriptorCount = 64;
+    // 单平面 RGBA 与两平面 YUV 集合均为 1 绑定（immutable 采样器）
+    ps.descriptorCount = 128;
     VkDescriptorPoolCreateInfo dpi{};
     dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpi.maxSets = 64;
@@ -711,6 +854,20 @@ void VulkanScene::shutdown() {
     if (s.composite_fence) vkDestroyFence(s.ctx.device, s.composite_fence, nullptr);
     if (s.dpool) vkDestroyDescriptorPool(s.ctx.device, s.dpool, nullptr);
     if (s.pipeline) vkDestroyPipeline(s.ctx.device, s.pipeline, nullptr);
+    for (int i = 0; i < 2; ++i) {
+        if (s.pipeline_yuv[i]) vkDestroyPipeline(s.ctx.device, s.pipeline_yuv[i], nullptr);
+        if (s.pipeline_layout_yuv[i]) {
+            vkDestroyPipelineLayout(s.ctx.device, s.pipeline_layout_yuv[i], nullptr);
+        }
+        if (s.dsl_yuv[i]) vkDestroyDescriptorSetLayout(s.ctx.device, s.dsl_yuv[i], nullptr);
+        if (s.ycbcr_sampler[i]) vkDestroySampler(s.ctx.device, s.ycbcr_sampler[i], nullptr);
+        if (s.ycbcr[i]) vkDestroySamplerYcbcrConversion(s.ctx.device, s.ycbcr[i], nullptr);
+        s.pipeline_yuv[i] = VK_NULL_HANDLE;
+        s.pipeline_layout_yuv[i] = VK_NULL_HANDLE;
+        s.dsl_yuv[i] = VK_NULL_HANDLE;
+        s.ycbcr_sampler[i] = VK_NULL_HANDLE;
+        s.ycbcr[i] = VK_NULL_HANDLE;
+    }
     if (s.pipeline_layout) {
         vkDestroyPipelineLayout(s.ctx.device, s.pipeline_layout, nullptr);
     }
@@ -791,6 +948,8 @@ bool VulkanScene::submit(uint64_t window_id, const ImportRequest& request,
     item.frame_id = request.frame_id;
     item.w = request.width;
     item.h = request.height;
+    item.yuv = format_is_multiplane(request.format);
+    item.bits10 = request.format == 0x30313050u ? 1 : 0;  // P010 → 10bit
 
     VkImageCreateInfo ii{};
     ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -867,39 +1026,87 @@ bool VulkanScene::submit(uint64_t window_id, const ImportRequest& request,
         s.destroy_item_resources(&item);
         return false;
     }
-    VkImageViewCreateInfo vi{};
-    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    vi.image = item.image;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = format;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkfail(vkCreateImageView(s.ctx.device, &vi, nullptr, &item.view),
-               "vkCreateImageView(import)", error)) {
-        s.destroy_item_resources(&item);
-        return false;
+    if (!item.yuv) {
+        // 单平面 RGBA：整图视图 + 单绑定描述符
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image = item.image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkfail(vkCreateImageView(s.ctx.device, &vi, nullptr, &item.view),
+                   "vkCreateImageView(import)", error)) {
+            s.destroy_item_resources(&item);
+            return false;
+        }
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = s.dpool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &s.dsl;
+        if (vkfail(vkAllocateDescriptorSets(s.ctx.device, &dai, &item.dset),
+                   "vkAllocateDescriptorSets(import)", error)) {
+            s.destroy_item_resources(&item);
+            return false;
+        }
+        VkDescriptorImageInfo dii{};
+        dii.sampler = s.sampler;
+        dii.imageView = item.view;
+        dii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = item.dset;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &dii;
+        vkUpdateDescriptorSets(s.ctx.device, 1, &write, 0, nullptr);
+    } else {
+        if (!s.ycbcr_ok) {
+            s.destroy_item_resources(&item);
+            if (error) *error = "场景缺 YCbCr 转换支持，无法导入两平面 YUV 帧";
+            return false;
+        }
+        const int fi = item.bits10 ? 1 : 0;
+        // 整图视图（COLOR aspect 覆盖两平面）挂 ycbcr 转换：平面提取与色度
+        // 上采样由采样器固定功能完成
+        VkSamplerYcbcrConversionInfo conv_info{};
+        conv_info.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+        conv_info.conversion = s.ycbcr[fi];
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.pNext = &conv_info;
+        vi.image = item.image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkfail(vkCreateImageView(s.ctx.device, &vi, nullptr, &item.view),
+                   "vkCreateImageView(yuv import)", error)) {
+            s.destroy_item_resources(&item);
+            return false;
+        }
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = s.dpool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &s.dsl_yuv[fi];
+        if (vkfail(vkAllocateDescriptorSets(s.ctx.device, &dai, &item.dset),
+                   "vkAllocateDescriptorSets(yuv)", error)) {
+            s.destroy_item_resources(&item);
+            return false;
+        }
+        VkDescriptorImageInfo dii{};
+        dii.imageView = item.view;  // immutable sampler，无需填 sampler
+        dii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = item.dset;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &dii;
+        vkUpdateDescriptorSets(s.ctx.device, 1, &write, 0, nullptr);
     }
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = s.dpool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &s.dsl;
-    if (vkfail(vkAllocateDescriptorSets(s.ctx.device, &dai, &item.dset),
-               "vkAllocateDescriptorSets(import)", error)) {
-        s.destroy_item_resources(&item);
-        return false;
-    }
-    VkDescriptorImageInfo dii{};
-    dii.sampler = s.sampler;
-    dii.imageView = item.view;
-    dii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = item.dset;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &dii;
-    vkUpdateDescriptorSets(s.ctx.device, 1, &write, 0, nullptr);
 
     s.pending.emplace(window_id, item);
     s.stats.import_us_total += static_cast<uint64_t>(now_us() - import_begin);
@@ -985,7 +1192,6 @@ bool VulkanScene::render(const std::vector<LayoutItem>& layout_items,
                      [](const LayoutItem* a, const LayoutItem* b) {
                          return a->z < b->z;
                      });
-    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline);
     std::vector<Impl::Item> drawn;
     if (getenv("KOPMS_RELEASE_DEBUG") && !order.empty()) {
         // 布局外挂起项检测：window 在 pending 但不在 layout → 永不绘制
@@ -1033,8 +1239,23 @@ bool VulkanScene::render(const std::vector<LayoutItem>& layout_items,
         VkRect2D scissor{{li->rect.x, li->rect.y}, {w, h}};
         vkCmdSetViewport(s.cmd, 0, 1, &viewport);
         vkCmdSetScissor(s.cmd, 0, 1, &scissor);
-        vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                s.pipeline_layout, 0, 1, &item.dset, 0, nullptr);
+        if (item.yuv) {
+            const int fi = item.bits10 ? 1 : 0;
+            vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              s.pipeline_yuv[fi]);
+            vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    s.pipeline_layout_yuv[fi], 0, 1, &item.dset,
+                                    0, nullptr);
+            // 色域：HD（≥720 行）按 BT.709，其余按 BT.601（与 KOPAW 后端一致）
+            const int32_t pc_data[2] = {item.bits10, item.h >= 720 ? 1 : 0};
+            vkCmdPushConstants(s.cmd, s.pipeline_layout_yuv[fi],
+                               VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc_data),
+                               pc_data);
+        } else {
+            vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline);
+            vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    s.pipeline_layout, 0, 1, &item.dset, 0, nullptr);
+        }
         vkCmdDraw(s.cmd, 4, 1, 0, 0);
         drawn.push_back(item);
     }

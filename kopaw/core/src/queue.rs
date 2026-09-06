@@ -74,7 +74,13 @@ pub(crate) struct FrameQueue {
 impl FrameQueue {
     pub fn new(cap: u32, state: Arc<AtomicU8>) -> Self {
         let (tx, rx) = crossbeam_channel::bounded(cap.max(1) as usize);
-        FrameQueue { cap: cap.max(1) as usize, tx, rx, state, stats: QueueStats::default() }
+        FrameQueue {
+            cap: cap.max(1) as usize,
+            tx,
+            rx,
+            state,
+            stats: QueueStats::default(),
+        }
     }
 
     fn note_enqueue(&self) {

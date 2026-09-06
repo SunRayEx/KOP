@@ -3,6 +3,8 @@
 // 数据面：引擎投递 CPU RGBA 帧 → VulkanDmabufExporter 上传为可导出
 // VkImage（KOPAW_MEMORY_VULKAN）→ KopmsFrameDescriptor 包裝 → BUS2LAYER
 // FRAME_SUBMIT（planes/acquire fence 经 SCM_RIGHTS 过 socket）。
+// P2 起支持原生直通：KOPAW_MEMORY_DMABUF 帧（VAAPI 解码导出的 NV12/P010）直接
+// 包装提交，不再经过 CPU RGBA 中转与二次导出；CPU 帧路径保持不变。
 // 生命周期：FRAME_RELEASE 到达时沿 descriptor.release → KopawFrame.release
 // 逐层归还，最后一个引用把图像还给导出器空闲池并关闭 fd。
 // 回压：在飞帧数达 max_in_flight 时 send 阻塞泵 FRAME_RELEASE，引擎队列
@@ -68,6 +70,7 @@ private:
     Options options_;
     std::unique_ptr<Impl> impl_;
     VulkanDmabufExporter exporter_;
+    bool exporter_ready_ = false;  // CPU 帧路径需要；直通帧不依赖
     KopawGraph* graph_ = nullptr;
     uint32_t node_id_ = 0;
     bool connected_ = false;

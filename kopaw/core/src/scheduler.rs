@@ -28,8 +28,7 @@ impl Scheduler {
         let mut handles = Vec::with_capacity(n);
         // 每工作者一个本地队列（先建好再取 stealer，然后移动进线程）
         let mut local_workers: Vec<Worker<Job>> = (0..n).map(|_| Worker::new_fifo()).collect();
-        let stealers: Vec<Stealer<Job>> =
-            local_workers.iter().map(|w| w.stealer()).collect();
+        let stealers: Vec<Stealer<Job>> = local_workers.iter().map(|w| w.stealer()).collect();
 
         let sched = Arc::new(Scheduler {
             global,
@@ -64,8 +63,12 @@ impl Scheduler {
             return;
         }
         self.stop.store(true, Ordering::Release);
-        let handles: Vec<_> =
-            self.handles.lock().unwrap_or_else(|p| p.into_inner()).drain(..).collect();
+        let handles: Vec<_> = self
+            .handles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect();
         for h in handles {
             let _ = h.join();
         }

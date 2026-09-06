@@ -49,6 +49,10 @@ public:
     virtual void shutdown() = 0;
 
     virtual const char* name() const = 0;
+
+    // 是否支持直接消费外部内存帧（KOPAW_MEMORY_DMABUF）。
+    // player 用它决定是否让解码器走原生零拷贝输出（P2）。
+    virtual bool supports_dmabuf() const { return false; }
 };
 
 // 工厂：name 为 "vulkan"/"opengl"。

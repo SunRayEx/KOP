@@ -228,6 +228,8 @@ AddFB2 + atomic page-flip，flip 完成事件到达后场景才释放参与合�
 KOPAW 管线（kopms_sink 节点）
     CPU RGBA → VulkanDmabufExporter（vk_dma_export）
         导出 VkImage：LINEAR modifier DMA-BUF + sync-fence（KOPAW_MEMORY_VULKAN）
+    VAAPI 原生解码帧（NV12/P010）
+        → 直接复用 DMA-BUF planes（无需 RGBA 中转或二次导出）
     BUS2LAYER FRAME_SUBMIT（planes/fence 经 SCM_RIGHTS）
         → KOPMS-S handler：窗口绑定（WINDOW_ATTACH 或隐式窗口）
         → VulkanScene::submit（vkImportMemoryFdKHR + fence 有界等待）
@@ -254,7 +256,21 @@ DRM 直出模式
   `get_release` 请求按最近一次合成 fence 回 `fenced_release`（合成未发生则
   `immediate_release`）。
 - KOPAW 侧 `KopmsSinkNode`（`--kopms-bus`）：导出图像池上限即在飞上限，send 阻塞
-  泵 FRAME_RELEASE 形成生产端背压；有界 500ms 超时防止图停止时挂死。
+  泵 FRAME_RELEASE 形成生产端背压；CPU RGBA 使用导出器，带 `drm_fourcc` 的
+  `KOPAW_MEMORY_DMABUF` 帧直接封装提交；有界 500ms 超时防止图停止时挂死。
+
+**多平面 YUV 导入（P2）**
+
+- `VulkanScene::submit` 支持单对象、双平面 NV12（8-bit）和 P010（10-bit）DMA-BUF；
+  描述符当前要求两个平面 fd 相同。格式、planes、offset、stride 和 modifier 仍经
+  `KopmsFrameDescriptor`/Wayland dmabuf 的原有入口传递。
+- Vulkan 的 YCbCr conversion 以 RGB identity 模型完成平面提取与色度上采样；
+  `nv12.frag` 再按 push constant 的位深及高度（≥720 为 BT.709，否则 BT.601）
+  应用有限范围 YCbCr→RGB 矩阵。它与 KOPAW 本地渲染器的“固定功能完成完整
+  BT.601/709 转换、复用 `quad.frag`”不同，不能把两者的管线和色彩元数据能力混为一谈。
+- YUV 导入需要场景设备具备 YCbCr conversion；有 modifier 时还依赖 DRM modifier
+  导入能力。acquire sync-fence 在导入前有界等待；VAAPI 导出帧已由生产端
+  `vaSyncSurface` 同步，因此携带 `KOPAW_SYNC_FENCE_NONE`。
 
 能力协商（协议 minor 1.1，32 字节头/双 lane/SCM_RIGHTS 不变）：
 
@@ -264,9 +280,9 @@ DRM 直出模式
 - `KOPMS_CONTROL_WINDOW_ATTACH`（operation 7）：owner 会话把窗口绑定为自己的
   native 帧目标，会话断开自动解绑。
 
-已知边界：多平面 YUV（NV12 等）暂不支持导入（单 VkImage 只能对应一份内存）；
-窗口模式 swapchain 为串行呈现（M4 验证基线）；DRM 直出的真机 flip 验证需要
-logind 会话或 vkms。
+已知边界：多平面图像目前只接受单对象双平面 NV12/P010；色彩范围、矩阵和 HDR
+元数据尚未通过 descriptor/BUS 传递。窗口模式 swapchain 为串行呈现（M4 验证基线）；
+DRM 直出的真机 flip 验证需要 logind 会话或 vkms。
 
 ## 验证
 
@@ -283,7 +299,12 @@ BUS2LAYER 与 M3/M4 协议自测不依赖 X11/GPU（Vulkan 回环测试无 DMA-B
 ./build/relwithdebinfo/kopms/kopms-bus-test
 ./build/relwithdebinfo/kopms/kopms-m34-protocol-test
 ./build/relwithdebinfo/kopms/kopms-vk-dmabuf-test
+./build/relwithdebinfo/kopms/kopms-vk-nv12-scene-test
 ```
+
+`kopms-vk-nv12-scene-test` 创建实际的 LINEAR NV12 DMA-BUF，经与 BUS 相同的
+`VulkanScene` 导入/合成路径回读 BT.601 有限范围结果；没有 DMA-BUF 能力的驱动以
+退出码 77 跳过。
 
 零拷贝基准（五项指标，JSON 输出）：
 
@@ -311,7 +332,8 @@ WAYLAND_DISPLAY=kop-0 ./build/relwithdebinfo/kopms/kopms-test-client 5
 
 ## 后续里程碑
 
-- 多平面 YUV（NV12）导入与色彩转换着色器；
+- 色彩范围、矩阵、传递函数/HDR 元数据的 descriptor/BUS 协商；KOPMS YUV 路径
+  仍使用 RGB identity + shader 矩阵，后续可与 KOPAW 的固定功能转换策略统一；
 - 窗口模式 swapchain 流水化（多帧 in-flight）与 presentation-time 反馈；
 - DRM 直出合成结果的真机 page-flip 验证（vkms / logind 双显卡 PRIME）；
 - KOPMS-S/C 的 descriptor 与 release 契约保持为 Vulkan/DRM 的上游边界。

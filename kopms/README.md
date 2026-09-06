@@ -25,6 +25,10 @@ KOPAW 仍是系统的第一优先级。
   `platform/vk_scene.cpp` 的 Vulkan GPU 场景：DMA-BUF 导入、多窗口合成、每窗口一帧
   回压，present/fence（直出为 page-flip）完成后才释放。不会复用 M1 的 CPU
   `wl_shm` buffer。
+- 场景支持 RGBA 与单对象双平面 NV12/P010 DMA-BUF；KOPAW 的 VAAPI 原生帧可由
+  `KopmsSinkNode` 直接提交 BUS。YUV 路径用 YCbCr conversion 提取/上采样平面，
+  再由 `nv12.frag` 处理有限范围 BT.601/709 矩阵；完整约束见
+  `docs/kopms-design.md`。
 - `--probe-drm` 会枚举 connector/encoder/CRTC/primary plane，并报告 atomic/universal-plane
   能力；它不会取得 DRM master、执行 modeset 或提交 page-flip。`--enable-input` 只绑定
   seat 并排空事件，不注入输入。
@@ -85,5 +89,6 @@ KOPMS-C 协议探测与 M3/M4 自测：
 ./build/relwithdebinfo/kopms/kopms-bus-test
 ./build/relwithdebinfo/kopms/kopms-m34-protocol-test
 ./build/relwithdebinfo/kopms/kopms-vk-dmabuf-test   # 无 Vulkan DMA-BUF 时跳过
+./build/relwithdebinfo/kopms/kopms-vk-nv12-scene-test # NV12 导入/合成/回读，无能力时跳过
 ./build/relwithdebinfo/kopms/kopms-dmabuf-bench     # 零拷贝基准（JSON）
 ```

@@ -60,11 +60,13 @@ cargo test                             # kopaw-core 单元测试（在 kopaw/cor
    （引擎负责释放）——**禁止"先释放再返回非 OK"**。
 2. **ABI 头文件只由 cbindgen 生成**（`kopaw/core/cbindgen.toml`），禁止手改；
    重新生成命令见 toml 头部注释。函数指针类型必须内联书写（cbindgen 限制）。
-   当前 ABI 为 5.1（新增 KOPAW_MEMORY_VULKAN 与 KOPAW_CAP_VULKAN_EXTERNAL）；媒体内存
-   统一由 `uint64_t dma_buf_handle` 标识，插件还需协商次版本和能力位。CPU 帧的句柄
-   只允许在当前进程内解码为地址别名，DMA-BUF/Vulkan external memory 跨进程必须由
-   协议层传递 FD。插件输出节点的 `bind_output` 在图注册后接收真实端口句柄，
-   Rust 引擎与 C++ 节点基于同一契约构建。
+   当前 ABI 为 5.2（在 Vulkan external memory 契约之上新增
+   `KOPAW_CAP_MULTI_INPUT`/`send_port` 和多平面 DMA-BUF 的 `drm_fourcc`）；
+   媒体内存统一由 `uint64_t dma_buf_handle` 标识，插件还需协商次版本和能力位。
+   CPU 帧的句柄只允许在当前进程内解码为地址别名，DMA-BUF/Vulkan external memory
+   跨进程必须由协议层传递 FD。原生 YUV 帧还必须给出 fourcc、每平面的
+   fd/offset/stride/modifier，消费者不得从尺寸或内存类型猜测格式。插件输出节点的
+   `bind_output` 在图注册后接收真实端口句柄，Rust 引擎与 C++ 节点基于同一契约构建。
 3. **FFmpeg 8 头文件不再自带 extern "C"**：C++ 包含时必须自行包裹；
    `kopaw_abi.h`/portaudio.h/GLFW 自带保护，**绝不能再包一层**。
 4. 图运行期（start 之后）不允许改图；EOS 经帧标志（`KOPAW_FRAME_FLAG_EOS`）在

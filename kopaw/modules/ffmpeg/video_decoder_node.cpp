@@ -4,6 +4,10 @@
 
 #include <cstring>
 
+#if KOPAW_HAVE_LIBVA
+#include <libavutil/hwcontext_vaapi.h>
+#endif
+
 #include "../frame.hpp"
 #include "kop/log.h"
 
@@ -167,6 +171,10 @@ int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
     if (!hw_active_ || raw->format != hw_.hw_pix_fmt) {
         return emit_converted(raw);
     }
+    // P2 硬解零拷贝：优先原生 DMA-BUF 导出（VAAPI），失败回退拉回路径
+    if (OwnedFrame* native = try_export_native(raw)) {
+        return kopaw_graph_emit(g_, out_, native->ptr());
+    }
     // 硬解帧在加速器内存：拉回系统内存（NV12，转换交给 sws）
     AVFrame* sw = av_frame_alloc();
     if (!sw) return KOPAW_E_GENERIC;
@@ -179,6 +187,43 @@ int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
     int32_t rc = emit_converted(sw);
     av_frame_free(&sw);
     return rc;
+}
+
+OwnedFrame* VideoDecoderNode::try_export_native(AVFrame* raw) {
+#if KOPAW_HAVE_LIBVA
+    if (!native_output_ || native_failed_) return nullptr;
+    const char* zc = getenv("KOPAW_ZERO_COPY");
+    if (zc && zc[0] == '0') return nullptr;
+    if (!va_export_tried_) {
+        va_export_tried_ = true;
+        if (hw_.type != AV_HWDEVICE_TYPE_VAAPI || !hw_.device_ref ||
+            !hw_.device_ref->data) {
+            native_failed_ = true;
+            KOP_LOG_INFO(kTag, "非 VAAPI 硬解，保持系统内存输出");
+            return nullptr;
+        }
+        auto* hw_dev = reinterpret_cast<AVHWDeviceContext*>(hw_.device_ref->data);
+        auto* dev = static_cast<AVVAAPIDeviceContext*>(hw_dev->hwctx);
+        std::string err;
+        if (!va_export_.init(dev->display)) {
+            native_failed_ = true;
+            KOP_LOG_INFO(kTag, "导出器初始化失败，保持系统内存输出");
+            return nullptr;
+        }
+        KOP_LOG_INFO(kTag, "零拷贝输出：解码表面原生 DMA-BUF 导出（NV12/P010）");
+    }
+    std::string err;
+    OwnedFrame* o = va_export_.export_frame(raw, &err);
+    if (!o) {
+        // 首次失败即永久回退：逐帧重试只会刷日志（驱动/格式能力不变）
+        native_failed_ = true;
+        KOP_LOG_WARN(kTag, "原生导出不可用（%s），回退系统内存路径", err.c_str());
+    }
+    return o;
+#else
+    (void)raw;
+    return nullptr;
+#endif
 }
 
 void VideoDecoderNode::flush_and_finish() {

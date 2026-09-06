@@ -19,11 +19,24 @@ set(KOPAW_MODULES_SOURCES
     modules/plugin_loader.cpp
 )
 
+set(KOPAW_HAVE_LIBVA_VAL 0)
 if(KOPAW_BUILD_VULKAN)
     list(APPEND KOPAW_MODULES_SOURCES
         modules/render/vulkan/vulkan_backend.cpp
+        modules/render/vulkan/vk_ycbcr.cpp
         modules/render/vulkan/vk_dma_export.cpp
         modules/ffmpeg/hwaccel.cpp)
+    # P2 硬解零拷贝：VAAPI 表面原生 DMA-BUF 导出（libva 可选依赖）
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBVA QUIET IMPORTED_TARGET libva)
+    endif()
+    if(LIBVA_FOUND)
+        set(KOPAW_HAVE_LIBVA_VAL 1)
+        list(APPEND KOPAW_MODULES_SOURCES modules/ffmpeg/vaapi_export.cpp)
+    else()
+        message(STATUS "未找到 libva：VAAPI 原生 DMA-BUF 导出禁用（硬解回退系统内存路径）")
+    endif()
 endif()
 
 if(KOPAW_BUILD_OPENGL)
@@ -40,6 +53,7 @@ target_include_directories(kopaw-modules PUBLIC
 target_compile_definitions(kopaw-modules PUBLIC
     KOPAW_BUILD_VULKAN=$<BOOL:${KOPAW_BUILD_VULKAN}>
     KOPAW_BUILD_OPENGL=$<BOOL:${KOPAW_BUILD_OPENGL}>
+    KOPAW_HAVE_LIBVA=${KOPAW_HAVE_LIBVA_VAL}
     # FFmpeg 头在 C++ 下要求
     __STDC_CONSTANT_MACROS __STDC_LIMIT_MACROS
 )
@@ -50,6 +64,9 @@ target_link_libraries(kopaw-modules PUBLIC
 )
 if(KOPAW_BUILD_VULKAN)
     target_link_libraries(kopaw-modules PUBLIC Vulkan::Vulkan glfw)
+    if(LIBVA_FOUND)
+        target_link_libraries(kopaw-modules PUBLIC PkgConfig::LIBVA)
+    endif()
 endif()
 
 if(KOPAW_BUILD_OPENGL)
@@ -70,6 +87,7 @@ if(KOPAW_BUILD_VULKAN)
             -DOUT_FILE=${GEN_DIR}/shaders_embed.cpp
             -P ${CMAKE_SOURCE_DIR}/cmake/EmbedShaders.cmake
         DEPENDS glslang-standalone ${SHADER_DIR}/quad.vert ${SHADER_DIR}/quad.frag
+                ${SHADER_DIR}/nv12.frag
         VERBATIM
     )
     target_sources(kopaw-modules PRIVATE ${GEN_DIR}/shaders_embed.cpp)
@@ -137,6 +155,17 @@ target_link_libraries(kopaw-transcode PRIVATE kop-common PkgConfig::FFMPEG pthre
 # Focused ABI and lavfi tests. They run without a sound device or display.
 # ---------------------------------------------------------------------------
 if(BUILD_TESTING)
+    if(KOPAW_BUILD_VULKAN)
+        add_executable(kopaw-vk-ycbcr-test
+            tests/vk_ycbcr_test.cpp
+            modules/render/vulkan/vk_ycbcr.cpp)
+        target_include_directories(kopaw-vk-ycbcr-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/modules
+            ${CMAKE_CURRENT_SOURCE_DIR}/abi/include
+            ${Vulkan_INCLUDE_DIRS})
+        add_test(NAME kopaw-vk-ycbcr COMMAND kopaw-vk-ycbcr-test)
+    endif()
+
     add_executable(kopaw-filter-node-test tests/filter_node_test.cpp)
     target_link_libraries(kopaw-filter-node-test PRIVATE
         kopaw-modules

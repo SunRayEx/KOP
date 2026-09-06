@@ -70,6 +70,7 @@ if(KOPAW_BUILD_VULKAN)
     FetchContent_Declare(glslang
         GIT_REPOSITORY https://github.com/KhronosGroup/glslang
         GIT_TAG 15.4.0
+        GIT_SHALLOW TRUE  # 标签固定：浅克隆体积小得多，弱网环境重试成功率更高
     )
     FetchContent_MakeAvailable(glslang)
     find_package(Vulkan REQUIRED)

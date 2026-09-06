@@ -143,7 +143,10 @@ impl GraphCore {
             }),
             state: Arc::new(AtomicU8::new(ffi::KOPAW_STATE_IDLE as u8)),
             clock: MediaClock::default(),
-            event: Mutex::new(EventSlot { cb: None, user: std::ptr::null_mut() }),
+            event: Mutex::new(EventSlot {
+                cb: None,
+                user: std::ptr::null_mut(),
+            }),
             threads: Mutex::new(Vec::new()),
             stop_hints_done: AtomicBool::new(false),
             stats: Mutex::new(Vec::new()),
@@ -172,9 +175,9 @@ impl GraphCore {
         {
             return Err(ffi::KOPAW_E_INVALID);
         }
-        // 响应式节点由引擎按单入边驱动（多入边只允许自驱动节点声明）；
-        // 0 入边的源节点合法（run 主动生产）。
-        if !self_driven && inputs > 1 {
+        // 响应式节点：单入边走 send；多入边（P2）必须提供 send_port 由引擎
+        // 按端口投递；0 入边的源节点合法（run 主动生产）。
+        if !self_driven && inputs > 1 && vt.send_port.is_none() {
             return Err(ffi::KOPAW_E_INVALID);
         }
         let mut g = lock(&self.inner);
@@ -221,7 +224,9 @@ impl GraphCore {
         if port as usize >= n.outputs.len() {
             return None;
         }
-        Some(KopawOutput { id: Self::output_id(node, port) })
+        Some(KopawOutput {
+            id: Self::output_id(node, port),
+        })
     }
 
     pub fn connect(&self, src: KopawOutput, dst: u32, dst_port: u32, cap: u32) -> i32 {
@@ -298,7 +303,11 @@ impl GraphCore {
                     self_driven: n.self_driven,
                     name: n.name.clone(),
                     stat: n.stat.clone(),
-                    in_queue: n.inputs.first().copied().flatten().map(|lid| g.links[&lid].queue.clone()),
+                    in_queues: n
+                        .inputs
+                        .iter()
+                        .map(|lid| lid.map(|l| g.links[&l].queue.clone()))
+                        .collect(),
                 })
                 .collect();
         }
@@ -325,15 +334,21 @@ impl GraphCore {
         let mut handles = Vec::with_capacity(jobs.len());
         for job in jobs {
             let this = GraphRef(self);
-            let kind = match (&job.in_queue, job.self_driven) {
-                (None, _) => NodeKind::Source,
-                (Some(_), true) => NodeKind::SelfDriven,
-                (Some(_), false) => NodeKind::Reactive,
+            let kind = match (job.in_queues.iter().flatten().count(), job.self_driven) {
+                (0, _) => NodeKind::Source,
+                (_, true) => NodeKind::SelfDriven,
+                (1, false) => NodeKind::Reactive,
+                (_, false) => NodeKind::MultiReactive,
             };
             match kind {
                 NodeKind::Reactive if workers > 0 => {
                     // 池模式：建执行体，不占线程
-                    let cap = job.in_queue.as_ref().map(|q| q.capacity()).unwrap_or(4);
+                    let cap = job
+                        .in_queues
+                        .first()
+                        .and_then(|q| q.as_ref())
+                        .map(|q| q.capacity())
+                        .unwrap_or(4);
                     let exec = Arc::new(NodeExec {
                         node_id: job.node,
                         name: job.name.clone(),
@@ -350,10 +365,20 @@ impl GraphCore {
                     lock(&self.execs).push(exec);
                 }
                 NodeKind::Reactive => {
-                    let q = job.in_queue.clone().expect("reactive has queue");
+                    let q = job.in_queues[0].clone().expect("reactive has queue");
                     let h = std::thread::Builder::new()
                         .name(format!("kopaw:{}", job.name))
                         .spawn(move || Self::reactive_loop(&this, &job, &q));
+                    if let Ok(h) = h {
+                        handles.push(h);
+                    }
+                }
+                NodeKind::MultiReactive => {
+                    // 多入边响应式：单线程轮询全部端口并按端口调用 send_port，
+                    // 保持节点回调串行（与池模式 drain 的串行化约定一致）。
+                    let h = std::thread::Builder::new()
+                        .name(format!("kopaw:{}", job.name))
+                        .spawn(move || Self::reactive_multi_loop(&this, &job));
                     if let Ok(h) = h {
                         handles.push(h);
                     }
@@ -419,11 +444,67 @@ impl GraphCore {
         }
     }
 
+    /// P2 多入边响应式消费循环：轮询各输入端口队列，按端口调用 send_port。
+    /// 每端口收到 EOS 后标记完成，全部端口完成（或图停止）时退出；端口队列
+    /// 的 Stopped 全局一致（STOPPING/FINISHED 后所有端口同步解除阻塞）。
+    /// EOS 转发契约与单入边一致：非汇聚节点自行 emit 下游，汇聚节点在自身
+    /// 全部输入完成后经 kopaw_node_sink_done 记账。
+    fn reactive_multi_loop(this: &GraphRef, job: &NodeJob) {
+        let send_port = match job.vt.send_port {
+            Some(f) => f,
+            None => return, // add_node 已校验；此处仅防御
+        };
+        let n = job.in_queues.len();
+        let mut done = vec![false; n];
+        let mut turn = 0usize;
+        loop {
+            if done.iter().all(|d| *d) {
+                return;
+            }
+            let p = turn % n;
+            turn = turn.wrapping_add(1);
+            if done[p] {
+                continue;
+            }
+            let queue = match &job.in_queues[p] {
+                Some(q) => q,
+                None => {
+                    done[p] = true; // 未连接端口视为终结
+                    continue;
+                }
+            };
+            match queue.recv(Duration::from_millis(2)) {
+                RecvResult::Stopped => return,
+                RecvResult::Timeout => continue,
+                RecvResult::Frame(f) => {
+                    let had_eos = unsafe { (*f).flags & ffi::KOPAW_FRAME_FLAG_EOS != 0 };
+                    let t0 = Instant::now();
+                    let rc = unsafe { send_port(job.user, f, p as u32) };
+                    let us = t0.elapsed().as_micros() as u64;
+                    job.stat.delivered.fetch_add(1, Ordering::Relaxed);
+                    job.stat.busy_us.fetch_add(us, Ordering::Relaxed);
+                    job.stat.busy_max_us.fetch_max(us, Ordering::Relaxed);
+                    if rc == ffi::KOPAW_OK {
+                        if had_eos {
+                            done[p] = true;
+                        }
+                    } else {
+                        // 节点未接管帧，引擎归还生产者
+                        unsafe { release_frame(f) };
+                        unsafe { this.report_error(&job.name, rc) };
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn stop(&self) -> i32 {
         // 1) 状态推进到 STOPPING（不回退既有终态）
         let cur = self.state.load(Ordering::Acquire);
         if (cur as i32) < ffi::KOPAW_STATE_STOPPING {
-            self.state.store(ffi::KOPAW_STATE_STOPPING as u8, Ordering::Release);
+            self.state
+                .store(ffi::KOPAW_STATE_STOPPING as u8, Ordering::Release);
         }
         // 2) 唤醒池模式执行体（等待中的 push/drain 立即退出）
         for e in lock(&self.execs).iter() {
@@ -577,9 +658,9 @@ impl GraphCore {
         if !exec.has_worker.swap(true, Ordering::AcqRel) {
             let sched = lock(&self.sched).clone();
             if let Some(s) = sched {
-            let this = GraphRef(self);
-            let e = exec.clone();
-            s.submit(Box::new(move || this.drain_job(&e)));
+                let this = GraphRef(self);
+                let e = exec.clone();
+                s.submit(Box::new(move || this.drain_job(&e)));
             } else {
                 // 无调度器（异常状态）：归还帧避免卡死
                 exec.has_worker.store(false, Ordering::Release);
@@ -700,8 +781,13 @@ impl GraphCore {
         if finished {
             let cur = self.state.load(Ordering::Acquire);
             if (cur as i32) == ffi::KOPAW_STATE_RUNNING {
-                self.state.store(ffi::KOPAW_STATE_FINISHED as u8, Ordering::Release);
-                self.fire_event(ffi::KOPAW_EVENT_FINISHED, ffi::KOPAW_OK, b"all sinks done\0");
+                self.state
+                    .store(ffi::KOPAW_STATE_FINISHED as u8, Ordering::Release);
+                self.fire_event(
+                    ffi::KOPAW_EVENT_FINISHED,
+                    ffi::KOPAW_OK,
+                    b"all sinks done\0",
+                );
             }
             // FINISHED(3) >= STOPPING(2)：所有阻塞发送/接收随之解除
         }
@@ -759,8 +845,14 @@ impl GraphCore {
             }
             first = false;
             let (from, to) = (
-                g.nodes.get(&l.src_node).map(|n| n.name.as_str()).unwrap_or("?"),
-                g.nodes.get(&l.dst_node).map(|n| n.name.as_str()).unwrap_or("?"),
+                g.nodes
+                    .get(&l.src_node)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("?"),
+                g.nodes
+                    .get(&l.dst_node)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("?"),
             );
             use std::fmt::Write as _;
             let _ = write!(
@@ -797,7 +889,8 @@ impl GraphCore {
     unsafe fn report_error(&self, _node: &str, code: i32) {
         let cur = self.state.load(Ordering::Acquire);
         if (cur as i32) == ffi::KOPAW_STATE_RUNNING {
-            self.state.store(ffi::KOPAW_STATE_ERROR as u8, Ordering::Release);
+            self.state
+                .store(ffi::KOPAW_STATE_ERROR as u8, Ordering::Release);
             self.fire_event(ffi::KOPAW_EVENT_ERROR, code, b"node error\0");
         }
         // 诊断细节留给日志系统（MVP 不打印）
@@ -811,7 +904,10 @@ impl GraphCore {
 enum NodeKind {
     Source,
     SelfDriven,
+    /// 单入边响应式（send 驱动；池模式下可进入 NodeExec 池调度）
     Reactive,
+    /// 多入边响应式（send_port 按端口驱动；始终专线程以保持节点内串行）
+    MultiReactive,
 }
 
 struct NodeJob {
@@ -822,7 +918,8 @@ struct NodeJob {
     self_driven: bool,
     name: String,
     stat: Arc<NodeStat>,
-    in_queue: Option<Arc<FrameQueue>>,
+    /// 每个输入端口一条队列（与端口下标对应；未连接端口为空）
+    in_queues: Vec<Option<Arc<FrameQueue>>>,
 }
 
 // 跨线程移交 NodeJob 是安全的：user 指向的 C++ 节点对象按 ABI 契约
@@ -853,13 +950,13 @@ impl GraphRef {
 mod tests {
     use super::*;
     use crate::ffi::{
-        KOPAW_E_STOPPED, KOPAW_E_TIMEOUT, KOPAW_EVENT_ERROR, KOPAW_EVENT_FINISHED,
+        KOPAW_EVENT_ERROR, KOPAW_EVENT_FINISHED, KOPAW_E_STOPPED, KOPAW_E_TIMEOUT,
         KOPAW_FRAME_FLAG_EOS, KOPAW_MEDIA_VIDEO, KOPAW_OK, KOPAW_STATE_FINISHED,
         KOPAW_STATE_STOPPING,
     };
+    use std::mem::size_of;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicUsize;
-    use std::mem::size_of;
 
     /// 每测试独立的泄漏计数与引用计数头：帧的 dma_buf_handle 指向 MockHdr
     /// （mock 帧不承载媒体数据，引擎永不解码该句柄，借用它是安全的）。
@@ -910,6 +1007,7 @@ mod tests {
             user_data: std::ptr::null_mut(),
             retain: Some(mock_retain),
             release: Some(mock_release),
+            drm_fourcc: 0,
         }))
     }
 
@@ -955,7 +1053,12 @@ mod tests {
         let _ = Box::from_raw(user as *mut PassState);
     }
 
-    unsafe extern "C" fn event_cb(user: *mut c_void, ev: KopawEventType, _code: i32, _m: *const i8) {
+    unsafe extern "C" fn event_cb(
+        user: *mut c_void,
+        ev: KopawEventType,
+        _code: i32,
+        _m: *const i8,
+    ) {
         let st = &*(user as *const SinkState);
         match ev {
             KOPAW_EVENT_FINISHED => st.finished.fetch_add(1, Ordering::SeqCst),
@@ -973,8 +1076,17 @@ mod tests {
         is_sink: bool,
         self_driven: bool,
     ) -> u32 {
-        g.add_node(name.to_string(), user, &vt, outputs, 1, 4, is_sink, self_driven)
-            .expect("add_node failed")
+        g.add_node(
+            name.to_string(),
+            user,
+            &vt,
+            outputs,
+            1,
+            4,
+            is_sink,
+            self_driven,
+        )
+        .expect("add_node failed")
     }
 
     /// 源节点：发 n 帧数据 + 1 帧 EOS 后返回
@@ -1007,240 +1119,258 @@ mod tests {
     #[test]
     fn source_pass_sink_natural_finish_no_leak() {
         unsafe {
-        let leak = AtomicUsize::new(0);
-        let g = GraphCore::new();
-        let src = Box::into_raw(Box::new(SrcState {
-            out: KopawOutput { id: 0 },
-            g: &g as *const _,
-            leak: &leak,
-            n: 10,
-        }));
-        let pass = Box::into_raw(Box::new(PassState { out: KopawOutput { id: 0 }, g: &g as *const _ }));
-        let sink = Box::into_raw(Box::new(SinkState {
-            g: &g as *const _,
-            got: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-            errors: AtomicUsize::new(0),
-        }));
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 10,
+            }));
+            let pass = Box::into_raw(Box::new(PassState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+            }));
+            let sink = Box::into_raw(Box::new(SinkState {
+                g: &g as *const _,
+                got: AtomicUsize::new(0),
+                finished: AtomicUsize::new(0),
+                errors: AtomicUsize::new(0),
+            }));
 
-        let src_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(source_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        let pass_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: None,
-            send: Some(pass_send),
-            stop: None,
-            destroy: Some(pass_destroy),
-            bind_output: None,
-        };
-        let sink_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: None,
-            send: Some(sink_send),
-            stop: None,
-            destroy: Some(sink_destroy),
-            bind_output: None,
-        };
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let pass_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(pass_send),
+                stop: None,
+                destroy: Some(pass_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(sink_send),
+                stop: None,
+                destroy: Some(sink_destroy),
+                bind_output: None,
+                send_port: None,
+            };
 
-        let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
-        let n_pass = add_named_node(&g, "pass", pass as _, pass_vt, 1, false, false);
-        let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
-        // 注册后回填真实输出句柄
-        (*src).out = g.node_output(n_src, 0).unwrap();
-        (*pass).out = g.node_output(n_pass, 0).unwrap();
+            let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            let n_pass = add_named_node(&g, "pass", pass as _, pass_vt, 1, false, false);
+            let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
+            // 注册后回填真实输出句柄
+            (*src).out = g.node_output(n_src, 0).unwrap();
+            (*pass).out = g.node_output(n_pass, 0).unwrap();
 
-        let o_src = g.node_output(n_src, 0).unwrap();
-        let o_pass = g.node_output(n_pass, 0).unwrap();
-        assert_eq!(g.connect(o_src, n_pass, 0, 4), KOPAW_OK);
-        assert_eq!(g.connect(o_pass, n_sink, 0, 4), KOPAW_OK);
+            let o_src = g.node_output(n_src, 0).unwrap();
+            let o_pass = g.node_output(n_pass, 0).unwrap();
+            assert_eq!(g.connect(o_src, n_pass, 0, 4), KOPAW_OK);
+            assert_eq!(g.connect(o_pass, n_sink, 0, 4), KOPAW_OK);
 
-        g.set_event_cb(Some(event_cb), sink as *mut c_void);
-        assert_eq!(g.start(), KOPAW_OK);
+            g.set_event_cb(Some(event_cb), sink as *mut c_void);
+            assert_eq!(g.start(), KOPAW_OK);
 
-        // 自然结束：等待 FINISHED（源发完即走，透传即时）
-        for _ in 0..500 {
-            if g.state() == KOPAW_STATE_FINISHED {
-                break;
+            // 自然结束：等待 FINISHED（源发完即走，透传即时）
+            for _ in 0..500 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(g.state(), KOPAW_STATE_FINISHED);
-        assert_eq!((*sink).got.load(Ordering::SeqCst), 11); // 10 数据 + 1 EOS
-        assert_eq!((*sink).finished.load(Ordering::SeqCst), 1);
+            assert_eq!(g.state(), KOPAW_STATE_FINISHED);
+            assert_eq!((*sink).got.load(Ordering::SeqCst), 11); // 10 数据 + 1 EOS
+            assert_eq!((*sink).finished.load(Ordering::SeqCst), 1);
 
-        g.shutdown();
-        assert_eq!(leak.load(Ordering::SeqCst), 0, "frames leaked");
-        // shutdown 已调用 destroy；避免双重释放
-        let _ = Box::from_raw(src);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "frames leaked");
+            // shutdown 已调用 destroy；避免双重释放
+            let _ = Box::from_raw(src);
         }
     }
 
     #[test]
     fn stop_mid_stream_no_leak() {
         unsafe {
-        let leak = AtomicUsize::new(0);
-        let g = GraphCore::new();
-        // 慢速汇聚：每帧 5ms，制造队列积压与阻塞发送
-        let sink = Box::into_raw(Box::new(SinkState {
-            g: &g as *const _,
-            got: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-            errors: AtomicUsize::new(0),
-        }));
-        let src = Box::into_raw(Box::new(SrcState {
-            out: KopawOutput { id: 0 },
-            g: &g as *const _,
-            leak: &leak,
-            n: 1_000_000,
-        }));
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            // 慢速汇聚：每帧 5ms，制造队列积压与阻塞发送
+            let sink = Box::into_raw(Box::new(SinkState {
+                g: &g as *const _,
+                got: AtomicUsize::new(0),
+                finished: AtomicUsize::new(0),
+                errors: AtomicUsize::new(0),
+            }));
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 1_000_000,
+            }));
 
-        let src_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(source_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        let sink_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: None,
-            send: Some(slow_sink_send),
-            stop: None,
-            destroy: Some(sink_destroy),
-            bind_output: None,
-        };
-        let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
-        let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
-        (*src).out = g.node_output(n_src, 0).unwrap();
-        let o = g.node_output(n_src, 0).unwrap();
-        assert_eq!(g.connect(o, n_sink, 0, 2), KOPAW_OK);
-        assert_eq!(g.start(), KOPAW_OK);
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(slow_sink_send),
+                stop: None,
+                destroy: Some(sink_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+            let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
+            (*src).out = g.node_output(n_src, 0).unwrap();
+            let o = g.node_output(n_src, 0).unwrap();
+            assert_eq!(g.connect(o, n_sink, 0, 2), KOPAW_OK);
+            assert_eq!(g.start(), KOPAW_OK);
 
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(g.stop(), KOPAW_OK);
-        assert_eq!(g.state(), KOPAW_STATE_STOPPING);
-        g.shutdown();
-        assert_eq!(leak.load(Ordering::SeqCst), 0, "frames leaked on stop");
-        let _ = Box::from_raw(src);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(g.stop(), KOPAW_OK);
+            assert_eq!(g.state(), KOPAW_STATE_STOPPING);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "frames leaked on stop");
+            let _ = Box::from_raw(src);
         }
     }
 
     #[test]
     fn self_driven_sink_recv_eos() {
         unsafe {
-        static GOT: AtomicUsize = AtomicUsize::new(0);
+            static GOT: AtomicUsize = AtomicUsize::new(0);
 
-        unsafe extern "C" fn driven_run(user: *mut c_void) -> i32 {
-            let st = &*(user as *const DrvState);
-            loop {
-                let mut f: *mut KopawFrame = std::ptr::null_mut();
-                match (*st.g).recv(st.node, &mut f, 10) {
-                    KOPAW_OK => {
-                        GOT.fetch_add(1, Ordering::SeqCst);
-                        let eos = (*f).flags & KOPAW_FRAME_FLAG_EOS != 0;
-                        release_frame(f);
-                        if eos {
-                            // 延迟记账：自驱动汇聚自行记账
-                            (*st.g).note_sink_input_done();
-                            return KOPAW_OK;
+            unsafe extern "C" fn driven_run(user: *mut c_void) -> i32 {
+                let st = &*(user as *const DrvState);
+                loop {
+                    let mut f: *mut KopawFrame = std::ptr::null_mut();
+                    match (*st.g).recv(st.node, &mut f, 10) {
+                        KOPAW_OK => {
+                            GOT.fetch_add(1, Ordering::SeqCst);
+                            let eos = (*f).flags & KOPAW_FRAME_FLAG_EOS != 0;
+                            release_frame(f);
+                            if eos {
+                                // 延迟记账：自驱动汇聚自行记账
+                                (*st.g).note_sink_input_done();
+                                return KOPAW_OK;
+                            }
                         }
+                        KOPAW_E_TIMEOUT => continue,
+                        KOPAW_E_STOPPED => return KOPAW_OK,
+                        _ => return 9,
                     }
-                    KOPAW_E_TIMEOUT => continue,
-                    KOPAW_E_STOPPED => return KOPAW_OK,
-                    _ => return 9,
                 }
             }
-        }
 
-        struct DrvState {
-            g: *const GraphCore,
-            node: u32,
-        }
-
-        let leak = AtomicUsize::new(0);
-        let g = GraphCore::new();
-        let src = Box::into_raw(Box::new(SrcState {
-            out: KopawOutput { id: 0 },
-            g: &g as *const _,
-            leak: &leak,
-            n: 5,
-        }));
-        let drv = Box::into_raw(Box::new(DrvState { g: &g as *const _, node: 0 }));
-
-        let src_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(source_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        let drv_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(driven_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
-        let n_drv = add_named_node(&g, "drv", drv as _, drv_vt, 0, true, true);
-        // 注册后回填自身节点 id，供 run 内的 recv 使用
-        (*drv).node = n_drv;
-        (*src).out = g.node_output(n_src, 0).unwrap();
-        let o = g.node_output(n_src, 0).unwrap();
-        assert_eq!(g.connect(o, n_drv, 0, 4), KOPAW_OK);
-        assert_eq!(g.start(), KOPAW_OK);
-
-        for _ in 0..1000 {
-            if g.state() == KOPAW_STATE_FINISHED {
-                break;
+            struct DrvState {
+                g: *const GraphCore,
+                node: u32,
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(g.state(), KOPAW_STATE_FINISHED);
-        assert_eq!(GOT.load(Ordering::SeqCst), 6);
-        g.shutdown();
-        assert_eq!(leak.load(Ordering::SeqCst), 0);
-        let _ = Box::from_raw(src);
-        let _ = Box::from_raw(drv);
+
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 5,
+            }));
+            let drv = Box::into_raw(Box::new(DrvState {
+                g: &g as *const _,
+                node: 0,
+            }));
+
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let drv_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(driven_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            let n_drv = add_named_node(&g, "drv", drv as _, drv_vt, 0, true, true);
+            // 注册后回填自身节点 id，供 run 内的 recv 使用
+            (*drv).node = n_drv;
+            (*src).out = g.node_output(n_src, 0).unwrap();
+            let o = g.node_output(n_src, 0).unwrap();
+            assert_eq!(g.connect(o, n_drv, 0, 4), KOPAW_OK);
+            assert_eq!(g.start(), KOPAW_OK);
+
+            for _ in 0..1000 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(g.state(), KOPAW_STATE_FINISHED);
+            assert_eq!(GOT.load(Ordering::SeqCst), 6);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0);
+            let _ = Box::from_raw(src);
+            let _ = Box::from_raw(drv);
         }
     }
 
     #[test]
     fn unconnected_output_drops_frames() {
         unsafe {
-        let leak = AtomicUsize::new(0);
-        let g = GraphCore::new();
-        let src = Box::into_raw(Box::new(SrcState {
-            out: KopawOutput { id: 0 }, // 未连接
-            g: &g as *const _,
-            leak: &leak,
-            n: 3,
-        }));
-        let src_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(source_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        // 无汇聚节点：不会自然结束，靠 run 自己返回
-        add_named_node(&g, "src", src as _, src_vt, 1, false, false);
-        assert_eq!(g.start(), KOPAW_OK);
-        std::thread::sleep(Duration::from_millis(30));
-        g.shutdown();
-        assert_eq!(leak.load(Ordering::SeqCst), 0, "unconnected frames must be released");
-        assert_eq!(g.dropped_unconnected.load(Ordering::SeqCst), 4);
-        let _ = Box::from_raw(src);
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 }, // 未连接
+                g: &g as *const _,
+                leak: &leak,
+                n: 3,
+            }));
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            // 无汇聚节点：不会自然结束，靠 run 自己返回
+            add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            assert_eq!(g.start(), KOPAW_OK);
+            std::thread::sleep(Duration::from_millis(30));
+            g.shutdown();
+            assert_eq!(
+                leak.load(Ordering::SeqCst),
+                0,
+                "unconnected frames must be released"
+            );
+            assert_eq!(g.dropped_unconnected.load(Ordering::SeqCst), 4);
+            let _ = Box::from_raw(src);
         }
     }
 
@@ -1249,73 +1379,79 @@ mod tests {
     #[test]
     fn tee_broadcast_two_sinks_no_leak() {
         unsafe {
-        let leak = AtomicUsize::new(0);
-        let g = GraphCore::new();
-        let src = Box::into_raw(Box::new(SrcState {
-            out: KopawOutput { id: 0 },
-            g: &g as *const _,
-            leak: &leak,
-            n: 8,
-        }));
-        let mk_sink = |g: *const GraphCore| {
-            Box::into_raw(Box::new(SinkState {
-                g,
-                got: AtomicUsize::new(0),
-                finished: AtomicUsize::new(0),
-                errors: AtomicUsize::new(0),
-            }))
-        };
-        let sink0 = mk_sink(&g as *const _);
-        let sink1 = mk_sink(&g as *const _);
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 8,
+            }));
+            let mk_sink = |g: *const GraphCore| {
+                Box::into_raw(Box::new(SinkState {
+                    g,
+                    got: AtomicUsize::new(0),
+                    finished: AtomicUsize::new(0),
+                    errors: AtomicUsize::new(0),
+                }))
+            };
+            let sink0 = mk_sink(&g as *const _);
+            let sink1 = mk_sink(&g as *const _);
 
-        let src_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(source_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        let sink_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: None,
-            send: Some(sink_send),
-            stop: None,
-            destroy: Some(sink_destroy),
-            bind_output: None,
-        };
-        let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
-        let n_s0 = add_named_node(&g, "sink0", sink0 as _, sink_vt, 0, true, false);
-        let n_s1 = add_named_node(&g, "sink1", sink1 as _, sink_vt, 0, true, false);
-        (*src).out = g.node_output(n_src, 0).unwrap();
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(sink_send),
+                stop: None,
+                destroy: Some(sink_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+            let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            let n_s0 = add_named_node(&g, "sink0", sink0 as _, sink_vt, 0, true, false);
+            let n_s1 = add_named_node(&g, "sink1", sink1 as _, sink_vt, 0, true, false);
+            (*src).out = g.node_output(n_src, 0).unwrap();
 
-        let o = g.node_output(n_src, 0).unwrap();
-        // 同一输出端口连两条边（tee）
-        assert_eq!(g.connect(o, n_s0, 0, 4), KOPAW_OK);
-        assert_eq!(g.connect(o, n_s1, 0, 4), KOPAW_OK);
+            let o = g.node_output(n_src, 0).unwrap();
+            // 同一输出端口连两条边（tee）
+            assert_eq!(g.connect(o, n_s0, 0, 4), KOPAW_OK);
+            assert_eq!(g.connect(o, n_s1, 0, 4), KOPAW_OK);
 
-        g.set_event_cb(Some(event_cb), sink0 as *mut c_void);
-        assert_eq!(g.start(), KOPAW_OK);
+            g.set_event_cb(Some(event_cb), sink0 as *mut c_void);
+            assert_eq!(g.start(), KOPAW_OK);
 
-        for _ in 0..1000 {
-            if g.state() == KOPAW_STATE_FINISHED {
-                break;
+            for _ in 0..1000 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(g.state(), KOPAW_STATE_FINISHED, "两个汇聚都记账后才 FINISHED");
-        assert_eq!((*sink0).got.load(Ordering::SeqCst), 9); // 8 数据 + 1 EOS
-        assert_eq!((*sink1).got.load(Ordering::SeqCst), 9);
-        assert_eq!((*sink0).finished.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                g.state(),
+                KOPAW_STATE_FINISHED,
+                "两个汇聚都记账后才 FINISHED"
+            );
+            assert_eq!((*sink0).got.load(Ordering::SeqCst), 9); // 8 数据 + 1 EOS
+            assert_eq!((*sink1).got.load(Ordering::SeqCst), 9);
+            assert_eq!((*sink0).finished.load(Ordering::SeqCst), 1);
 
-        // 统计 JSON 应包含两个汇聚与统计字段
-        let j = g.stats_json();
-        assert!(j.contains("\"name\":\"src\"") && j.contains("\"name\":\"sink0\""));
-        assert!(j.contains("\"emitted\":9"));
+            // 统计 JSON 应包含两个汇聚与统计字段
+            let j = g.stats_json();
+            assert!(j.contains("\"name\":\"src\"") && j.contains("\"name\":\"sink0\""));
+            assert!(j.contains("\"emitted\":9"));
 
-        g.shutdown();
-        assert_eq!(leak.load(Ordering::SeqCst), 0, "tee 引用计数必须归零");
-        let _ = Box::from_raw(src);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "tee 引用计数必须归零");
+            let _ = Box::from_raw(src);
         }
     }
 
@@ -1324,69 +1460,485 @@ mod tests {
     #[test]
     fn pool_scheduler_source_pass_sink_no_leak() {
         unsafe {
-        let leak = AtomicUsize::new(0);
-        let g = GraphCore::new();
-        assert_eq!(g.set_workers(4), 4);
-        let src = Box::into_raw(Box::new(SrcState {
-            out: KopawOutput { id: 0 },
-            g: &g as *const _,
-            leak: &leak,
-            n: 50,
-        }));
-        let pass = Box::into_raw(Box::new(PassState { out: KopawOutput { id: 0 }, g: &g as *const _ }));
-        let sink = Box::into_raw(Box::new(SinkState {
-            g: &g as *const _,
-            got: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-            errors: AtomicUsize::new(0),
-        }));
-        let src_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: Some(source_run),
-            send: None,
-            stop: None,
-            destroy: None,
-            bind_output: None,
-        };
-        let pass_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: None,
-            send: Some(pass_send),
-            stop: None,
-            destroy: Some(pass_destroy),
-            bind_output: None,
-        };
-        let sink_vt = KopawNodeVTable {
-            struct_size: size_of::<KopawNodeVTable>() as u32,
-            run: None,
-            send: Some(sink_send),
-            stop: None,
-            destroy: Some(sink_destroy),
-            bind_output: None,
-        };
-        let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
-        let n_pass = add_named_node(&g, "pass", pass as _, pass_vt, 1, false, false);
-        let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
-        (*src).out = g.node_output(n_src, 0).unwrap();
-        (*pass).out = g.node_output(n_pass, 0).unwrap();
-        let o_src = g.node_output(n_src, 0).unwrap();
-        let o_pass = g.node_output(n_pass, 0).unwrap();
-        assert_eq!(g.connect(o_src, n_pass, 0, 4), KOPAW_OK);
-        assert_eq!(g.connect(o_pass, n_sink, 0, 4), KOPAW_OK);
-        g.set_event_cb(Some(event_cb), sink as *mut c_void);
-        assert_eq!(g.start(), KOPAW_OK);
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            assert_eq!(g.set_workers(4), 4);
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 50,
+            }));
+            let pass = Box::into_raw(Box::new(PassState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+            }));
+            let sink = Box::into_raw(Box::new(SinkState {
+                g: &g as *const _,
+                got: AtomicUsize::new(0),
+                finished: AtomicUsize::new(0),
+                errors: AtomicUsize::new(0),
+            }));
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let pass_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(pass_send),
+                stop: None,
+                destroy: Some(pass_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(sink_send),
+                stop: None,
+                destroy: Some(sink_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+            let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            let n_pass = add_named_node(&g, "pass", pass as _, pass_vt, 1, false, false);
+            let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
+            (*src).out = g.node_output(n_src, 0).unwrap();
+            (*pass).out = g.node_output(n_pass, 0).unwrap();
+            let o_src = g.node_output(n_src, 0).unwrap();
+            let o_pass = g.node_output(n_pass, 0).unwrap();
+            assert_eq!(g.connect(o_src, n_pass, 0, 4), KOPAW_OK);
+            assert_eq!(g.connect(o_pass, n_sink, 0, 4), KOPAW_OK);
+            g.set_event_cb(Some(event_cb), sink as *mut c_void);
+            assert_eq!(g.start(), KOPAW_OK);
 
-        for _ in 0..1000 {
-            if g.state() == KOPAW_STATE_FINISHED {
-                break;
+            for _ in 0..1000 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
-            std::thread::sleep(Duration::from_millis(2));
+            assert_eq!(g.state(), KOPAW_STATE_FINISHED);
+            assert_eq!((*sink).got.load(Ordering::SeqCst), 51);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "pool mode frames leaked");
+            let _ = Box::from_raw(src);
         }
-        assert_eq!(g.state(), KOPAW_STATE_FINISHED);
-        assert_eq!((*sink).got.load(Ordering::SeqCst), 51);
-        g.shutdown();
-        assert_eq!(leak.load(Ordering::SeqCst), 0, "pool mode frames leaked");
-        let _ = Box::from_raw(src);
+    }
+
+    /// P2 多入边（响应式 + send_port）：两个源 → 合流节点（inputs=2）→ 汇聚。
+    /// 合流节点逐帧透传，两个端口各收到 EOS 后才向下游发一帧 EOS。
+    #[test]
+    fn multi_input_reactive_merge_no_leak() {
+        unsafe {
+            struct MergeState {
+                g: *const GraphCore,
+                out: KopawOutput,
+                leak: *const AtomicUsize,
+                eos: [bool; 2],
+            }
+
+            unsafe extern "C" fn merge_send_port(
+                user: *mut c_void,
+                f: *mut KopawFrame,
+                port: u32,
+            ) -> i32 {
+                let st = &mut *(user as *mut MergeState);
+                if (*f).flags & KOPAW_FRAME_FLAG_EOS == 0 {
+                    // 数据帧透传（emit 接管当前引用）
+                    return (*st.g).emit(st.out, f);
+                }
+                release_frame(f);
+                let p = port as usize;
+                if !st.eos[p] {
+                    st.eos[p] = true;
+                    if st.eos[0] && st.eos[1] {
+                        // 两路全部终结：向下游发一帧 EOS
+                        let e = make_frame(&*st.leak, 0, true);
+                        return (*st.g).emit(st.out, e);
+                    }
+                }
+                KOPAW_OK
+            }
+
+            unsafe extern "C" fn merge_destroy(user: *mut c_void) {
+                let _ = Box::from_raw(user as *mut MergeState);
+            }
+
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            let mk_src = |out: KopawOutput, g: *const GraphCore, leak: *const AtomicUsize| {
+                Box::into_raw(Box::new(SrcState { out, g, leak, n: 6 }))
+            };
+            let src0 = mk_src(KopawOutput { id: 0 }, &g as *const _, &leak);
+            let src1 = mk_src(KopawOutput { id: 0 }, &g as *const _, &leak);
+            let merge = Box::into_raw(Box::new(MergeState {
+                g: &g as *const _,
+                out: KopawOutput { id: 0 },
+                leak: &leak,
+                eos: [false, false],
+            }));
+            let sink = Box::into_raw(Box::new(SinkState {
+                g: &g as *const _,
+                got: AtomicUsize::new(0),
+                finished: AtomicUsize::new(0),
+                errors: AtomicUsize::new(0),
+            }));
+
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let merge_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: None,
+                stop: None,
+                destroy: Some(merge_destroy),
+                bind_output: None,
+                send_port: Some(merge_send_port),
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(sink_send),
+                stop: None,
+                destroy: Some(sink_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+
+            let n_s0 = add_named_node(&g, "src0", src0 as _, src_vt, 1, false, false);
+            let n_s1 = add_named_node(&g, "src1", src1 as _, src_vt, 1, false, false);
+            // 多入边响应式节点：inputs=2，引擎要求 send_port（非自驱动）
+            let n_merge = g
+                .add_node(
+                    "merge".to_string(),
+                    merge as _,
+                    &merge_vt,
+                    1,
+                    2,
+                    4,
+                    false,
+                    false,
+                )
+                .expect("multi-input reactive node rejected");
+            let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
+            (*src0).out = g.node_output(n_s0, 0).unwrap();
+            (*src1).out = g.node_output(n_s1, 0).unwrap();
+            (*merge).out = g.node_output(n_merge, 0).unwrap();
+
+            assert_eq!(
+                g.connect(g.node_output(n_s0, 0).unwrap(), n_merge, 0, 4),
+                KOPAW_OK
+            );
+            assert_eq!(
+                g.connect(g.node_output(n_s1, 0).unwrap(), n_merge, 1, 4),
+                KOPAW_OK
+            );
+            assert_eq!(
+                g.connect(g.node_output(n_merge, 0).unwrap(), n_sink, 0, 4),
+                KOPAW_OK
+            );
+
+            g.set_event_cb(Some(event_cb), sink as *mut c_void);
+            assert_eq!(g.start(), KOPAW_OK);
+
+            for _ in 0..1000 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(g.state(), KOPAW_STATE_FINISHED);
+            // 两路各 6 数据帧 + 合并后的 1 帧 EOS
+            assert_eq!((*sink).got.load(Ordering::SeqCst), 13);
+            assert_eq!((*sink).finished.load(Ordering::SeqCst), 1);
+
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "multi-input frames leaked");
+            let _ = Box::from_raw(src0);
+            let _ = Box::from_raw(src1);
+        }
+    }
+
+    /// P2 多入边 + 池调度：多入边响应式节点在池模式下回退专线程，
+    /// 上游/下游不受影响，FINISHED 与零泄漏保持。
+    #[test]
+    fn pool_scheduler_multi_input_merge_no_leak() {
+        unsafe {
+            struct MergeState {
+                g: *const GraphCore,
+                out: KopawOutput,
+                leak: *const AtomicUsize,
+                eos: [bool; 2],
+            }
+            unsafe extern "C" fn merge_send_port2(
+                user: *mut c_void,
+                f: *mut KopawFrame,
+                port: u32,
+            ) -> i32 {
+                let st = &mut *(user as *mut MergeState);
+                if (*f).flags & KOPAW_FRAME_FLAG_EOS == 0 {
+                    return (*st.g).emit(st.out, f);
+                }
+                release_frame(f);
+                let p = port as usize;
+                if !st.eos[p] {
+                    st.eos[p] = true;
+                    if st.eos[0] && st.eos[1] {
+                        let e = make_frame(&*st.leak, 0, true);
+                        return (*st.g).emit(st.out, e);
+                    }
+                }
+                KOPAW_OK
+            }
+            unsafe extern "C" fn merge_destroy2(user: *mut c_void) {
+                let _ = Box::from_raw(user as *mut MergeState);
+            }
+
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            assert_eq!(g.set_workers(4), 4);
+            let src0 = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 6,
+            }));
+            let src1 = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 6,
+            }));
+            let merge = Box::into_raw(Box::new(MergeState {
+                g: &g as *const _,
+                out: KopawOutput { id: 0 },
+                leak: &leak,
+                eos: [false, false],
+            }));
+            let sink = Box::into_raw(Box::new(SinkState {
+                g: &g as *const _,
+                got: AtomicUsize::new(0),
+                finished: AtomicUsize::new(0),
+                errors: AtomicUsize::new(0),
+            }));
+
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let merge_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: None,
+                stop: None,
+                destroy: Some(merge_destroy2),
+                bind_output: None,
+                send_port: Some(merge_send_port2),
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(sink_send),
+                stop: None,
+                destroy: Some(sink_destroy),
+                bind_output: None,
+                send_port: None,
+            };
+
+            let n_s0 = add_named_node(&g, "src0", src0 as _, src_vt, 1, false, false);
+            let n_s1 = add_named_node(&g, "src1", src1 as _, src_vt, 1, false, false);
+            let n_merge = g
+                .add_node(
+                    "merge".to_string(),
+                    merge as _,
+                    &merge_vt,
+                    1,
+                    2,
+                    4,
+                    false,
+                    false,
+                )
+                .expect("multi-input reactive node rejected");
+            let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
+            (*src0).out = g.node_output(n_s0, 0).unwrap();
+            (*src1).out = g.node_output(n_s1, 0).unwrap();
+            (*merge).out = g.node_output(n_merge, 0).unwrap();
+
+            assert_eq!(
+                g.connect(g.node_output(n_s0, 0).unwrap(), n_merge, 0, 4),
+                KOPAW_OK
+            );
+            assert_eq!(
+                g.connect(g.node_output(n_s1, 0).unwrap(), n_merge, 1, 4),
+                KOPAW_OK
+            );
+            assert_eq!(
+                g.connect(g.node_output(n_merge, 0).unwrap(), n_sink, 0, 4),
+                KOPAW_OK
+            );
+
+            g.set_event_cb(Some(event_cb), sink as *mut c_void);
+            assert_eq!(g.start(), KOPAW_OK);
+
+            for _ in 0..1000 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(g.state(), KOPAW_STATE_FINISHED);
+            assert_eq!((*sink).got.load(Ordering::SeqCst), 13);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "pool + multi-input leaked");
+            let _ = Box::from_raw(src0);
+            let _ = Box::from_raw(src1);
+        }
+    }
+
+    /// P2 多入边自驱动节点：双端口 recv_port 交替拉取，两端 EOS 后记账。
+    #[test]
+    fn self_driven_multi_input_recv_port() {
+        unsafe {
+            static GOT: AtomicUsize = AtomicUsize::new(0);
+
+            struct Drv2State {
+                g: *const GraphCore,
+                node: u32,
+                eos: [bool; 2],
+            }
+
+            unsafe extern "C" fn drv2_run(user: *mut c_void) -> i32 {
+                let st = &mut *(user as *mut Drv2State);
+                let mut turn = 0u32;
+                loop {
+                    if st.eos[0] && st.eos[1] {
+                        // 两路终结：延迟记账（自驱动汇聚）
+                        (*st.g).note_sink_input_done();
+                        return KOPAW_OK;
+                    }
+                    let p = turn % 2;
+                    turn = turn.wrapping_add(1);
+                    let mut f: *mut KopawFrame = std::ptr::null_mut();
+                    match (*st.g).recv_port(st.node, p, &mut f, 10) {
+                        KOPAW_OK => {
+                            GOT.fetch_add(1, Ordering::SeqCst);
+                            if (*f).flags & KOPAW_FRAME_FLAG_EOS != 0 {
+                                st.eos[p as usize] = true;
+                            }
+                            release_frame(f);
+                        }
+                        KOPAW_E_TIMEOUT => continue,
+                        KOPAW_E_STOPPED => return KOPAW_OK,
+                        _ => return 9,
+                    }
+                }
+            }
+
+            struct Drv2Host {
+                g: *const GraphCore,
+                node: u32,
+            }
+
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            let src0 = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 5,
+            }));
+            let src1 = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 5,
+            }));
+            let drv_state = Box::into_raw(Box::new(Drv2State {
+                g: &g as *const _,
+                node: 0,
+                eos: [false, false],
+            }));
+
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let drv_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(drv2_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+
+            let n_s0 = add_named_node(&g, "src0", src0 as _, src_vt, 1, false, false);
+            let n_s1 = add_named_node(&g, "src1", src1 as _, src_vt, 1, false, false);
+            let n_drv = g
+                .add_node(
+                    "drv2".to_string(),
+                    drv_state as _,
+                    &drv_vt,
+                    0,
+                    2,
+                    4,
+                    true,
+                    true,
+                )
+                .expect("self-driven multi-input node rejected");
+            (*drv_state).node = n_drv;
+            (*src0).out = g.node_output(n_s0, 0).unwrap();
+            (*src1).out = g.node_output(n_s1, 0).unwrap();
+
+            assert_eq!(
+                g.connect(g.node_output(n_s0, 0).unwrap(), n_drv, 0, 4),
+                KOPAW_OK
+            );
+            assert_eq!(
+                g.connect(g.node_output(n_s1, 0).unwrap(), n_drv, 1, 4),
+                KOPAW_OK
+            );
+            assert_eq!(g.start(), KOPAW_OK);
+
+            for _ in 0..1000 {
+                if g.state() == KOPAW_STATE_FINISHED {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(g.state(), KOPAW_STATE_FINISHED);
+            // 两路各 5 数据 + 1 EOS
+            assert_eq!(GOT.load(Ordering::SeqCst), 12);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0);
+            let _ = Box::from_raw(src0);
+            let _ = Box::from_raw(src1);
+            let _ = Box::from_raw(drv_state);
         }
     }
 }

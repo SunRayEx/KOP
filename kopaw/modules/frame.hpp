@@ -167,6 +167,7 @@ private:
             data_size ? handle_from_cpu_address(o->storage.data()) : 0;
         o->frame.size = data_size;
         o->frame.stride = 0;
+        o->frame.drm_fourcc = 0;
         o->frame.retain = &OwnedFrame::retain_cb;
         o->frame.release = &OwnedFrame::release_cb;
     }
@@ -205,6 +206,7 @@ inline OwnedFrame* make_frame(int32_t media_type, int64_t pts, int64_t dts, size
         data_size ? handle_from_cpu_address(o->storage.data()) : 0;
     o->frame.size = data_size;
     o->frame.stride = 0;
+    o->frame.drm_fourcc = 0;
     o->frame.retain = &OwnedFrame::retain_cb;
     o->frame.release = &OwnedFrame::release_cb;
     return o;
@@ -226,9 +228,16 @@ inline bool frame_has_external_planes(const KopawFrame* frame) noexcept {
                      frame->memory_type == KOPAW_MEMORY_VULKAN);
 }
 
-// DRM_FORMAT_MOD_INVALID：未协商 modifier 的外部帧（导入方走无 modifier 路径）。
+// DRM_FORMAT_MOD_INVALID：生产者未提供显式 modifier。允许隐式布局的消费者可走
+// 无 modifier 路径；KOPAW 的严格 YCbCr DMA-BUF 导入会拒绝此值。
 constexpr uint64_t kDrmFormatModInvalid = 0x00ffffffffffffffull;
 // DRM_FORMAT_MOD_LINEAR：所有导入方（含软件渲染）都支持的线性 modifier。
 constexpr uint64_t kDrmFormatModLinear = 0;
+// DRM_FORMAT_NV12（fourcc 'N','V','1','2'）：两平面 8bit YCbCr 4:2:0，
+// VAAPI 解码表面原生导出的标准格式（P2 硬解零拷贝）。
+constexpr uint32_t kDrmFormatNv12 = 0x3231564Eu;
+// DRM_FORMAT_P010（fourcc 'P','0','1','0'）：两平面 10bit YCbCr 4:2:0
+// （16bit 容器高位对齐），HEVC Main10 等硬解的原生导出格式。
+constexpr uint32_t kDrmFormatP010 = 0x30313050u;
 
 }  // namespace kopaw

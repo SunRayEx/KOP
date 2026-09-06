@@ -3,12 +3,14 @@
 // 用法：kopaw-player <file> [--backend vulkan|opengl] [--width W] [--height H]
 //                  [--no-audio] [--no-video] [--duration SEC]
 //                  [--filter video:<chain>|audio:<chain>] [--plugin path --use node]
-//                  [--kopms-bus NAME] [--kopms-window ID]
+//                  [--zero-copy on|off|auto] [--kopms-bus NAME] [--kopms-window ID]
 //
 // 全链：demuxer → (video_decoder → video_render) / (audio_decoder → audio_sink)
 // 音频回调驱动主时钟，视频按 pts 对齐节拍。
 // --kopms-bus：视频走 KOPMS 零拷贝路径（Vulkan 导出 DMA-BUF → BUS2LAYER →
 // KOPMS-S 合成器），替代本地渲染窗口（P3-M3）。
+// --zero-copy：硬解表面原生 DMA-BUF 直通 Vulkan 渲染（P2；auto 仅在
+// Vulkan 后端且无滤镜/插件介入时启用，导出失败自动回退软拷贝）。
 //
 // 所有权约定：任何节点对象一旦 add_node 成功，其析构即由 graph_free 的
 // destroy 回调负责；player 不再手动 delete。因此所有可能失败的 open/创建
@@ -69,6 +71,7 @@ void usage() {
             "  --buffer-ms N   网络抖动缓冲（默认 250）\n"
             "  --plugin PATH   加载 .so 插件\n"
             "  --use NODE      将插件节点插入视频链\n"
+            "  --zero-copy M   硬解表面原生 DMA-BUF 直通渲染（on|off|auto，默认 auto）\n"
             "  --kopms-bus NAME     视频零拷贝提交到 KOPMS-S 合成器（P3-M3）\n"
             "  --kopms-window ID    目标 CONTROL 窗口（默认 1，自动创建并 attach）\n");
 }
@@ -101,6 +104,7 @@ int main(int argc, char** argv) {
     std::string use_node;
     std::string video_filter_desc;
     std::string audio_filter_desc;
+    std::string zero_copy_mode = "auto";  // on|off|auto
     std::vector<std::pair<std::string, std::string>> input_opts;
 #if KOPAW_HAVE_KOPMS_SINK
     std::string kopms_bus;
@@ -119,6 +123,7 @@ int main(int argc, char** argv) {
         else if (a == "--duration") duration = std::atof(next().c_str());
         else if (a == "--timeout-ms") timeout_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--buffer-ms") buffer_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        else if (a == "--zero-copy") zero_copy_mode = next();
         else if (a == "--plugin") plugin_paths.push_back(next());
         else if (a == "--use") use_node = next();
         else if (a == "--filter") {
@@ -273,6 +278,32 @@ int main(int argc, char** argv) {
                 KOP_LOG_ERROR(kTag, "%s", err.c_str());
                 exit_code = 2;
                 break;
+            }
+        }
+
+        // P2 硬解零拷贝：原生 DMA-BUF 输出对 Vulkan 本地渲染直连或 KOPMS
+        // BUS 直通开放（滤镜/插件节点消费 CPU 帧，排除）。导出不可用时
+        // 解码节点逐路径自动回退系统内存输出，此处不做硬性约束。
+        if (vdec) {
+#if KOPAW_HAVE_KOPMS_SINK
+            const bool sink_direct = kopms_mode;
+#else
+            const bool sink_direct = false;
+#endif
+            bool native = (backend != nullptr || sink_direct) &&
+                          vfilter == nullptr && use_node.empty();
+            if (backend != nullptr && backend_name != "vulkan") native = false;
+            if (zero_copy_mode == "off") {
+                native = false;
+            } else if (zero_copy_mode == "on" && !native) {
+                KOP_LOG_WARN(kTag, "--zero-copy on 需要 Vulkan 渲染或 KOPMS 直通，已忽略");
+                native = false;
+            }
+            vdec->set_native_output(native);
+            if (native) {
+                KOP_LOG_INFO(kTag,
+                             "零拷贝：解码表面原生 DMA-BUF 直通下游"
+                             "（VAAPI 导出失败回退；导入失败报告错误）");
             }
         }
         ready = true;

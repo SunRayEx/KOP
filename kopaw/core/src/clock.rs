@@ -14,7 +14,11 @@ struct ClockState {
 
 impl Default for ClockState {
     fn default() -> Self {
-        ClockState { media_us: 0, at: Instant::now(), started: false }
+        ClockState {
+            media_us: 0,
+            at: Instant::now(),
+            started: false,
+        }
     }
 }
 
@@ -32,7 +36,9 @@ pub struct MediaClock {
 
 impl Default for MediaClock {
     fn default() -> Self {
-        MediaClock { st: Mutex::new(ClockState::default()) }
+        MediaClock {
+            st: Mutex::new(ClockState::default()),
+        }
     }
 }
 

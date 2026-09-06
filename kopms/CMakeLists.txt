@@ -136,6 +136,7 @@ if(KOPMS_BUILD_VK_SCENE AND KOPAW_BUILD_VULKAN)
             -P ${CMAKE_SOURCE_DIR}/cmake/EmbedShaders.cmake
         DEPENDS glslang-standalone
                 ${KOPMS_SCENE_SHADER_DIR}/quad.vert ${KOPMS_SCENE_SHADER_DIR}/quad.frag
+                ${KOPMS_SCENE_SHADER_DIR}/nv12.frag
         VERBATIM
     )
     target_sources(kopms-platform PRIVATE
@@ -255,6 +256,19 @@ if(BUILD_TESTING)
         target_link_libraries(kopms-vk-dmabuf-test PRIVATE kop-common Vulkan::Vulkan)
         add_test(NAME kopms-vk-dmabuf-roundtrip COMMAND kopms-vk-dmabuf-test)
         set_tests_properties(kopms-vk-dmabuf-roundtrip PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 60)
+
+        # P2：VulkanScene NV12 两平面导入 → YUV→RGB 合成 → 目标回读校验。
+        add_executable(kopms-vk-nv12-scene-test tests/vk_nv12_scene_test.cpp)
+        target_include_directories(kopms-vk-nv12-scene-test PRIVATE
+            ${CMAKE_SOURCE_DIR}/kopms/platform
+            ${CMAKE_SOURCE_DIR}/common/include
+            ${CMAKE_SOURCE_DIR}/kopaw/abi/include)
+        target_link_libraries(kopms-vk-nv12-scene-test PRIVATE
+            kopms-platform kop-common Vulkan::Vulkan)
+        add_test(NAME kopms-vk-nv12-scene COMMAND kopms-vk-nv12-scene-test)
+        set_tests_properties(kopms-vk-nv12-scene PROPERTIES
             SKIP_RETURN_CODE 77
             TIMEOUT 60)
 

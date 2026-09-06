@@ -67,8 +67,18 @@ void KopmsSinkNode::free_submission(Submission* sub) {
 
 bool KopmsSinkNode::connect(std::string* error) {
     disconnect();
+    // 导出器仅供 CPU 帧路径；初始化失败不阻断连接（P2 直通帧不依赖它），
+    // 全 CPU 帧且导出不可用时在 send 路径明确报错丢弃。
     if (!exporter_.inited()) {
-        if (exporter_.init(options_.max_export_images, error)) return false;
+        std::string export_err;
+        if (exporter_.init(options_.max_export_images, &export_err)) {
+            exporter_ready_ = true;
+        } else {
+            KOP_LOG_WARN(kTag, "Vulkan 导出器不可用（%s）：仅支持 DMA-BUF 帧直通",
+                         export_err.c_str());
+        }
+    } else {
+        exporter_ready_ = true;
     }
     const uint64_t caps = KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE |
                           KOPMS_PROTOCOL_CAP_HANDLE_FRAMES |
@@ -182,12 +192,29 @@ int32_t KopmsSinkNode::send_impl(KopawFrame* frame) {
     // 每帧先推进一轮已完成释放，缩短图像池驻留时间。
     pump_releases(0);
 
-    KopawFrame* gpu = exporter_.export_cpu_frame(frame, &error);
-    if (!gpu) {
-        KOP_LOG_WARN(kTag, "导出失败（%s），丢弃本帧", error.c_str());
-        frame->release(frame);
-        ++frames_dropped_;
-        return KOPAW_OK;
+    KopawFrame* gpu = nullptr;
+    uint32_t drm_format = 0;
+    if (frame->memory_type == KOPAW_MEMORY_DMABUF && frame->drm_fourcc != 0) {
+        // P2 直通：解码原生 DMA-BUF 帧（NV12 等）直接包装提交。
+        // 引用计数桥直接作用于该帧：client submit 的 retain 与 sink 自持
+        // 引用都落到 KopawFrame 引用计数上，语义与导出帧完全一致。
+        gpu = frame;
+        drm_format = frame->drm_fourcc;
+    } else {
+        if (!exporter_ready_) {
+            KOP_LOG_WARN(kTag, "CPU 帧无可用导出器，丢弃本帧");
+            frame->release(frame);
+            ++frames_dropped_;
+            return KOPAW_OK;
+        }
+        gpu = exporter_.export_cpu_frame(frame, &error);
+        if (!gpu) {
+            KOP_LOG_WARN(kTag, "导出失败（%s），丢弃本帧", error.c_str());
+            frame->release(frame);
+            ++frames_dropped_;
+            return KOPAW_OK;
+        }
+        drm_format = kDrmFormatAbgr8888;
     }
 
     auto* sub = new Submission();
@@ -199,7 +226,7 @@ int32_t KopmsSinkNode::send_impl(KopawFrame* frame) {
     d.media_type = KOPAW_MEDIA_VIDEO;
     d.width = gpu->format.video.width;
     d.height = gpu->format.video.height;
-    d.format = kDrmFormatAbgr8888;
+    d.format = drm_format;
     d.memory_type = gpu->memory_type;
     d.plane_count = gpu->plane_count;
     for (uint32_t i = 0; i < gpu->plane_count && i < KOPAW_MAX_DMABUF_PLANES; ++i) {
@@ -224,7 +251,11 @@ int32_t KopmsSinkNode::send_impl(KopawFrame* frame) {
         pending_.emplace(reinterpret_cast<uintptr_t>(sub), sub);
         ++frames_submitted_;
     }
-    frame->release(frame);
+    // 导出路径：sink 额外持有的源帧引用在此归还（直通帧由 Submission 管理，
+    // 不可在此释放——client 的 retain 已把引用交给 BUS）。
+    if (gpu != frame) {
+        frame->release(frame);
+    }
     return KOPAW_OK;
 }
 

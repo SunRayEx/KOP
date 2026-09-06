@@ -5,8 +5,11 @@
 #include <cstring>
 #include <vector>
 
-#include "kop/log.h"
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "../../frame.hpp"
+#include "kop/log.h"
 
 // 由 CMake 嵌入步骤生成（shaders/*.vert|frag → SPIR-V 字节数组）
 extern "C" {
@@ -24,12 +27,18 @@ namespace {
 
 const char* vk_result_str(VkResult r) {
     switch (r) {
-        case VK_SUCCESS: return "VK_SUCCESS";
-        case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
-        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
-        case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
-        case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
-        default: return "VK_ERROR";
+        case VK_SUCCESS:
+            return "VK_SUCCESS";
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            return "VK_ERROR_OUT_OF_DATE_KHR";
+        case VK_ERROR_DEVICE_LOST:
+            return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_SURFACE_LOST_KHR:
+            return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_SUBOPTIMAL_KHR:
+            return "VK_SUBOPTIMAL_KHR";
+        default:
+            return "VK_ERROR";
     }
 }
 
@@ -40,7 +49,7 @@ bool vkfail(VkResult r, const char* what, std::string* error) {
     return true;
 }
 
-}  // namespace
+} // namespace
 
 VulkanBackend::~VulkanBackend() { shutdown(); }
 
@@ -59,7 +68,9 @@ bool VulkanBackend::init(GLFWwindow* window, std::string* error) {
 
 void VulkanBackend::poll_events() { glfwPollEvents(); }
 
-bool VulkanBackend::window_closed() const { return glfwWindowShouldClose(win_); }
+bool VulkanBackend::window_closed() const {
+    return glfwWindowShouldClose(win_);
+}
 
 bool VulkanBackend::create_instance(std::string* error) {
     VkApplicationInfo app{};
@@ -101,7 +112,8 @@ bool VulkanBackend::create_instance(std::string* error) {
     ci.ppEnabledExtensionNames = exts.data();
     ci.enabledLayerCount = static_cast<uint32_t>(layers.size());
     ci.ppEnabledLayerNames = layers.data();
-    return vkfail(vkCreateInstance(&ci, nullptr, &inst_), "vkCreateInstance", error);
+    return vkfail(vkCreateInstance(&ci, nullptr, &inst_), "vkCreateInstance",
+                  error);
 }
 
 bool VulkanBackend::create_surface(GLFWwindow* window, std::string* error) {
@@ -119,12 +131,26 @@ bool VulkanBackend::pick_physical_device(std::string* error) {
     std::vector<VkPhysicalDevice> devs(n);
     vkEnumeratePhysicalDevices(inst_, &n, devs.data());
 
-    // 离散显卡优先，独显/集显各打分
+    // 离散显卡优先，独显/集显各打分；KOPAW_VK_DEVICE 可按设备名子串过滤
+    // （多 GPU 环境下选择与解码同侧的导入/呈现设备，例如 KOPAW_VK_DEVICE=i915）
+    const char* want_dev = getenv("KOPAW_VK_DEVICE");
     VkPhysicalDevice best = VK_NULL_HANDLE;
     int best_score = -1;
     for (VkPhysicalDevice d : devs) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(d, &props);
+        if (props.apiVersion < VK_API_VERSION_1_3) continue;
+        VkPhysicalDeviceVulkan13Features features13{};
+        features13.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        VkPhysicalDeviceFeatures2 features{};
+        features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features.pNext = &features13;
+        vkGetPhysicalDeviceFeatures2(d, &features);
+        if (!features13.dynamicRendering) continue;
+        if (want_dev && want_dev[0] && !strstr(props.deviceName, want_dev)) {
+            continue;
+        }
         uint32_t n_qf = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(d, &n_qf, nullptr);
         std::vector<VkQueueFamilyProperties> qfs(n_qf);
@@ -139,9 +165,10 @@ bool VulkanBackend::pick_physical_device(std::string* error) {
         }
         if (gq == UINT32_MAX || pq == UINT32_MAX) continue;
 
-        int score = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 1000
-                    : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 500
-                                                                                 : 100;
+        int score =
+            props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 1000
+            : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 500
+                                                                         : 100;
         if (score > best_score) {
             best_score = score;
             best = d;
@@ -155,11 +182,42 @@ bool VulkanBackend::pick_physical_device(std::string* error) {
     }
     pd_ = best;
     same_queue_ = gq_family_ == pq_family_;
+
+    // Native import is optional; RGBA rendering only needs the swapchain.
+    ext_drm_modifier_ = false;
+    ext_dmabuf_ = false;
+    ext_foreign_queue_ = false;
+    {
+        uint32_t n_ext = 0;
+        vkEnumerateDeviceExtensionProperties(pd_, nullptr, &n_ext, nullptr);
+        std::vector<VkExtensionProperties> exts(n_ext);
+        vkEnumerateDeviceExtensionProperties(pd_, nullptr, &n_ext, exts.data());
+        bool memory_fd = false, dma_buf = false;
+        for (auto& e : exts) {
+            if (strcmp(e.extensionName,
+                       VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0)
+                memory_fd = true;
+            if (strcmp(e.extensionName,
+                       VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0)
+                dma_buf = true;
+            if (strcmp(e.extensionName,
+                       VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0)
+                ext_foreign_queue_ = true;
+            if (strcmp(e.extensionName,
+                       VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0) {
+                ext_drm_modifier_ = true;
+            }
+        }
+        ext_dmabuf_ = memory_fd && dma_buf;
+    }
+
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(pd_, &props);
-    KOP_LOG_INFO(kTag, "设备: %s (%s)", props.deviceName,
-                 props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
-                                                                          : "integrated");
+    KOP_LOG_INFO(kTag, "设备: %s (%s%s)", props.deviceName,
+                 props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+                     ? "discrete"
+                     : "integrated",
+                 ext_drm_modifier_ ? "，DRM modifier 导入" : "");
     return false;
 }
 
@@ -176,17 +234,46 @@ bool VulkanBackend::create_device(std::string* error) {
         qcis[1].queueFamilyIndex = pq_family_;
     }
 
-    const char* dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> dev_exts{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    if (ext_dmabuf_) {
+        dev_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    }
+    if (ext_drm_modifier_ && ext_dmabuf_) {
+        dev_exts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    }
+    if (ext_foreign_queue_) {
+        dev_exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    }
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
+    ycbcr.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+    VkPhysicalDeviceFeatures2 features{};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &ycbcr;
+    vkGetPhysicalDeviceFeatures2(pd_, &features);
+    ycbcr_enabled_ = ycbcr.samplerYcbcrConversion == VK_TRUE;
+    VkPhysicalDeviceVulkan13Features features13{};
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    features13.dynamicRendering = VK_TRUE;
+    features13.pNext = &ycbcr;
     VkDeviceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    ci.pNext = &features13;
     ci.queueCreateInfoCount = n_q;
     ci.pQueueCreateInfos = qcis;
-    ci.enabledExtensionCount = 1;
-    ci.ppEnabledExtensionNames = dev_exts;
-    if (vkfail(vkCreateDevice(pd_, &ci, nullptr, &dev_), "vkCreateDevice", error)) return true;
+    ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
+    ci.ppEnabledExtensionNames = dev_exts.data();
+    if (vkfail(vkCreateDevice(pd_, &ci, nullptr, &dev_), "vkCreateDevice",
+               error))
+        return true;
 
     vkGetDeviceQueue(dev_, gq_family_, 0, &gq_);
     vkGetDeviceQueue(dev_, pq_family_, 0, &pq_);
+    get_memory_fd_properties_ =
+        reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+            vkGetDeviceProcAddr(dev_, "vkGetMemoryFdPropertiesKHR"));
+    // fd 导入经 vkAllocateMemory + VkImportMemoryFdInfoKHR（无独立导入函数）
     return false;
 }
 
@@ -217,7 +304,8 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
     vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surf_, &n_fmt, fmts.data());
     sc_fmt_ = fmts[0].format;
     for (auto& f : fmts) {
-        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM ||
+             f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
             f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             sc_fmt_ = f.format;
             break;
@@ -228,9 +316,9 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd_, surf_, &n_pm, nullptr);
     std::vector<VkPresentModeKHR> pms(n_pm);
     vkGetPhysicalDeviceSurfacePresentModesKHR(pd_, surf_, &n_pm, pms.data());
-    VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR;  // 保证存在
+    VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR; // 保证存在
     for (auto m : pms) {
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR) pm = m;  // 有则低延迟
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR) pm = m; // 有则低延迟
     }
 
     ext_ = caps.currentExtent;
@@ -240,10 +328,11 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
         ext_.width = static_cast<uint32_t>(w);
         ext_.height = static_cast<uint32_t>(h);
     }
-    if (ext_.width == 0 || ext_.height == 0) return false;  // 最小化中，稍后重建
+    if (ext_.width == 0 || ext_.height == 0) return false; // 最小化中，稍后重建
 
     uint32_t img_count = caps.minImageCount + 1;
-    if (caps.maxImageCount > 0 && img_count > caps.maxImageCount) img_count = caps.maxImageCount;
+    if (caps.maxImageCount > 0 && img_count > caps.maxImageCount)
+        img_count = caps.maxImageCount;
 
     VkSwapchainCreateInfoKHR ci{};
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -266,7 +355,8 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = pm;
     ci.clipped = VK_TRUE;
-    if (vkfail(vkCreateSwapchainKHR(dev_, &ci, nullptr, &sc_), "vkCreateSwapchainKHR", error))
+    if (vkfail(vkCreateSwapchainKHR(dev_, &ci, nullptr, &sc_),
+               "vkCreateSwapchainKHR", error))
         return true;
 
     uint32_t n_img = 0;
@@ -309,6 +399,11 @@ bool VulkanBackend::recreate_swapchain(std::string* error) {
         pipe_ = VK_NULL_HANDLE;
     }
     if (create_pipeline(error)) return true;
+    for (auto& yuv : yuv_pipelines_) {
+        if (yuv->pipeline) vkDestroyPipeline(dev_, yuv->pipeline, nullptr);
+        yuv->pipeline = VK_NULL_HANDLE;
+        if (build_pipeline(yuv->layout, &yuv->pipeline, error)) return true;
+    }
     return false;
 }
 
@@ -322,24 +417,9 @@ bool VulkanBackend::create_pipeline(std::string* error) {
         si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (vkfail(vkCreateSampler(dev_, &si, nullptr, &samp_), "vkCreateSampler", error))
+        if (vkfail(vkCreateSampler(dev_, &si, nullptr, &samp_),
+                   "vkCreateSampler", error))
             return true;
-    }
-
-    // --- 着色器模块 ---
-    VkShaderModuleCreateInfo smci{};
-    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = kopaw_vert_spv_len;
-    smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_vert_spv);
-    VkShaderModule vs{};
-    if (vkfail(vkCreateShaderModule(dev_, &smci, nullptr, &vs), "顶点着色器模块", error))
-        return true;
-    smci.codeSize = kopaw_frag_spv_len;
-    smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_frag_spv);
-    VkShaderModule fs{};
-    if (vkfail(vkCreateShaderModule(dev_, &smci, nullptr, &fs), "片段着色器模块", error)) {
-        vkDestroyShaderModule(dev_, vs, nullptr);
-        return true;
     }
 
     // --- 描述符布局（一次） ---
@@ -361,11 +441,33 @@ bool VulkanBackend::create_pipeline(std::string* error) {
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pli.setLayoutCount = 1;
         pli.pSetLayouts = &dsl_;
-        if (vkfail(vkCreatePipelineLayout(dev_, &pli, nullptr, &play_), "管线布局", error)) {
+        if (vkfail(vkCreatePipelineLayout(dev_, &pli, nullptr, &play_),
+                   "管线布局", error)) {
             return true;
         }
     }
 
+    return build_pipeline(play_, &pipe_, error);
+}
+
+bool VulkanBackend::build_pipeline(VkPipelineLayout layout,
+                                   VkPipeline* pipeline, std::string* error) {
+    VkShaderModuleCreateInfo smci{};
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = kopaw_vert_spv_len;
+    smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_vert_spv);
+    VkShaderModule vs{};
+    if (vkfail(vkCreateShaderModule(dev_, &smci, nullptr, &vs),
+               "顶点着色器模块", error))
+        return true;
+    smci.codeSize = kopaw_frag_spv_len;
+    smci.pCode = reinterpret_cast<const uint32_t*>(kopaw_frag_spv);
+    VkShaderModule fs{};
+    if (vkfail(vkCreateShaderModule(dev_, &smci, nullptr, &fs),
+               "片段着色器模块", error)) {
+        vkDestroyShaderModule(dev_, vs, nullptr);
+        return true;
+    }
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -401,7 +503,8 @@ bool VulkanBackend::create_pipeline(std::string* error) {
     cb.attachmentCount = 1;
     cb.pAttachments = &att;
 
-    VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                   VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dyn{};
     dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dyn.dynamicStateCount = 2;
@@ -409,6 +512,11 @@ bool VulkanBackend::create_pipeline(std::string* error) {
 
     VkGraphicsPipelineCreateInfo pi{};
     pi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    VkPipelineRenderingCreateInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &sc_fmt_;
+    pi.pNext = &rendering;
     pi.stageCount = 2;
     pi.pStages = stages;
     pi.pVertexInputState = &vi;
@@ -418,8 +526,9 @@ bool VulkanBackend::create_pipeline(std::string* error) {
     pi.pMultisampleState = &ms;
     pi.pColorBlendState = &cb;
     pi.pDynamicState = &dyn;
-    pi.layout = play_;
-    if (vkfail(vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &pi, nullptr, &pipe_),
+    pi.layout = layout;
+    if (vkfail(vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &pi, nullptr,
+                                         pipeline),
                "图形管线", error)) {
         vkDestroyShaderModule(dev_, vs, nullptr);
         vkDestroyShaderModule(dev_, fs, nullptr);
@@ -428,6 +537,134 @@ bool VulkanBackend::create_pipeline(std::string* error) {
     vkDestroyShaderModule(dev_, vs, nullptr);
     vkDestroyShaderModule(dev_, fs, nullptr);
     return false;
+}
+
+VulkanBackend::YuvPipeline*
+VulkanBackend::ensure_yuv_pipeline(YcbcrConfig config, uint32_t width,
+                                   uint32_t height, std::string* error) {
+    for (auto& entry : yuv_pipelines_) {
+        const auto& key = entry->config;
+        if (key.format == config.format && key.modifier == config.modifier &&
+            key.model == config.model) {
+            if (width > key.max_extent.width ||
+                height > key.max_extent.height) {
+                *error = "YCbCr dimensions exceed the device format limits";
+                return nullptr;
+            }
+            return entry.get();
+        }
+    }
+    if (!query_ycbcr_support(pd_, width, height, &config, error))
+        return nullptr;
+    auto entry = std::make_unique<YuvPipeline>();
+    auto& yuv = *entry;
+    yuv.config = config;
+    VkSamplerYcbcrConversionCreateInfo conversion{};
+    conversion.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
+    conversion.format = config.format;
+    conversion.ycbcrModel = config.model;
+    conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
+    conversion.components = {
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    conversion.xChromaOffset = config.chroma_location;
+    conversion.yChromaOffset = config.chroma_location;
+    conversion.chromaFilter = config.filter;
+    auto failed = [&](VkResult result, const char* operation) {
+        if (!vkfail(result, operation, error)) return false;
+        destroy_yuv_pipeline(yuv);
+        return true;
+    };
+    if (failed(vkCreateSamplerYcbcrConversion(dev_, &conversion, nullptr,
+                                              &yuv.conversion),
+               "YCbCr conversion"))
+        return nullptr;
+    VkSamplerYcbcrConversionInfo linked{};
+    linked.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+    linked.conversion = yuv.conversion;
+    VkSamplerCreateInfo sampler{};
+    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler.pNext = &linked;
+    sampler.magFilter = sampler.minFilter = config.filter;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW =
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (failed(vkCreateSampler(dev_, &sampler, nullptr, &yuv.sampler),
+               "YCbCr sampler"))
+        return nullptr;
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    binding.pImmutableSamplers = &yuv.sampler;
+    VkDescriptorSetLayoutCreateInfo descriptor_layout{};
+    descriptor_layout.sType =
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    descriptor_layout.bindingCount = 1;
+    descriptor_layout.pBindings = &binding;
+    if (failed(vkCreateDescriptorSetLayout(dev_, &descriptor_layout, nullptr,
+                                           &yuv.descriptor_layout),
+               "YCbCr descriptor layout"))
+        return nullptr;
+    VkPipelineLayoutCreateInfo layout{};
+    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout.setLayoutCount = 1;
+    layout.pSetLayouts = &yuv.descriptor_layout;
+    if (failed(vkCreatePipelineLayout(dev_, &layout, nullptr, &yuv.layout),
+               "YCbCr pipeline layout"))
+        return nullptr;
+    if (build_pipeline(yuv.layout, &yuv.pipeline, error)) {
+        destroy_yuv_pipeline(yuv);
+        return nullptr;
+    }
+    if (config.descriptor_count > UINT32_MAX / kMaxFrames) {
+        *error = "YCbCr descriptor count overflows the pool size";
+        destroy_yuv_pipeline(yuv);
+        return nullptr;
+    }
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              config.descriptor_count * kMaxFrames};
+    VkDescriptorPoolCreateInfo pool{};
+    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool.maxSets = kMaxFrames;
+    pool.poolSizeCount = 1;
+    pool.pPoolSizes = &size;
+    if (failed(vkCreateDescriptorPool(dev_, &pool, nullptr, &yuv.pool),
+               "YCbCr descriptor pool"))
+        return nullptr;
+    VkDescriptorSetLayout layouts[kMaxFrames];
+    std::fill_n(layouts, kMaxFrames, yuv.descriptor_layout);
+    VkDescriptorSetAllocateInfo sets{};
+    sets.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    sets.descriptorPool = yuv.pool;
+    sets.descriptorSetCount = kMaxFrames;
+    sets.pSetLayouts = layouts;
+    if (failed(vkAllocateDescriptorSets(dev_, &sets, yuv.sets),
+               "YCbCr descriptor sets"))
+        return nullptr;
+    KOP_LOG_INFO(
+        kTag, "YCbCr %s %s modifier=0x%llx descriptors=%u filter=%s",
+        config.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? "NV12" : "P010",
+        config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709 ? "BT.709"
+                                                                    : "BT.601",
+        static_cast<unsigned long long>(config.modifier),
+        config.descriptor_count,
+        config.filter == VK_FILTER_LINEAR ? "linear" : "nearest");
+    yuv_pipelines_.push_back(std::move(entry));
+    return yuv_pipelines_.back().get();
+}
+
+void VulkanBackend::destroy_yuv_pipeline(YuvPipeline& yuv) {
+    if (yuv.pool) vkDestroyDescriptorPool(dev_, yuv.pool, nullptr);
+    if (yuv.pipeline) vkDestroyPipeline(dev_, yuv.pipeline, nullptr);
+    if (yuv.layout) vkDestroyPipelineLayout(dev_, yuv.layout, nullptr);
+    if (yuv.descriptor_layout)
+        vkDestroyDescriptorSetLayout(dev_, yuv.descriptor_layout, nullptr);
+    if (yuv.sampler) vkDestroySampler(dev_, yuv.sampler, nullptr);
+    if (yuv.conversion)
+        vkDestroySamplerYcbcrConversion(dev_, yuv.conversion, nullptr);
+    yuv = YuvPipeline{};
 }
 
 bool VulkanBackend::create_descriptors(std::string* error) {
@@ -439,7 +676,8 @@ bool VulkanBackend::create_descriptors(std::string* error) {
     pi.maxSets = kMaxFrames;
     pi.poolSizeCount = 1;
     pi.pPoolSizes = &ps;
-    if (vkfail(vkCreateDescriptorPool(dev_, &pi, nullptr, &dpool_), "描述符池", error))
+    if (vkfail(vkCreateDescriptorPool(dev_, &pi, nullptr, &dpool_), "描述符池",
+               error))
         return true;
 
     for (int i = 0; i < kMaxFrames; ++i) {
@@ -448,24 +686,29 @@ bool VulkanBackend::create_descriptors(std::string* error) {
         ai.descriptorPool = dpool_;
         ai.descriptorSetCount = 1;
         ai.pSetLayouts = &dsl_;
-        if (vkfail(vkAllocateDescriptorSets(dev_, &ai, &dsets_[i]), "分配描述符集", error))
+        if (vkfail(vkAllocateDescriptorSets(dev_, &ai, &dsets_[i]),
+                   "分配描述符集", error))
             return true;
     }
+
     return false;
 }
 
 bool VulkanBackend::create_sync_and_commands(std::string* error) {
     VkCommandPoolCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpi.queueFamilyIndex = gq_family_;
-    if (vkfail(vkCreateCommandPool(dev_, &cpi, nullptr, &cpool_), "命令池", error))
+    if (vkfail(vkCreateCommandPool(dev_, &cpi, nullptr, &cpool_), "命令池",
+               error))
         return true;
     VkCommandBufferAllocateInfo cai{};
     cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cai.commandPool = cpool_;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = kMaxFrames;
-    if (vkfail(vkAllocateCommandBuffers(dev_, &cai, cmds_), "命令缓冲", error)) return true;
+    if (vkfail(vkAllocateCommandBuffers(dev_, &cai, cmds_), "命令缓冲", error))
+        return true;
 
     VkSemaphoreCreateInfo sci{};
     sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -473,16 +716,20 @@ bool VulkanBackend::create_sync_and_commands(std::string* error) {
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     for (int i = 0; i < kMaxFrames; ++i) {
-        if (vkfail(vkCreateSemaphore(dev_, &sci, nullptr, &img_avail_[i]), "信号量", error) ||
-            vkfail(vkCreateSemaphore(dev_, &sci, nullptr, &render_done_[i]), "信号量", error) ||
-            vkfail(vkCreateFence(dev_, &fci, nullptr, &inflight_[i]), "栅栏", error)) {
+        if (vkfail(vkCreateSemaphore(dev_, &sci, nullptr, &img_avail_[i]),
+                   "信号量", error) ||
+            vkfail(vkCreateSemaphore(dev_, &sci, nullptr, &render_done_[i]),
+                   "信号量", error) ||
+            vkfail(vkCreateFence(dev_, &fci, nullptr, &inflight_[i]), "栅栏",
+                   error)) {
             return true;
         }
     }
     return false;
 }
 
-bool VulkanBackend::ensure_staging(int slot, VkDeviceSize size, std::string* error) {
+bool VulkanBackend::ensure_staging(int slot, VkDeviceSize size,
+                                   std::string* error) {
     if (stage_size_[slot] >= size) return false;
     if (stage_[slot]) {
         vkDestroyBuffer(dev_, stage_[slot], nullptr);
@@ -495,7 +742,8 @@ bool VulkanBackend::ensure_staging(int slot, VkDeviceSize size, std::string* err
     bi.size = size;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkfail(vkCreateBuffer(dev_, &bi, nullptr, &stage_[slot]), "上传缓冲", error))
+    if (vkfail(vkCreateBuffer(dev_, &bi, nullptr, &stage_[slot]), "上传缓冲",
+               error))
         return true;
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(dev_, stage_[slot], &req);
@@ -508,12 +756,14 @@ bool VulkanBackend::ensure_staging(int slot, VkDeviceSize size, std::string* err
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = mt;
-    if (vkfail(vkAllocateMemory(dev_, &ai, nullptr, &stage_mem_[slot]), "分配上传内存", error))
+    if (vkfail(vkAllocateMemory(dev_, &ai, nullptr, &stage_mem_[slot]),
+               "分配上传内存", error))
         return true;
     if (vkfail(vkBindBufferMemory(dev_, stage_[slot], stage_mem_[slot], 0),
                "绑定上传缓冲", error))
         return true;
-    if (vkfail(vkMapMemory(dev_, stage_mem_[slot], 0, req.size, 0, &stage_map_[slot]),
+    if (vkfail(vkMapMemory(dev_, stage_mem_[slot], 0, req.size, 0,
+                           &stage_map_[slot]),
                "映射上传缓冲", error))
         return true;
     stage_size_[slot] = req.size;
@@ -523,6 +773,9 @@ bool VulkanBackend::ensure_staging(int slot, VkDeviceSize size, std::string* err
 bool VulkanBackend::ensure_texture(uint32_t w, uint32_t h, std::string* error) {
     if (tex_[0].w == w && tex_[0].h == h && tex_[0].img) return false;
 
+    // Both slots are replaced; the other slot may still be sampling its
+    // texture.
+    if (vkfail(vkDeviceWaitIdle(dev_), "等待纹理重建", error)) return true;
     // 尺寸变化：先销毁旧纹理
     for (int i = 0; i < kMaxFrames; ++i) {
         if (tex_[i].view) vkDestroyImageView(dev_, tex_[i].view, nullptr);
@@ -544,20 +797,23 @@ bool VulkanBackend::ensure_texture(uint32_t w, uint32_t h, std::string* error) {
         ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkfail(vkCreateImage(dev_, &ii, nullptr, &tex_[i].img), "创建采样图像", error))
+        if (vkfail(vkCreateImage(dev_, &ii, nullptr, &tex_[i].img),
+                   "创建采样图像", error))
             return true;
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(dev_, tex_[i].img, &req);
-        uint32_t mt = find_memory_type(req.memoryTypeBits,
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, error);
+        uint32_t mt = find_memory_type(
+            req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, error);
         if (mt == UINT32_MAX) return true;
         VkMemoryAllocateInfo ai{};
         ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.allocationSize = req.size;
         ai.memoryTypeIndex = mt;
-        if (vkfail(vkAllocateMemory(dev_, &ai, nullptr, &tex_[i].mem), "分配显存", error))
+        if (vkfail(vkAllocateMemory(dev_, &ai, nullptr, &tex_[i].mem),
+                   "分配显存", error))
             return true;
-        if (vkfail(vkBindImageMemory(dev_, tex_[i].img, tex_[i].mem, 0), "绑定显存", error))
+        if (vkfail(vkBindImageMemory(dev_, tex_[i].img, tex_[i].mem, 0),
+                   "绑定显存", error))
             return true;
         VkImageViewCreateInfo vi{};
         vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -565,7 +821,8 @@ bool VulkanBackend::ensure_texture(uint32_t w, uint32_t h, std::string* error) {
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = VK_FORMAT_R8G8B8A8_UNORM;
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (vkfail(vkCreateImageView(dev_, &vi, nullptr, &tex_[i].view), "采样图像视图", error))
+        if (vkfail(vkCreateImageView(dev_, &vi, nullptr, &tex_[i].view),
+                   "采样图像视图", error))
             return true;
         tex_[i].w = w;
         tex_[i].h = h;
@@ -584,12 +841,159 @@ bool VulkanBackend::ensure_texture(uint32_t w, uint32_t h, std::string* error) {
         wr.pImageInfo = &dii;
         vkUpdateDescriptorSets(dev_, 1, &wr, 0, nullptr);
     }
-    cur_tex_ = 0;
     return false;
 }
 
+void VulkanBackend::destroy_imported(Imported& imp) {
+    if (imp.view) vkDestroyImageView(dev_, imp.view, nullptr);
+    if (imp.img) vkDestroyImage(dev_, imp.img, nullptr);
+    if (imp.mem) vkFreeMemory(dev_, imp.mem, nullptr);
+    if (imp.frame) imp.frame->release(imp.frame);
+    imp = Imported{};
+}
+
+// 每帧导入一次（解码表面池循环复用，fd 每次导出都新建）。调用点保证
+// inflight fence 已等待，槽位旧导入的 GPU 使用已经结束，可安全销毁。
+bool VulkanBackend::import_yuv(int slot, const KopawFrame* frame,
+                               YuvPipeline& pipeline, std::string* error) {
+    Imported& imp = imported_[slot];
+
+    const int src_fd = frame->planes[0].fd;
+    if (src_fd < 0) {
+        *error = "YUV 帧缺少 DMA-BUF fd";
+        return false;
+    }
+    const uint32_t w = frame->format.video.width;
+    const uint32_t h = frame->format.video.height;
+    const uint64_t modifier = frame->planes[0].modifier;
+    const VkFormat image_format = pipeline.config.format;
+
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = image_format;
+    ii.extent = {w, h, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkExternalMemoryImageCreateInfo external{};
+    external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_mod{};
+    VkSubresourceLayout plane_layouts[2]{};
+    {
+        plane_layouts[0].offset = frame->planes[0].offset;
+        plane_layouts[0].rowPitch = frame->planes[0].stride;
+        plane_layouts[1].offset = frame->planes[1].offset;
+        plane_layouts[1].rowPitch = frame->planes[1].stride;
+        explicit_mod.sType =
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+        explicit_mod.drmFormatModifier = modifier;
+        explicit_mod.drmFormatModifierPlaneCount = 2;
+        explicit_mod.pPlaneLayouts = plane_layouts;
+        external.pNext = &explicit_mod;
+    }
+    ii.pNext = &external;
+    if (vkfail(vkCreateImage(dev_, &ii, nullptr, &imp.img),
+               "创建 NV12 导入图像", error))
+        return false;
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(dev_, imp.img, &req);
+    VkMemoryFdPropertiesKHR fd_properties{};
+    fd_properties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+    if (vkfail(get_memory_fd_properties_(
+                   dev_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, src_fd,
+                   &fd_properties),
+               "DMA-BUF memory properties", error)) {
+        destroy_imported(imp);
+        return false;
+    }
+    const uint32_t memory_type = find_memory_type(
+        req.memoryTypeBits & fd_properties.memoryTypeBits, 0, error);
+    if (memory_type == UINT32_MAX) {
+        destroy_imported(imp);
+        return false;
+    }
+    // fd 所有权：导入成功后 Vulkan 接管 fd 并在释放显存时关闭。帧的 release
+    // 会关闭原始 fd，因此这里交给 Vulkan 一份 dup，避免双重 close。
+    const int dup_fd = fcntl(src_fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+        destroy_imported(imp);
+        *error = "DMA-BUF fd 复制失败";
+        return false;
+    }
+    VkImportMemoryFdInfoKHR import_mem{};
+    import_mem.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    import_mem.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    import_mem.fd = dup_fd;
+    VkMemoryDedicatedAllocateInfo dedicated{};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image = imp.img;
+    import_mem.pNext = &dedicated;
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.pNext = &import_mem;
+    ai.memoryTypeIndex = memory_type;
+    if (vkfail(vkAllocateMemory(dev_, &ai, nullptr, &imp.mem), "导入 NV12 显存",
+               error)) {
+        close(dup_fd); // Vulkan takes ownership only on successful allocation.
+        destroy_imported(imp);
+        return false;
+    }
+    if (vkfail(vkBindImageMemory(dev_, imp.img, imp.mem, 0),
+               "绑定 NV12 导入显存", error)) {
+        destroy_imported(imp);
+        return false;
+    }
+
+    // 整图视图（COLOR aspect 覆盖两平面）挂 ycbcr 转换：平面提取与色度
+    // 上采样由采样器固定功能完成
+    VkSamplerYcbcrConversionInfo conv_info{};
+    conv_info.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
+    conv_info.conversion = pipeline.conversion;
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.pNext = &conv_info;
+    vi.image = imp.img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = image_format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkfail(vkCreateImageView(dev_, &vi, nullptr, &imp.view),
+               "创建 YUV 导入视图", error)) {
+        destroy_imported(imp);
+        return false;
+    }
+    imp.w = w;
+    imp.h = h;
+    imp.frame = const_cast<KopawFrame*>(frame);
+    imp.frame->retain(imp.frame);
+
+    VkDescriptorImageInfo dii{};
+    dii.imageView = imp.view; // immutable 采样器，无需填 sampler
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wr{};
+    wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr.dstSet = pipeline.sets[slot];
+    wr.dstBinding = 0;
+    wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &dii;
+    vkUpdateDescriptorSets(dev_, 1, &wr, 0, nullptr);
+    KOP_LOG_DEBUG(kTag, "导入 YUV(%s) %ux%u fd=%d modifier=0x%llx",
+                  image_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? "NV12"
+                                                                     : "P010",
+                  w, h, src_fd, static_cast<unsigned long long>(modifier));
+    return true;
+}
+
 bool VulkanBackend::draw(const KopawFrame* frame) {
-    if (device_lost_ || !inited_) return false;
+    if (device_lost_ || !inited_ || !frame) return false;
     std::string err;
 
     const uint32_t w = frame->format.video.width;
@@ -611,26 +1015,57 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
             }
         }
     }
-    if (ensure_texture(w, h, &err)) {
-        KOP_LOG_ERROR(kTag, "%s", err.c_str());
-        device_lost_ = true;
-        return false;
+    const bool native_yuv = frame->memory_type == KOPAW_MEMORY_DMABUF;
+    YuvPipeline* yuv = nullptr;
+    if (native_yuv) {
+        YcbcrConfig config;
+        if (!supports_dmabuf() || !get_memory_fd_properties_) {
+            KOP_LOG_ERROR(kTag, "设备未启用 YCbCr DMA-BUF 导入");
+            return false;
+        }
+        if (!describe_ycbcr_frame(frame, &config, &err) ||
+            !(yuv = ensure_yuv_pipeline(config, w, h, &err))) {
+            KOP_LOG_ERROR(kTag, "%s", err.c_str());
+            return false;
+        }
     }
-    if (ensure_staging(cur_tex_, static_cast<VkDeviceSize>(frame->size), &err)) {
-        KOP_LOG_ERROR(kTag, "%s", err.c_str());
-        device_lost_ = true;
-        return false;
-    }
-    const uint8_t* input = cpu_data(frame);
-    if (!input) {
-        KOP_LOG_ERROR(kTag, "Vulkan 后端收到不可 CPU 映射的帧句柄");
-        device_lost_ = true;
-        return false;
-    }
-    memcpy(stage_map_[cur_tex_], input, frame->size);
 
+    // 槽位 fence 等待提前：YUV 导入要销毁该槽位旧导入图像，CPU 路径复用
+    // staging 同理——两者都要求上一轮同槽位 GPU 工作已经结束。
     const int fi = frame_idx_;
-    vkWaitForFences(dev_, 1, &inflight_[fi], VK_TRUE, UINT64_MAX);
+    if (vkfail(vkWaitForFences(dev_, 1, &inflight_[fi], VK_TRUE, UINT64_MAX),
+               "等待渲染 fence", &err)) {
+        device_lost_ = true;
+        return false;
+    }
+    destroy_imported(imported_[cur_tex_]);
+
+    if (native_yuv) {
+        if (!import_yuv(cur_tex_, frame, *yuv, &err)) {
+            KOP_LOG_ERROR(kTag, "%s", err.c_str());
+            device_lost_ = true;
+            return false;
+        }
+    } else {
+        if (ensure_texture(w, h, &err)) {
+            KOP_LOG_ERROR(kTag, "%s", err.c_str());
+            device_lost_ = true;
+            return false;
+        }
+        if (ensure_staging(cur_tex_, static_cast<VkDeviceSize>(frame->size),
+                           &err)) {
+            KOP_LOG_ERROR(kTag, "%s", err.c_str());
+            device_lost_ = true;
+            return false;
+        }
+        const uint8_t* input = cpu_data(frame);
+        if (!input) {
+            KOP_LOG_ERROR(kTag, "Vulkan 后端收到不可 CPU 映射的帧句柄");
+            device_lost_ = true;
+            return false;
+        }
+        memcpy(stage_map_[cur_tex_], input, frame->size);
+    }
 
     uint32_t img_idx = 0;
     VkResult acq = vkAcquireNextImageKHR(dev_, sc_, UINT64_MAX, img_avail_[fi],
@@ -641,7 +1076,7 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
             device_lost_ = true;
             return false;
         }
-        return true;  // 本帧跳过
+        return true; // 本帧跳过
     }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
         KOP_LOG_ERROR(kTag, "acquire 失败: %s", vk_result_str(acq));
@@ -656,34 +1091,53 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &bi);
 
-    // 1) staging → 纹理（含布局转换）
-    VkImageMemoryBarrier to_dst{};
-    to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.image = tex_[cur_tex_].img;
-    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                         &to_dst);
+    if (native_yuv) {
+        // VAAPI has synchronized the producer. Acquire ownership without
+        // discarding its pixels, then return the image to GENERAL after
+        // sampling.
+        VkImageMemoryBarrier to_read{};
+        to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        to_read.dstQueueFamilyIndex = gq_family_;
+        to_read.image = imported_[cur_tex_].img;
+        to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &to_read);
+    } else {
+        // 1) staging → 纹理（含布局转换）
+        VkImageMemoryBarrier to_dst{};
+        to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.image = tex_[cur_tex_].img;
+        to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &to_dst);
 
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(cmd, stage_[cur_tex_], tex_[cur_tex_].img,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, stage_[cur_tex_], tex_[cur_tex_].img,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &region);
 
-    VkImageMemoryBarrier to_read = to_dst;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &to_read);
+        VkImageMemoryBarrier to_read = to_dst;
+        to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &to_read);
+    }
 
     // 2) 交换链图像 → 颜色附件
     VkImageMemoryBarrier to_color{};
@@ -696,8 +1150,8 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
     to_color.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     to_color.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr,
-                         0, nullptr, 1, &to_color);
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &to_color);
 
     VkClearValue clear = {{{0.02f, 0.02f, 0.03f, 1.0f}}};
     VkRenderingAttachmentInfo att{};
@@ -709,7 +1163,7 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
     att.clearValue = clear;
     VkRenderingInfo ri{};
     ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
-    ri.renderArea = {{0, 0}, ext_.width, ext_.height};  // 清屏覆盖整窗（含黑边）
+    ri.renderArea = {{0, 0}, ext_.width, ext_.height}; // 清屏覆盖整窗（含黑边）
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &att;
@@ -717,17 +1171,44 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
 
     // letterbox：保持视频纵横比居中，黑边由 clear 填充
     const LetterboxRect lb = compute_letterbox(w, h, ext_.width, ext_.height);
-    VkViewport viewport{static_cast<float>(lb.x), static_cast<float>(lb.y),
-                        static_cast<float>(lb.w), static_cast<float>(lb.h), 0.0f, 1.0f};
-    VkRect2D scissor{{lb.x, lb.y},
-                     {static_cast<uint32_t>(lb.w), static_cast<uint32_t>(lb.h)}};
+    VkViewport viewport{static_cast<float>(lb.x),
+                        static_cast<float>(lb.y),
+                        static_cast<float>(lb.w),
+                        static_cast<float>(lb.h),
+                        0.0f,
+                        1.0f};
+    VkRect2D scissor{
+        {lb.x, lb.y},
+        {static_cast<uint32_t>(lb.w), static_cast<uint32_t>(lb.h)}};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, play_, 0, 1,
-                            &dsets_[cur_tex_], 0, nullptr);
-    vkCmdDraw(cmd, 4, 1, 0, 0);  // 三角带全屏四边形
+    if (native_yuv) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, yuv->pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                yuv->layout, 0, 1, &yuv->sets[cur_tex_], 0,
+                                nullptr);
+    } else {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, play_, 0,
+                                1, &dsets_[cur_tex_], 0, nullptr);
+    }
+    vkCmdDraw(cmd, 4, 1, 0, 0); // 三角带全屏四边形
     vkCmdEndRendering(cmd);
+
+    if (native_yuv) {
+        VkImageMemoryBarrier release{};
+        release.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        release.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        release.srcQueueFamilyIndex = gq_family_;
+        release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        release.image = imported_[cur_tex_].img;
+        release.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        release.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &release);
+    }
 
     VkImageMemoryBarrier to_present{};
     to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -743,7 +1224,8 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
                          nullptr, 1, &to_present);
     vkEndCommandBuffer(cmd);
 
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkPipelineStageFlags wait_stage =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.waitSemaphoreCount = 1;
@@ -753,7 +1235,8 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
     si.pCommandBuffers = &cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &render_done_[fi];
-    if (vkfail(vkQueueSubmit(gq_, 1, &si, inflight_[fi]), "vkQueueSubmit", &err)) {
+    if (vkfail(vkQueueSubmit(gq_, 1, &si, inflight_[fi]), "vkQueueSubmit",
+               &err)) {
         device_lost_ = true;
         KOP_LOG_ERROR(kTag, "%s", err.c_str());
         return false;
@@ -805,8 +1288,11 @@ void VulkanBackend::shutdown() {
         if (inflight_[i]) vkDestroyFence(dev_, inflight_[i], nullptr);
         img_avail_[i] = render_done_[i] = VK_NULL_HANDLE;
         inflight_[i] = VK_NULL_HANDLE;
+        destroy_imported(imported_[i]);
     }
     if (pipe_) vkDestroyPipeline(dev_, pipe_, nullptr);
+    for (auto& yuv : yuv_pipelines_) destroy_yuv_pipeline(*yuv);
+    yuv_pipelines_.clear();
     if (play_) vkDestroyPipelineLayout(dev_, play_, nullptr);
     if (dsl_) vkDestroyDescriptorSetLayout(dev_, dsl_, nullptr);
     if (dpool_) vkDestroyDescriptorPool(dev_, dpool_, nullptr);
@@ -825,7 +1311,13 @@ void VulkanBackend::shutdown() {
     surf_ = VK_NULL_HANDLE;
     dev_ = VK_NULL_HANDLE;
     inst_ = VK_NULL_HANDLE;
+    pd_ = VK_NULL_HANDLE;
+    get_memory_fd_properties_ = nullptr;
+    ycbcr_enabled_ = false;
+    ext_dmabuf_ = ext_drm_modifier_ = ext_foreign_queue_ = false;
+    frame_idx_ = cur_tex_ = 0;
+    device_lost_ = false;
     inited_ = false;
 }
 
-}  // namespace kopaw
+} // namespace kopaw

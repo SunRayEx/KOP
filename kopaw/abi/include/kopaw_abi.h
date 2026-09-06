@@ -19,11 +19,15 @@ struct KopawGraph;
 
 /**
  * 5.1: KOPAW_MEMORY_VULKAN external-memory frames (P3-M3). The frame layout
- * is unchanged; only the new memory-type value and capability bit were added.
+ * was unchanged; only the new memory-type value and capability bit were added.
+ * 5.2: P2 platformization — KopawNodeVTable::send_port for reactive
+ * multi-input nodes (KOPAW_CAP_MULTI_INPUT) and KopawFrame::drm_fourcc for
+ * external-memory frames. Both are additive: newer fields are appended and
+ * gated by struct_size, so 5.0/5.1 nodes and frames keep working.
  */
-#define KOPAW_ABI_MINOR 1
+#define KOPAW_ABI_MINOR 2
 
-#define KOPAW_ABI_VERSION 327681
+#define KOPAW_ABI_VERSION 327682
 
 #define KOPAW_CAP_FRAME_OWNERSHIP 1
 
@@ -52,7 +56,14 @@ struct KopawGraph;
  */
 #define KOPAW_CAP_VULKAN_EXTERNAL 256
 
-#define KOPAW_ABI_CAPABILITIES 511
+/**
+ * Reactive nodes may declare multiple input ports when their vtable provides
+ * the send_port callback (5.2). Self-driven multi-input nodes (recv_port)
+ * do not require this bit.
+ */
+#define KOPAW_CAP_MULTI_INPUT 512
+
+#define KOPAW_ABI_CAPABILITIES 1023
 
 /**
  * 帧标志位
@@ -231,6 +242,12 @@ typedef struct KopawFrame {
    * 引擎与消费者都会调用。
    */
   void (*release)(struct KopawFrame *frame);
+  /**
+   * 5.2：外部内存帧的 DRM fourcc（如 NV12 = 0x3231_564E）。CPU 帧为 0，
+   * 像素布局由 media_type 的既有约定解释（视频 = RGBA8 打包）；消费方仅在
+   * 读取外部平面时使用此字段。结构体按 struct_size 前缀兼容读取。
+   */
+  uint32_t drm_fourcc;
 } KopawFrame;
 
 /**
@@ -272,6 +289,12 @@ typedef struct KopawNodeVTable {
    * 图注册后绑定输出端口句柄；没有输出端口的节点可省略。
    */
   void (*bind_output)(void *user, uint32_t port, struct KopawOutput output);
+  /**
+   * 5.2：多入边响应式节点按端口收帧（所有权转移约定同 send）。
+   * 声明 inputs > 1 且非自驱动的节点必须提供；单入边响应式节点继续使用
+   * send，自驱动节点走 run + kopaw_node_recv(_port)。
+   */
+  int32_t (*send_port)(void *user, struct KopawFrame *frame, uint32_t port);
 } KopawNodeVTable;
 
 typedef struct KopawNodeDesc {
@@ -286,7 +309,8 @@ typedef struct KopawNodeDesc {
    */
   uint32_t outputs;
   /**
-   * 输入端口数（P2）：响应式节点必须为 1；自驱动节点可声明多个（按端口 recv）
+   * 输入端口数：响应式节点单入边（send）或声明多入边（必须提供 send_port）；
+   * 自驱动节点可声明任意多个（run 内按端口 kopaw_node_recv_port 拉取）。
    */
   uint32_t inputs;
   /**
@@ -338,7 +362,8 @@ struct KopawOutput kopaw_graph_node_output(KopawGraph *g, uint32_t node, uint32_
 
 /**
  * 连接：src 输出端口 → dst 节点（容量 cap 的有界队列）。
- * MVP 约束：每个输出端口最多一条出边；非自驱动节点的入边数必须为 1。
+ * 每个输入端口至多一条入边；响应式节点单入边用 send，多入边必须提供
+ * send_port；自驱动节点按端口拉取。
  */
 int32_t kopaw_graph_connect(KopawGraph *g,
                             struct KopawOutput src,
@@ -388,8 +413,8 @@ int32_t kopaw_node_recv(KopawGraph *g,
 
 /**
  * 调度模式：workers=0 → 每节点一线程（默认）；workers>0 → 共享队列+工作窃取
- * 线程池（响应式节点以串行化 drain 任务执行；源/自驱动节点仍各占一线程）。
- * 必须在 start 前调用。返回实际生效的 worker 数。
+ * 线程池（单入边响应式节点以串行化 drain 任务执行；源/自驱动/多入边响应式
+ * 节点仍各占一线程）。必须在 start 前调用。返回实际生效的 worker 数。
  */
 uint32_t kopaw_graph_set_workers(KopawGraph *g,
                                  uint32_t workers);

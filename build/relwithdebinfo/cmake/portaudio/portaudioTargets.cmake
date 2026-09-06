@@ -50,7 +50,7 @@ unset(_cmake_expected_targets)
 add_library(portaudio_static STATIC IMPORTED)
 
 set_target_properties(portaudio_static PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "/home/sunray/文档/KOP/build/relwithdebinfo/_deps/portaudio-src/include"
+  INTERFACE_INCLUDE_DIRECTORIES "/home/sunray/文档/GitHub/KOP/build/relwithdebinfo/_deps/portaudio-src/include"
   INTERFACE_LINK_LIBRARIES "/usr/lib64/libasound.so;m;pthread"
 )
 
@@ -58,7 +58,7 @@ set_target_properties(portaudio_static PROPERTIES
 set_property(TARGET portaudio_static APPEND PROPERTY IMPORTED_CONFIGURATIONS RELWITHDEBINFO)
 set_target_properties(portaudio_static PROPERTIES
   IMPORTED_LINK_INTERFACE_LANGUAGES_RELWITHDEBINFO "C"
-  IMPORTED_LOCATION_RELWITHDEBINFO "/home/sunray/文档/KOP/build/relwithdebinfo/_deps/portaudio-build/libportaudio.a"
+  IMPORTED_LOCATION_RELWITHDEBINFO "/home/sunray/文档/GitHub/KOP/build/relwithdebinfo/_deps/portaudio-build/libportaudio.a"
   )
 
 # This file does not depend on other imported targets which have
