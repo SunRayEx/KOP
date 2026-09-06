@@ -1,0 +1,41 @@
+# cbindgen 配置：从 Rust 源生成 kopaw/abi/include/kopaw_abi.h
+# 重新生成：cbindgen --config kopaw/core/cbindgen.toml \
+#                    --crate kopaw-core --output kopaw/abi/include/kopaw_abi.h
+language = "C"
+style = "both"
+documentation = true
+
+# 注意：不用 include_guard 选项——cbindgen 会把 guard 的 #endif 放在
+# trailer 之前，导致 extern "C" 收尾落在 guard 外，二次包含时报错。
+# 这里用 header/trailer 手工包裹整个文件。
+autogen_warning = "// 自动生成（cbindgen），勿手改；重新生成命令见 kopaw/core/cbindgen.toml。"
+header = """
+#ifndef KOPAW_ABI_H
+#define KOPAW_ABI_H
+"""
+after_includes = """
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct KopawGraph;
+"""
+trailer = """
+#ifdef __cplusplus
+}
+#endif
+
+#endif  /* KOPAW_ABI_H */
+"""
+
+[parse]
+parse_deps = false
+
+[export]
+include = [
+    "KopawMediaType", "KopawVideoFormat", "KopawAudioFormat", "KopawFormat",
+    "KopawFrame", "KopawNodeVTable", "KopawNodeDesc", "KopawOutput",
+    "KopawEventType",
+]
+# KopawGraph 由 after_includes 中的前置声明保持不透明，不导出结构体定义
+exclude = ["KopawGraph"]

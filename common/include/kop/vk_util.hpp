@@ -1,0 +1,54 @@
+// 跨进程零拷贝共用的最小 Vulkan 装置（P3-M3）。
+//
+// KOPAW 导出器与 KOPMS 导入/合成器共享这份窗口无关的 instance/device 装配
+// 代码；窗口 surface、交换链和管线由各自模块自持。约定：不缓存函数指针、
+// 不创建任何 GUI 资源，错误经 *error 返回。
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include <vulkan/vulkan.h>
+
+namespace kop {
+namespace vkutil {
+
+struct DeviceContext {
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    uint32_t graphics_family = 0;
+    VkQueue graphics_queue = VK_NULL_HANDLE;
+    // 扩展探测结果（调用方据此选择 modifier/fence 路径）
+    bool ext_drm_modifier = false;
+    bool ext_dma_buf = false;
+    bool ext_fence_fd = false;
+    std::string device_name;
+    // 加载器不静态导出的设备级扩展命令（经 vkGetDeviceProcAddr 解析）。
+    PFN_vkGetMemoryFdKHR get_memory_fd = nullptr;
+    PFN_vkGetFenceFdKHR get_fence_fd = nullptr;
+};
+
+// 创建实例；extra_instance_extensions 由调用方追加（如窗口 surface 扩展）。
+bool create_instance(const std::vector<const char*>& extra_instance_extensions,
+                     VkInstance* out, std::string* error);
+
+// 选择支持图形队列与全部必需设备扩展的物理设备并创建 device。
+// extra_extensions 由调用方追加（如 swapchain）。
+bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
+                            DeviceContext* ctx, std::string* error);
+
+uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits,
+                          VkMemoryPropertyFlags props, std::string* error);
+
+inline void destroy(DeviceContext* ctx) {
+    if (!ctx) return;
+    if (ctx->device != VK_NULL_HANDLE) vkDestroyDevice(ctx->device, nullptr);
+    if (ctx->instance != VK_NULL_HANDLE) vkDestroyInstance(ctx->instance, nullptr);
+    ctx->device = VK_NULL_HANDLE;
+    ctx->instance = VK_NULL_HANDLE;
+    ctx->physical = VK_NULL_HANDLE;
+}
+
+}  // namespace vkutil
+}  // namespace kop

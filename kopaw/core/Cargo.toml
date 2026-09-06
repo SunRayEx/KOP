@@ -1,0 +1,17 @@
+[package]
+name = "kopaw-core"
+version = "0.1.0"
+edition = "2021"
+description = "KOPAW 管线图引擎：节点/链路/队列/时钟/调度（KOP 项目核心）"
+license = "UNLICENSED"
+
+[lib]
+name = "kopaw_core"
+# staticlib 供 C++ 宿主链接；rlib 供自身测试
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# 有界队列：阻塞发送实现自然背压，阻塞接收实现拉取式消费
+crossbeam-channel = "0.5"
+# 工作窃取原语（P2 池调度器）：本地队列 + 全局注入 + Stealer
+crossbeam-deque = "0.8"

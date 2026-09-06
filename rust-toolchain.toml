@@ -1,0 +1,4 @@
+# KOP 统一 Rust 工具链。稳定版由 rustup 自动拉取；
+# 待 CI 确定后可改为精确版本号以保证可复现构建。
+[toolchain]
+channel = "stable"
