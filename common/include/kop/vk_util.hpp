@@ -5,6 +5,8 @@
 // 不创建任何 GUI 资源，错误经 *error 返回。
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -12,6 +14,17 @@
 
 namespace kop {
 namespace vkutil {
+
+inline std::string to_hex(const std::array<uint8_t, VK_UUID_SIZE>& uuid) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    out.reserve(uuid.size() * 2);
+    for (uint8_t b : uuid) {
+        out.push_back(digits[b >> 4]);
+        out.push_back(digits[b & 0xf]);
+    }
+    return out;
+}
 
 struct DeviceContext {
     VkInstance instance = VK_NULL_HANDLE;
@@ -24,8 +37,14 @@ struct DeviceContext {
     bool ext_dma_buf = false;
     bool ext_fence_fd = false;
     std::string device_name;
+    // VK_KHR_external_memory_capabilities 设备 UUID：跨 VkDevice 导入 DMA-BUF
+    // 时用来核对导出侧与导入侧是否同一张物理卡。
+    std::array<uint8_t, VK_UUID_SIZE> device_uuid{};
+
+    std::string uuid_hex() const { return to_hex(device_uuid); }
     // 加载器不静态导出的设备级扩展命令（经 vkGetDeviceProcAddr 解析）。
     PFN_vkGetMemoryFdKHR get_memory_fd = nullptr;
+    PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties = nullptr;
     PFN_vkGetFenceFdKHR get_fence_fd = nullptr;
 };
 
@@ -35,8 +54,12 @@ bool create_instance(const std::vector<const char*>& extra_instance_extensions,
 
 // 选择支持图形队列与全部必需设备扩展的物理设备并创建 device。
 // extra_extensions 由调用方追加（如 swapchain）。
+// prefer_name 非空时，同名设备只要满足全部要求即优先选中：DMA-BUF 导入侧
+// 必须与导出侧同卡（生产链路里合成器与客户端始终同机同卡），这能让双卡
+// 机器上的导入测试确定性地落在同一张卡上。
 bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
-                            DeviceContext* ctx, std::string* error);
+                            DeviceContext* ctx, std::string* error,
+                            const std::string& prefer_name = {});
 
 uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits,
                           VkMemoryPropertyFlags props, std::string* error);

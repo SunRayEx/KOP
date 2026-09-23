@@ -37,6 +37,45 @@ int skip(const std::string& reason) {
     return 77;
 }
 
+// 参考实现（与 kopaw/modules/render/shaders/color.glsl 同一公式）：
+// 非线性编码值 → EOTF 线性化 →（PQ/HLG 色调映射）→ sRGB OETF 编码。
+// 8bit 有限范围展开：(Y-16)/219，色度为中性时非线性 RGB == Y。
+float eotf_bt709(float v) {
+    return v < 0.081f ? v / 4.5f
+                     : std::pow((v + 0.099f) / 1.099f, 1.0f / 0.45f);
+}
+
+float eotf_pq(float v) {
+    const float m1 = 2610.0f / 16384.0f;
+    const float m2 = 2523.0f / 4096.0f * 128.0f;
+    const float c1 = 3424.0f / 4096.0f;
+    const float c2 = 2413.0f / 4096.0f * 32.0f;
+    const float c3 = 2392.0f / 4096.0f * 32.0f;
+    const float em = std::pow(v, 1.0f / m2);
+    return 10000.0f * std::pow((em - c1) / (c2 - c3 * em), 1.0f / m1);
+}
+
+float tonemap(float lin, float peak_in) {
+    const float t = lin / peak_in;
+    const float scale = (t <= 1.0f ? 1.0f : (2.0f - 1.0f / t) / t) / peak_in;
+    return lin * scale;
+}
+
+float oetf_srgb(float l) {
+    return l <= 0.0031308f ? l * 12.92f
+                           : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+}
+
+// 有限范围 luma 编码值 → 期望的 8bit 输出（0-255 浮点，BT.709 传递函数）
+float expect_sdr(uint8_t y) {
+    return oetf_srgb(eotf_bt709((y - 16.0f) / 219.0f)) * 255.0f;
+}
+
+// 有限范围 luma 编码值 → PQ 解码 + 以 max_cll 为锚的色调映射 → sRGB 编码
+float expect_pq(uint8_t y, float max_cll) {
+    return oetf_srgb(tonemap(eotf_pq((y - 16.0f) / 219.0f), max_cll)) * 255.0f;
+}
+
 }  // namespace
 
 int main() {
@@ -60,7 +99,7 @@ int main() {
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
     ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkExternalMemoryImageCreateInfo external{};
@@ -229,9 +268,10 @@ int main() {
         vkQueueSubmit(producer.graphics_queue, 1, &vsubmit, vfence);
         vkWaitForFences(producer.device, 1, &vfence, VK_TRUE, 5'000'000'000ull);
         vkDestroyFence(producer.device, vfence, nullptr);
-        std::fprintf(stderr, "dbg raw y(0,0)=%3u y(0,40)=%3u y(40,0)=%3u uv0=%3u\n",
-                     bytes[0], bytes[40], bytes[40 * plane_layout[0].rowPitch],
-                     bytes[y_bytes]);
+        if (bytes[0] != 64 || bytes[40] != 200 ||
+            bytes[y_bytes] != 128) {
+            return fail("producer NV12 content check");
+        }
     }
 
     VkMemoryGetFdInfoKHR fd_info{};
@@ -256,6 +296,7 @@ int main() {
     uint32_t released = 0;
     scene.set_release_callback(
         [&](uint64_t, uint64_t, uint32_t) { ++released; });
+    const uint32_t expected_releases = 2;
 
     kopms::VulkanScene::ImportRequest request{};
     request.width = kW;
@@ -273,16 +314,38 @@ int main() {
     request.plane_strides = strides;
     request.plane_modifiers = modifiers;
     request.acquire_fence_kind = KOPAW_SYNC_FENCE_NONE;
+    request.has_color_metadata = true;
+    request.color.range = KOPAW_COLOR_RANGE_LIMITED;
+    request.color.matrix = KOPAW_COLOR_MATRIX_BT601;
+    request.color.primaries = KOPAW_COLOR_PRIMARIES_BT601;
+    request.color.chroma_location = KOPAW_CHROMA_LOCATION_CENTER;
+
+    // 两个窗口并排，导入同一张 NV12，但走不同传递函数：左窗 SDR（BT.709
+    // 直上 sRGB），右窗 HDR（PQ + MaxCLL=2000 做色调映射）。
+    request.color.transfer = KOPAW_COLOR_TRANSFER_BT709;
     request.session_id = 1;
     request.frame_id = 1;
     if (!scene.submit(1, request, &reason)) {
-        return fail(("scene submit: " + reason).c_str());
+        return fail(("scene submit sdr: " + reason).c_str());
     }
 
-    std::vector<kopms::VulkanScene::LayoutItem> layout(1);
+    request.color.transfer = KOPAW_COLOR_TRANSFER_PQ;
+    request.color.hdr.flags = KOPAW_HDR_FLAG_CONTENT_LIGHT;
+    request.color.hdr.max_cll = 4000;  // cd/m²，色调映射锚点
+    request.session_id = 2;
+    request.frame_id = 2;
+    if (!scene.submit(2, request, &reason)) {
+        return fail(("scene submit pq: " + reason).c_str());
+    }
+
+    const int32_t half = static_cast<int32_t>(kW / 2);
+    std::vector<kopms::VulkanScene::LayoutItem> layout(2);
     layout[0].window_id = 1;
     layout[0].z = 0;
-    layout[0].rect = {0, 0, static_cast<int32_t>(kW), static_cast<int32_t>(kH)};
+    layout[0].rect = {0, 0, half, static_cast<int32_t>(kH)};
+    layout[1].window_id = 2;
+    layout[1].z = 0;
+    layout[1].rect = {half, 0, half, static_cast<int32_t>(kH)};
     if (!scene.render(layout, &reason)) {
         return fail(("scene render: " + reason).c_str());
     }
@@ -313,7 +376,7 @@ int main() {
         ti.mipLevels = 1;
         ti.arrayLayers = 1;
         ti.samples = VK_SAMPLE_COUNT_1_BIT;
-        ti.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ti.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
         ti.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ti.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkExternalMemoryImageCreateInfo texternal{};
@@ -348,9 +411,18 @@ int main() {
         tai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         tai.allocationSize = treq.size;
         tai.pNext = &import_mem;
+        VkMemoryFdPropertiesKHR fd_props{};
+        fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+        if (!reader.get_memory_fd_properties ||
+            reader.get_memory_fd_properties(
+                reader.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                target_fd, &fd_props) != VK_SUCCESS) {
+            return fail("reader vkGetMemoryFdPropertiesKHR");
+        }
         tai.memoryTypeIndex =
-            kop::vkutil::find_memory_type(reader.physical, treq.memoryTypeBits, 0,
-                                          &reason);
+            kop::vkutil::find_memory_type(reader.physical,
+                                          treq.memoryTypeBits & fd_props.memoryTypeBits,
+                                          0, &reason);
         if (tai.memoryTypeIndex == UINT32_MAX) return fail("reader memory type");
         VkDeviceMemory tmem = VK_NULL_HANDLE;
         if (vkAllocateMemory(reader.device, &tai, nullptr, &tmem) != VK_SUCCESS) {
@@ -435,35 +507,32 @@ int main() {
         struct Probe {
             uint32_t x;
             float expect;
+            const char* note;
         };
-        const Probe probes[2] = {{8, 56.0f}, {44, 214.0f}};
+        // 两窗口并排（各 32 宽），同一张 NV12（左半 Y=64 暗、右半 Y=200 亮）。
+        // 每窗取两个探针：一个落在暗半、一个落在亮半，均远离中线与窗口边界。
+        // 期望值由上面的参考实现算出（BT.709 直上 sRGB / PQ+MaxCLL 色调映射）。
+        const Probe probes[4] = {
+            {4,  expect_sdr(64),  "sdr dark"},
+            {26, expect_sdr(200), "sdr bright"},
+            {36, expect_pq(64, 4000.0f),  "pq dark"},
+            {58, expect_pq(200, 4000.0f), "pq bright"},
+        };
         const auto* pixels = static_cast<const uint8_t*>(rmapped);
-        for (uint32_t xx = 40; xx < 46; ++xx) {
-            const uint8_t* px = pixels + 24ull * target_stride + xx * 4;
-            std::fprintf(stderr, "dbg right y24 x=%u: %3u %3u %3u %3u\n", xx, px[0],
-                         px[1], px[2], px[3]);
-        }
-        for (uint32_t xx = 0; xx < 12; ++xx) {
-            const uint8_t* px = pixels + 24ull * target_stride + xx * 4;
-            std::fprintf(stderr, "dbg y24 x=%u: %3u %3u %3u %3u\n", xx, px[0],
-                         px[1], px[2], px[3]);
-        }
-        for (uint32_t yy = 0; yy < 48; yy += 12) {
-            const uint8_t* px = pixels + yy * target_stride + 8 * 4;
-            std::fprintf(stderr, "dbg x8 y=%u: %3u %3u %3u %3u\n", yy, px[0],
-                         px[1], px[2], px[3]);
-        }
         for (const Probe& p : probes) {
             const uint8_t* px =
                 pixels + static_cast<size_t>(24) * target_stride + p.x * 4;
             const float b = px[0], g = px[1], r = px[2];
-            std::fprintf(stdout, "vk nv12 scene: probe x=%u rgb=(%.0f,%.0f,%.0f)\n",
-                         p.x, r, g, b);
+            std::fprintf(stdout,
+                         "vk nv12 scene: probe x=%u (%s) rgb=(%.0f,%.0f,%.0f)"
+                         " expect=%.1f\n",
+                         p.x, p.note, r, g, b, p.expect);
             if (fabsf(r - p.expect) > 2.0f || fabsf(g - p.expect) > 2.0f ||
                 fabsf(b - p.expect) > 2.0f) {
-                std::fprintf(stderr, "probe x=%u: got (%.0f,%.0f,%.0f), want %.0f\n",
-                             p.x, r, g, b, p.expect);
-                return fail("NV12 YUV→RGB 转换结果超出容差");
+                std::fprintf(stderr,
+                             "probe x=%u (%s): got (%.0f,%.0f,%.0f), want %.1f\n",
+                             p.x, p.note, r, g, b, p.expect);
+                return fail("NV12 色彩管线（YUV→RGB→传递函数）结果超出容差");
             }
         }
 
@@ -479,7 +548,8 @@ int main() {
 
     // ---- 释放：再次 render 触发 fire_releases，帧生命周期闭合 ----
     scene.render({}, &reason);
-    if (released != 1) return fail("release callback not fired exactly once");
+    if (released != expected_releases)
+        return fail("release callback not fired for every submitted frame");
     ::close(target_fd);
     ::close(nv12_fd);
     vkUnmapMemory(producer.device, smem);

@@ -201,13 +201,15 @@ bool run() {
                               KOPMS_PROTOCOL_CAP_FRAME_RELEASE |
                               KOPMS_PROTOCOL_CAP_HANDLE_FRAMES |
                               KOPMS_PROTOCOL_CAP_MODIFIERS |
-                              KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC;
+                              KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC |
+                              KOPMS_PROTOCOL_CAP_COLOR_METADATA;
         if (!hello_with(&client, loop, caps, &ack, &error)) {
             return fail(("negotiation hello: " + error).c_str());
         }
         if ((ack.capabilities & KOPMS_PROTOCOL_CAP_HANDLE_FRAMES) == 0 ||
             (ack.capabilities & KOPMS_PROTOCOL_CAP_MODIFIERS) == 0 ||
-            (ack.capabilities & KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC) == 0) {
+            (ack.capabilities & KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC) == 0 ||
+            (ack.capabilities & KOPMS_PROTOCOL_CAP_COLOR_METADATA) == 0) {
             return fail("new P3 capability bits were not negotiated");
         }
         if (ack.selected_minor < 1) return fail("protocol minor < 1");
@@ -223,7 +225,8 @@ bool run() {
         kopms::BusConnection gated(fd);
         KopmsHelloAckPayload ack{};
         if (!hello_with(&gated, loop,
-                        KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE,
+                        KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE |
+                            KOPMS_PROTOCOL_CAP_COLOR_METADATA,
                         &ack, &error)) {
             return fail("gated hello");
         }
@@ -256,6 +259,7 @@ bool run() {
                         KOPMS_PROTOCOL_CAP_HANDLE_FRAMES |
                         KOPMS_PROTOCOL_CAP_MODIFIERS |
                         KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC |
+                        KOPMS_PROTOCOL_CAP_COLOR_METADATA |
                         KOPMS_PROTOCOL_CAP_CONTROL_STATE,
                     &ack, &error)) {
         return fail(("producer hello: " + error).c_str());
@@ -360,7 +364,8 @@ bool run() {
         KopmsHelloAckPayload abrupt_ack{};
         const uint64_t caps = KOPMS_PROTOCOL_CAP_DMABUF |
                               KOPMS_PROTOCOL_CAP_FRAME_RELEASE |
-                              KOPMS_PROTOCOL_CAP_HANDLE_FRAMES;
+                              KOPMS_PROTOCOL_CAP_HANDLE_FRAMES |
+                              KOPMS_PROTOCOL_CAP_COLOR_METADATA;
         if (!hello_with(&abrupt, loop, caps, &abrupt_ack, &error))
             return fail("abrupt hello");
         const int frame_fd2 = open("/dev/zero", O_RDONLY | O_CLOEXEC);

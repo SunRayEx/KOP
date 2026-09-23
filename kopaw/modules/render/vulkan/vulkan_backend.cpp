@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "../../frame.hpp"
+#include "kop/color_pipeline.hpp"
 #include "kop/log.h"
 
 // 由 CMake 嵌入步骤生成（shaders/*.vert|frag → SPIR-V 字节数组）
@@ -24,6 +25,16 @@ namespace kopaw {
 static const char* kTag = "vk";
 
 namespace {
+
+// quad.frag 的 push constant 区（片段 stage，24 字节）。两条管线（RGBA 与
+// native YUV）共用同一 SPIR-V，故布局必须一致。
+VkPushConstantRange color_pc_range() {
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    range.offset = 0;
+    range.size = sizeof(kop::ColorPushConstants);
+    return range;
+}
 
 const char* vk_result_str(VkResult r) {
     switch (r) {
@@ -292,6 +303,31 @@ uint32_t VulkanBackend::find_memory_type(uint32_t type_bits,
     return UINT32_MAX;
 }
 
+uint32_t VulkanBackend::dmabuf_format_mask() const {
+    if (!inited_ || !ycbcr_enabled_ || !ext_dmabuf_ || !ext_drm_modifier_ ||
+        !get_memory_fd_properties_) {
+        return kNativeDmabufFormatNone;
+    }
+    struct Candidate {
+        VkFormat format;
+        uint32_t bit;
+    };
+    constexpr Candidate candidates[] = {
+        {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, kNativeDmabufFormatNv12},
+        {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+         kNativeDmabufFormatP010},
+    };
+    uint32_t formats = kNativeDmabufFormatNone;
+    for (const Candidate& candidate : candidates) {
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(pd_, candidate.format, &props);
+        if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0) {
+            formats |= candidate.bit;
+        }
+    }
+    return formats;
+}
+
 bool VulkanBackend::create_swapchain_objects(std::string* error) {
     VkSurfaceCapabilitiesKHR caps{};
     if (vkfail(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd_, surf_, &caps),
@@ -441,6 +477,9 @@ bool VulkanBackend::create_pipeline(std::string* error) {
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pli.setLayoutCount = 1;
         pli.pSetLayouts = &dsl_;
+        const VkPushConstantRange pc_range = color_pc_range();
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pc_range;
         if (vkfail(vkCreatePipelineLayout(dev_, &pli, nullptr, &play_),
                    "管线布局", error)) {
             return true;
@@ -545,7 +584,10 @@ VulkanBackend::ensure_yuv_pipeline(YcbcrConfig config, uint32_t width,
     for (auto& entry : yuv_pipelines_) {
         const auto& key = entry->config;
         if (key.format == config.format && key.modifier == config.modifier &&
-            key.model == config.model) {
+            key.model == config.model && key.range == config.range &&
+            key.x_chroma_location == config.x_chroma_location &&
+            key.y_chroma_location == config.y_chroma_location &&
+            key.filter == config.filter) {
             if (width > key.max_extent.width ||
                 height > key.max_extent.height) {
                 *error = "YCbCr dimensions exceed the device format limits";
@@ -563,12 +605,12 @@ VulkanBackend::ensure_yuv_pipeline(YcbcrConfig config, uint32_t width,
     conversion.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
     conversion.format = config.format;
     conversion.ycbcrModel = config.model;
-    conversion.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
+    conversion.ycbcrRange = config.range;
     conversion.components = {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    conversion.xChromaOffset = config.chroma_location;
-    conversion.yChromaOffset = config.chroma_location;
+    conversion.xChromaOffset = config.x_chroma_location;
+    conversion.yChromaOffset = config.y_chroma_location;
     conversion.chromaFilter = config.filter;
     auto failed = [&](VkResult result, const char* operation) {
         if (!vkfail(result, operation, error)) return false;
@@ -611,6 +653,9 @@ VulkanBackend::ensure_yuv_pipeline(YcbcrConfig config, uint32_t width,
     layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layout.setLayoutCount = 1;
     layout.pSetLayouts = &yuv.descriptor_layout;
+    const VkPushConstantRange pc_range = color_pc_range();
+    layout.pushConstantRangeCount = 1;
+    layout.pPushConstantRanges = &pc_range;
     if (failed(vkCreatePipelineLayout(dev_, &layout, nullptr, &yuv.layout),
                "YCbCr pipeline layout"))
         return nullptr;
@@ -643,14 +688,19 @@ VulkanBackend::ensure_yuv_pipeline(YcbcrConfig config, uint32_t width,
     if (failed(vkAllocateDescriptorSets(dev_, &sets, yuv.sets),
                "YCbCr descriptor sets"))
         return nullptr;
-    KOP_LOG_INFO(
-        kTag, "YCbCr %s %s modifier=0x%llx descriptors=%u filter=%s",
-        config.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? "NV12" : "P010",
-        config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709 ? "BT.709"
-                                                                    : "BT.601",
-        static_cast<unsigned long long>(config.modifier),
-        config.descriptor_count,
-        config.filter == VK_FILTER_LINEAR ? "linear" : "nearest");
+    const char* matrix = config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709
+                             ? "BT.709"
+                         : config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_2020
+                             ? "BT.2020 NCL"
+                             : "BT.601";
+    KOP_LOG_INFO(kTag,
+                 "YCbCr %s %s %s modifier=0x%llx descriptors=%u filter=%s",
+                 config.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? "NV12" : "P010",
+                 matrix,
+                 config.range == VK_SAMPLER_YCBCR_RANGE_ITU_FULL ? "full" : "limited",
+                 static_cast<unsigned long long>(config.modifier),
+                 config.descriptor_count,
+                 config.filter == VK_FILTER_LINEAR ? "linear" : "nearest");
     yuv_pipelines_.push_back(std::move(entry));
     return yuv_pipelines_.back().get();
 }
@@ -1023,6 +1073,15 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
             KOP_LOG_ERROR(kTag, "设备未启用 YCbCr DMA-BUF 导入");
             return false;
         }
+        if (!hdr_sdr_warning_logged_ &&
+            (frame->color.transfer == KOPAW_COLOR_TRANSFER_PQ ||
+             frame->color.transfer == KOPAW_COLOR_TRANSFER_HLG)) {
+            hdr_sdr_warning_logged_ = true;
+            KOP_LOG_WARN(kTag,
+                         "HDR frame is tone-mapped to the SDR swapchain "
+                         "(anchored on the declared content peak); no full "
+                         "HDR output transform is applied");
+        }
         if (!describe_ycbcr_frame(frame, &config, &err) ||
             !(yuv = ensure_yuv_pipeline(config, w, h, &err))) {
             KOP_LOG_ERROR(kTag, "%s", err.c_str());
@@ -1192,6 +1251,22 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, play_, 0,
                                 1, &dsets_[cur_tex_], 0, nullptr);
     }
+    // 两条管线共用 quad.frag：按帧声明的 transfer 走 EOTF→色调映射→sRGB OETF；
+    // transfer 未知时着色器直通，保留旧路径。
+    const size_t color_end = offsetof(KopawFrame, color) + sizeof(frame->color);
+    const kop::ColorPushConstants color_pc{
+        0,
+        0,
+        0,
+        frame->struct_size >= color_end
+            ? static_cast<int32_t>(frame->color.transfer)
+            : KOPAW_COLOR_TRANSFER_UNKNOWN,
+        frame->struct_size >= color_end
+            ? kop::declared_peak_luminance(frame->color)
+            : 1000.0f};
+    vkCmdPushConstants(cmd, native_yuv ? yuv->layout : play_,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(color_pc),
+                       &color_pc);
     vkCmdDraw(cmd, 4, 1, 0, 0); // 三角带全屏四边形
     vkCmdEndRendering(cmd);
 

@@ -49,6 +49,9 @@ int32_t RenderNode::run_impl() {
         return KOPAW_E_GENERIC;
     }
     KOP_LOG_INFO(kTag, "使用 %s 渲染后端", backend_->name());
+    if (dmabuf_capability_callback_) {
+        dmabuf_capability_callback_(backend_->dmabuf_format_mask());
+    }
 
     // 音频时钟未激活时以首帧为原点的墙上时钟节拍
     bool anchored = false;
@@ -94,9 +97,17 @@ int32_t RenderNode::run_impl() {
             kop::sleep_us(std::min<int64_t>(remain, 2000));
         }
         backend_->poll_events();
+        const bool external = f->memory_type == KOPAW_MEMORY_DMABUF;
         bool ok = backend_->draw(f);
         f->release(f);
         if (!ok) {
+            if (external && !dmabuf_fallback_used_ && dmabuf_fallback_) {
+                dmabuf_fallback_used_ = true;
+                KOP_LOG_WARN(kTag,
+                             "DMA-BUF 导入失败，关闭解码器原生输出并回退 CPU 路径");
+                dmabuf_fallback_();
+                continue;
+            }
             KOP_LOG_ERROR(kTag, "绘制失败，终止渲染");
             close_requested_.store(true);
             break;

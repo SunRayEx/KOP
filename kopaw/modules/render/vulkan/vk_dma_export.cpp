@@ -1,5 +1,6 @@
 #include "vk_dma_export.hpp"
 
+#include <cstddef>
 #include <chrono>
 #include <cstring>
 #include <utility>
@@ -126,10 +127,14 @@ bool VulkanDmabufExporter::create_export_image(uint32_t w, uint32_t h, Slot* slo
     image.mipLevels = 1;
     image.arrayLayers = 1;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
-    // modifier 扩展缺失时退回 LINEAR tiling（行距有定义、全平台可导入）；
-    // OPTIMAL tiling 的行距未定义，不能作为 DMA-BUF 平面元数据导出。
-    image.tiling = ctx_.ext_drm_modifier ? VK_IMAGE_TILING_OPTIMAL
-                                         : VK_IMAGE_TILING_LINEAR;
+    // VkImageDrmFormatModifierListCreateInfoEXT 只能与
+    // VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT 配对。此前把它错误地作为
+    // OPTIMAL 图像创建，部分驱动虽接受导出，却会在另一个 VkDevice 导入时
+    // 以 vkAllocateMemory 失败暴露出来。
+    // modifier 扩展缺失时退回 LINEAR tiling（行距有定义、全平台可导入）。
+    image.tiling = ctx_.ext_drm_modifier
+                       ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+                       : VK_IMAGE_TILING_LINEAR;
     image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -169,8 +174,13 @@ bool VulkanDmabufExporter::create_export_image(uint32_t w, uint32_t h, Slot* slo
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.pNext = &export_mem;
-    ai.memoryTypeIndex = vkutil::find_memory_type(
-        ctx_.physical, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, error);
+    // External-memory implementations (notably software Vulkan and some
+    // integrated GPUs) may expose exportable image allocations only from a
+    // host-visible heap. The image's memoryTypeBits already constrain this to
+    // valid heaps; do not impose DEVICE_LOCAL and turn a usable zero-copy
+    // handle into an avoidable OUT_OF_DEVICE_MEMORY failure.
+    ai.memoryTypeIndex = vkutil::find_memory_type(ctx_.physical, req.memoryTypeBits,
+                                                  0, error);
     if (ai.memoryTypeIndex == UINT32_MAX) return false;
     if (vkfail(vkAllocateMemory(ctx_.device, &ai, nullptr, &slot->memory),
                "vkAllocateMemory(exportable)", error)) {
@@ -197,10 +207,10 @@ bool VulkanDmabufExporter::create_export_image(uint32_t w, uint32_t h, Slot* slo
     slot->offset = static_cast<uint32_t>(layout.offset);
     slot->w = w;
     slot->h = h;
+    slot->modifier = linear;  // 两条路径最终都是 DRM_FORMAT_MOD_LINEAR
     KOP_LOG_DEBUG(kTag, "导出图像 %ux%u stride=%u offset=%u modifier=0x%llx", w, h,
                   slot->stride, slot->offset,
                   static_cast<unsigned long long>(slot->modifier));
-    slot->modifier = linear;  // 两条路径最终都是 DRM_FORMAT_MOD_LINEAR
     if (slot->stride < w * 4) {
         if (error) *error = "导出图像行距异常";
         return false;
@@ -375,6 +385,8 @@ bool VulkanDmabufExporter::upload_and_export(const KopawFrame* src, Slot* slot,
     out->acquire_fence.value = 0;
     out->dma_buf_handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(slot->image));
     out->flags = src->flags;
+    const size_t color_end = offsetof(KopawFrame, color) + sizeof(src->color);
+    if (src->struct_size >= color_end) out->color = src->color;
     upload_us_total_ += static_cast<uint64_t>(now_us() - started);
     ++exported_frames_;
     return true;

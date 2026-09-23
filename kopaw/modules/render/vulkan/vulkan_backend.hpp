@@ -2,7 +2,8 @@
 // 管线：RGBA 纹理（双缓冲乒乓）→ 全屏三角形采样 → 动态渲染呈现。
 // 使用 Vulkan 1.3 dynamic rendering（无 RenderPass 对象），FIFO 垂直同步。
 // NV12/P010 DMA-BUF 按显式 DRM modifier 导入为双平面 VkImage，
-// VkSamplerYcbcrConversion 完成有限范围 BT.601/709 转换。
+// VkSamplerYcbcrConversion 按帧元数据完成 BT.601/709/2020 NCL 与
+// full/limited-range 转换。
 #pragma once
 #include <memory>
 #include <string>
@@ -27,9 +28,9 @@ public:
     void shutdown() override;
     const char* name() const override { return "vulkan"; }
     bool supports_dmabuf() const override {
-        return inited_ && ycbcr_enabled_ && ext_dmabuf_ && ext_drm_modifier_ &&
-               ext_foreign_queue_;
+        return dmabuf_format_mask() != kNativeDmabufFormatNone;
     }
+    uint32_t dmabuf_format_mask() const override;
 
 private:
     static constexpr int kMaxFrames = 2;
@@ -114,7 +115,8 @@ private:
     VkDescriptorSet dsets_[kMaxFrames]{};
     VkSampler samp_ = VK_NULL_HANDLE;
 
-    // Format/modifier/matrix select immutable samplers and compatible layouts.
+    // Format/modifier/matrix/range/chroma/filter select immutable samplers and
+    // compatible layouts.
     // Fixed-function YCbCr conversion lets RGBA and YUV share quad.frag.
     std::vector<std::unique_ptr<YuvPipeline>> yuv_pipelines_;
     Imported imported_[kMaxFrames];
@@ -134,6 +136,7 @@ private:
     int frame_idx_ = 0;
 
     bool device_lost_ = false;
+    bool hdr_sdr_warning_logged_ = false;
 };
 
 } // namespace kopaw

@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include "../frame.hpp"
+#include "native_dmabuf.hpp"
 
 namespace kopaw {
 
@@ -33,9 +34,13 @@ public:
     bool init(VADisplay display);
     bool inited() const { return display_ != nullptr; }
 
-    // hw 帧必须是 AV_PIX_FMT_VAAPI 且表面格式为 NV12 或 P010。返回的帧引用归零时：
+    // accepted_formats comes from the downstream startup negotiation. The
+    // current exporter maps NV12/P010; additional native surface formats can
+    // be added by extending that map without weakening the fallback contract.
+    // 返回的帧引用归零时：
     // 关闭 DMA-BUF fd → av_frame_free 归还表面。失败返回 nullptr。
-    OwnedFrame* export_frame(const AVFrame* hw_frame, std::string* error);
+    OwnedFrame* export_frame(const AVFrame* hw_frame, uint32_t accepted_formats,
+                             std::string* error);
 
 private:
     VADisplay display_ = nullptr;

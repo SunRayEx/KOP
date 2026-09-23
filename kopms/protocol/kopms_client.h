@@ -2,7 +2,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -13,6 +15,7 @@ namespace kopms {
 
 class KopmsClient {
 public:
+    using FrameReleaseObserver = std::function<void(uint32_t frame_id, uint32_t status)>;
     KopmsClient() = default;
     ~KopmsClient();
 
@@ -23,8 +26,9 @@ public:
     bool hello(uint64_t capabilities, std::string* error);
     bool connected() const { return connection_.valid() && hello_complete_; }
 
-    // submit() retains the descriptor until KOPMS-S sends FRAME_RELEASE. The
-    // caller keeps its original reference and may release it immediately.
+    // submit() retains the descriptor until KOPMS-S sends FRAME_RELEASE. Once
+    // connected, a rejected attempt also invokes release exactly once, so a
+    // submission wrapper can keep one ownership path for success and failure.
     bool submit(KopmsFrameDescriptor* frame, uint32_t* frame_id, std::string* error);
 
     // Sends a control-plane request. The request remains pending until its
@@ -45,6 +49,9 @@ public:
 
     uint64_t capabilities() const { return capabilities_; }
     uint16_t negotiated_minor() const { return minor_; }
+    void set_frame_release_observer(FrameReleaseObserver observer) {
+        frame_release_observer_ = std::move(observer);
+    }
 
 private:
     bool process_message(BusMessage&& message, std::string* error);
@@ -65,6 +72,7 @@ private:
     uint32_t next_frame_id_ = 1;
     uint32_t last_released_frame_id_ = 0;
     uint32_t last_release_status_ = KOPMS_FRAME_RELEASE_OK;
+    FrameReleaseObserver frame_release_observer_;
     std::unordered_map<uint32_t, KopmsFrameDescriptor*> pending_frames_;
     std::unordered_set<uint64_t> pending_control_requests_;
     std::unordered_map<uint64_t, KopmsControlAckPayload> control_acks_;

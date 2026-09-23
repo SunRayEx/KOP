@@ -1008,6 +1008,7 @@ mod tests {
             retain: Some(mock_retain),
             release: Some(mock_release),
             drm_fourcc: 0,
+            color: crate::ffi::KopawColorMetadata::default(),
         }))
     }
 

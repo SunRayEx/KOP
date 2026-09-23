@@ -53,6 +53,11 @@ public:
         const uint64_t* plane_modifiers = nullptr;
         uint32_t acquire_fence_kind = KOPAW_SYNC_FENCE_NONE;
         int acquire_fence_fd = -1;
+        // BUS 1.2 carries this tail explicitly. Wayland linux-dmabuf has no
+        // color-management handoff here, so YUV from that path stays absent
+        // instead of guessing BT.601/709 from its dimensions.
+        KopawColorMetadata color{};
+        bool has_color_metadata = false;
         uint64_t session_id = 0;   // 释放回调参数
         uint32_t frame_id = 0;     // 释放回调参数
     };
@@ -86,6 +91,7 @@ public:
     // 提交一帧到场景窗口。false = 该窗口上一帧仍在飞（回压拒收），调用方
     // 应以 DROPPED 释放。导入失败同样返回 false（帧被拒收而不是挂死）。
     bool submit(uint64_t window_id, const ImportRequest& request, std::string* error);
+    bool backpressured(uint64_t window_id) const;
 
     // 合成一帧布局并呈现。windowed 模式走 swapchain present，离屏模式渲染
     // 后等待 render fence；两种模式都在 GPU 完成后触发帧释放回调。

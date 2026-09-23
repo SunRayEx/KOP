@@ -21,7 +21,8 @@ struct KopmsFrameDescriptor;
 /// 1.1: Handle/modifier/explicit-sync capability negotiation (P3-M3/M4). The
 /// 32-byte header, the CONTROL/MEDIA lanes, and SCM_RIGHTS framing are
 /// unchanged; only new capability bits and their validation rules were added.
-#define KOPMS_PROTOCOL_MINOR UINT16_C(1)
+/// 1.2: optional colorimetry/HDR tail on FRAME_SUBMIT.
+#define KOPMS_PROTOCOL_MINOR UINT16_C(2)
 
 #define KOPMS_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define KOPMS_PROTOCOL_MAX_PAYLOAD UINT32_C(65536)
@@ -38,10 +39,15 @@ struct KopmsFrameDescriptor;
 /// Acquire fences may ride on FRAME_SUBMIT and release timing is honored
 /// (release only after present/flip completion).
 #define KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC UINT64_C(64)
+/// KopawColorMetadata is present in the optional FRAME_SUBMIT tail.
+#define KOPMS_PROTOCOL_CAP_COLOR_METADATA UINT64_C(128)
 
 #define KOPMS_HELLO_PAYLOAD_SIZE UINT32_C(32)
 #define KOPMS_HELLO_ACK_PAYLOAD_SIZE UINT32_C(32)
-#define KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE UINT32_C(160)
+#define KOPMS_FRAME_SUBMIT_BASE_SIZE UINT32_C(160)
+#define KOPMS_FRAME_SUBMIT_COLOR_METADATA_SIZE UINT32_C(80)
+#define KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE \
+    (KOPMS_FRAME_SUBMIT_BASE_SIZE + KOPMS_FRAME_SUBMIT_COLOR_METADATA_SIZE)
 #define KOPMS_FRAME_RELEASE_PAYLOAD_SIZE UINT32_C(16)
 #define KOPMS_GOODBYE_PAYLOAD_SIZE UINT32_C(8)
 #define KOPMS_CONTROL_PAYLOAD_SIZE UINT32_C(40)
@@ -167,6 +173,9 @@ typedef struct KopmsFrameSubmitPayload {
     int64_t dts;
     KopmsFramePlane planes[KOPAW_MAX_DMABUF_PLANES];
     KopmsFrameFence acquire_fence;
+    // Optional 1.2 tail. Presence is gated by struct_size and the negotiated
+    // KOPMS_PROTOCOL_CAP_COLOR_METADATA capability.
+    KopawColorMetadata color;
 } KopmsFrameSubmitPayload;
 
 typedef struct KopmsFrameReleasePayload {
@@ -209,6 +218,8 @@ typedef struct KopmsControlAckPayload {
 static_assert(sizeof(KopmsMessageHeader) == 32, "unexpected KOPMS header layout");
 static_assert(sizeof(KopmsFramePlane) == 24, "unexpected KOPMS plane layout");
 static_assert(sizeof(KopmsFrameFence) == 16, "unexpected KOPMS fence layout");
+static_assert(sizeof(KopawHdrMetadata) == 56, "unexpected KOPAW HDR layout");
+static_assert(sizeof(KopawColorMetadata) == 80, "unexpected KOPAW color layout");
 static_assert(sizeof(KopmsFrameSubmitPayload) == KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE,
               "unexpected KOPMS frame layout");
 static_assert(sizeof(KopmsControlCommandPayload) == KOPMS_CONTROL_PAYLOAD_SIZE,

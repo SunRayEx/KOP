@@ -11,6 +11,7 @@ corrosion_import_crate(
 set(KOPAW_MODULES_SOURCES
     modules/ffmpeg/demuxer_node.cpp
     modules/ffmpeg/video_decoder_node.cpp
+    modules/ffmpeg/color_metadata.cpp
     modules/ffmpeg/audio_decoder_node.cpp
     modules/ffmpeg/filter_node.cpp
     modules/audio/portaudio_sink_node.cpp
@@ -87,7 +88,7 @@ if(KOPAW_BUILD_VULKAN)
             -DOUT_FILE=${GEN_DIR}/shaders_embed.cpp
             -P ${CMAKE_SOURCE_DIR}/cmake/EmbedShaders.cmake
         DEPENDS glslang-standalone ${SHADER_DIR}/quad.vert ${SHADER_DIR}/quad.frag
-                ${SHADER_DIR}/nv12.frag
+                ${SHADER_DIR}/nv12.frag ${SHADER_DIR}/color.glsl
         VERBATIM
     )
     target_sources(kopaw-modules PRIVATE ${GEN_DIR}/shaders_embed.cpp)

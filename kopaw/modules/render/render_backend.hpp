@@ -6,6 +6,7 @@
 #include <string>
 
 #include "kopaw_abi.h"  // 自带 extern "C" 保护
+#include "native_dmabuf.hpp"
 
 struct GLFWwindow;
 
@@ -51,7 +52,12 @@ public:
     virtual const char* name() const = 0;
 
     // 是否支持直接消费外部内存帧（KOPAW_MEMORY_DMABUF）。
-    // player 用它决定是否让解码器走原生零拷贝输出（P2）。
+    // The mask is negotiated before native output is enabled. Per-frame
+    // modifier compatibility remains an import-time check and can trigger the
+    // CPU fallback.
+    virtual uint32_t dmabuf_format_mask() const {
+        return kNativeDmabufFormatNone;
+    }
     virtual bool supports_dmabuf() const { return false; }
 };
 

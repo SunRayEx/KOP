@@ -108,6 +108,9 @@ kopms::VulkanScene::ImportRequest request_from(const kopms::KopmsReceivedFrame& 
         frame.payload.acquire_fence.kind == KOPAW_SYNC_FENCE_FD
             ? frame.fds[static_cast<size_t>(frame.payload.acquire_fence.fd_index)]
             : -1;
+    request.color = frame.payload.color;
+    request.has_color_metadata =
+        frame.payload.struct_size >= KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE;
     request.session_id = frame.session_id;
     request.frame_id = frame.payload.frame_id;
     return request;

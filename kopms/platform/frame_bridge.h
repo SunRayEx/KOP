@@ -43,6 +43,8 @@ typedef struct KopmsFrameDescriptor {
     // these absent; consumers must check struct_size before reading them.
     int64_t pts;
     int64_t dts;
+    // Optional colorimetry/HDR tail. Consumers must gate reads by struct_size.
+    KopawColorMetadata color;
 } KopmsFrameDescriptor;
 
 #ifdef __cplusplus

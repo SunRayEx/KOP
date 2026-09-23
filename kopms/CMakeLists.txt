@@ -89,21 +89,31 @@ if(KOPMS_HAVE_EXPLICIT_SYNC_PROTO)
 endif()
 target_include_directories(kopms-compositor PRIVATE
     ${KOPMS_PROTO_DIR} ${CMAKE_SOURCE_DIR}/common/include)
+# KOPMS 线编解码（protocol codec + 帧描述校验）：无 wayland/DRM 依赖，
+# 供 kopnet-remote 等跨模块消费者复用，避免重复编译同一份 .cpp 导致符号冲突。
+add_library(kopms-wire STATIC
+    protocol/kopms_protocol.cpp
+    platform/frame_bridge.cpp
+    platform/gpu_mode.cpp
+)
+target_include_directories(kopms-wire PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform
+    ${CMAKE_SOURCE_DIR}/kopaw/abi/include)
+
 add_library(kopms-platform STATIC
     platform/drm_kms.cpp
     platform/drm_buffer.cpp
     platform/drm_hotplug.cpp
     platform/drm_output.cpp
-    platform/gpu_mode.cpp
     platform/libinput_guard.cpp
     platform/seat_session.cpp
-    platform/frame_bridge.cpp
 )
 target_include_directories(kopms-platform PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/platform
     ${CMAKE_SOURCE_DIR}/kopaw/abi/include
     ${CMAKE_SOURCE_DIR}/common/include)
-target_link_libraries(kopms-platform PUBLIC kop-common)
+target_link_libraries(kopms-platform PUBLIC kop-common kopms-wire)
 if(LIBDRM_FOUND)
     target_compile_definitions(kopms-platform PRIVATE KOPMS_HAVE_LIBDRM=1)
     target_link_libraries(kopms-platform PUBLIC PkgConfig::LIBDRM)
@@ -169,7 +179,6 @@ target_include_directories(kopms-bus2layer PUBLIC
 
 add_library(kopms-protocol STATIC
     control/control_state.cpp
-    protocol/kopms_protocol.cpp
     protocol/kopms_server.cpp
     protocol/kopms_client.cpp
 )
@@ -181,7 +190,7 @@ target_include_directories(kopms-protocol PUBLIC
     ${CMAKE_SOURCE_DIR}/kopaw/abi/include
 )
 target_link_libraries(kopms-protocol PUBLIC
-    kopms-bus2layer kopms-platform wayland-server)
+    kopms-wire kopms-bus2layer kopms-platform wayland-server)
 if(LIBINPUT_FOUND)
     target_compile_definitions(kopms-platform PRIVATE KOPMS_HAVE_LIBINPUT=1)
     target_link_libraries(kopms-platform PRIVATE PkgConfig::LIBINPUT)

@@ -9,6 +9,7 @@
 #endif
 
 #include "../frame.hpp"
+#include "color_metadata.hpp"
 #include "kop/log.h"
 
 namespace kopaw {
@@ -35,6 +36,14 @@ VideoDecoderNode::~VideoDecoderNode() {
     if (frm_) av_frame_free(&frm_);
     if (ctx_) avcodec_free_context(&ctx_);
     if (hw_.device_ref) av_buffer_unref(&hw_.device_ref);
+}
+
+bool VideoDecoderNode::native_dmabuf_export_supported() const {
+#if KOPAW_HAVE_LIBVA
+    return hw_active_ && hw_.type == AV_HWDEVICE_TYPE_VAAPI;
+#else
+    return false;
+#endif
 }
 
 enum AVPixelFormat VideoDecoderNode::get_hw_format(AVCodecContext* ctx,
@@ -155,6 +164,7 @@ int32_t VideoDecoderNode::emit_converted(AVFrame* frame) {
     o->frame.format.video.width = static_cast<uint32_t>(frame->width);
     o->frame.format.video.height = static_cast<uint32_t>(frame->height);
     o->frame.stride = static_cast<uint32_t>(frame->width) * 4;
+    o->frame.color = color_metadata_from_av_frame(frame);
 
     const uint8_t* src[4] = {frame->data[0], frame->data[1], frame->data[2],
                              frame->data[3]};
@@ -183,6 +193,7 @@ int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
         av_frame_free(&sw);
         return KOPAW_OK;
     }
+    av_frame_copy_props(sw, raw);
     sw->pts = raw->pts;
     int32_t rc = emit_converted(sw);
     av_frame_free(&sw);
@@ -191,7 +202,10 @@ int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
 
 OwnedFrame* VideoDecoderNode::try_export_native(AVFrame* raw) {
 #if KOPAW_HAVE_LIBVA
-    if (!native_output_ || native_failed_) return nullptr;
+    if (!native_output_.load(std::memory_order_acquire) || native_failed_) return nullptr;
+    const uint32_t accepted_formats =
+        native_format_mask_.load(std::memory_order_acquire);
+    if (accepted_formats == kNativeDmabufFormatNone) return nullptr;
     const char* zc = getenv("KOPAW_ZERO_COPY");
     if (zc && zc[0] == '0') return nullptr;
     if (!va_export_tried_) {
@@ -213,7 +227,7 @@ OwnedFrame* VideoDecoderNode::try_export_native(AVFrame* raw) {
         KOP_LOG_INFO(kTag, "零拷贝输出：解码表面原生 DMA-BUF 导出（NV12/P010）");
     }
     std::string err;
-    OwnedFrame* o = va_export_.export_frame(raw, &err);
+    OwnedFrame* o = va_export_.export_frame(raw, accepted_formats, &err);
     if (!o) {
         // 首次失败即永久回退：逐帧重试只会刷日志（驱动/格式能力不变）
         native_failed_ = true;

@@ -46,7 +46,7 @@
   KOPAW Vulkan 后端按实际 format/modifier 建外部图像，用
   `VkSamplerYcbcrConversion` 完成有限范围 BT.601/709 并复用 `quad.frag`；
   `KopmsSinkNode` 可将原生 DMA-BUF 直接提交 BUS。 `--zero-copy on|off|auto`
-  的 VAAPI 导出失败会回退系统内存路径；本地渲染端导入失败尚未运行时降级。
+  的 VAAPI 导出失败会回退系统内存路径；本地渲染端导入失败后下一帧回退 CPU。
   CUDA（CUVID）原生导出依赖 EGL 互操作，留待后续
 - [x] P2.3 网络输入与转码：RTSP/HTTP(S)、超时/断连处理、过滤、编码、封装和文件输出
 - [x] P2.4 lavfi 桥接：视频/音频过滤器节点、player `--filter` 和 transcode 过滤链
@@ -69,8 +69,9 @@
     sync-fence acquire fence；图像池随帧引用归零回收；
   - KOPMS `vk_scene`：vkImportMemoryFdKHR 导入 RGBA 与单对象双平面 NV12/P010、
     多窗口 GPU 合成、每窗口一帧回压、present/fence 完成后才释放。YUV 路径用
-    RGB identity 的 YCbCr 采样提取平面，再由 `nv12.frag` 应用有限范围
-    BT.601/709 矩阵；DRM 直出模式由 page-flip 完成事件驱动释放；
+    RGB identity 的 YCbCr 采样提取平面，采样返回格式通道原序 (Cr, Y, Cb)，
+    由 `nv12.frag` 重排后应用有限范围 BT.601/709 矩阵；DRM 直出模式由
+    page-flip 完成事件驱动释放；
   - 全部路径不复用 M1 CPU wl_shm。
 - [x] M4 KOPMS-Wayland 融合（2026-09）：
   - zwp_linux_dmabuf_v1（v1-v3）：格式/modifier 协商、params → wl_buffer；
@@ -103,10 +104,25 @@
 
 ## 后续
 
+- [ ] **KOPNET 透明远程控制层**（见 docs/kopnet-design.md）：三层模型
+      （应用 → Tunnel → ProtocolAdapter → Transport）已落地，隧道多路复用 /
+      credit 回压 / SCM_RIGHTS fd 透传 / kopnet-relay（含 --stdio SSH 伙伴模式）/
+      KOPMS remote_session（HELLO 协商、帧提交与 Retain/release 回路、
+      控制请求/ack、错误 lane）均已通过 `ctest -R kopnet` 全套与端到端冒烟；
+      net 节点帧信封（pts/宽高/stride/fourcc/modifier/色彩元数据 + 平面 fd）
+      已完成 DMA-BUF 透传端到端验证；会话韧性层（断线自动重连 + Endpoint
+      列表故障转移，逻辑通道跨重连保持）已落地并接入 net 节点与 KOPMS
+      remote_session（服务端主动 GOODBYE / 断开时在途帧回放 DROPPED，重连后
+      由应用重新协商继续提交）；RTP 适配器（RFC 3550 报文分帧、会话化 UDP、
+      回绕序号丢包/重复统计、RTCP 复用跳过、MTU 守卫）已落地，`rtp://` URI
+      支持 pt/clock/ts_step/fps/ssrc 参数；剩余 RTC/RDP 适配器需 DTLS-SRTP/ICE
+      栈，离线环境不可引入
 - [ ] 硬解零拷贝跨后端：CUVID（CUDA）原生导出需 EGL/DMA-BUF 互操作；
   NV12/P010 之外的原生表面格式按需扩展导出器
-- [ ] 在播放器启动时协商后端的 DMA-BUF/format/modifier 能力，并在本地 Vulkan
-  导入失败时动态回退 CPU 路径
-- [ ] 将色彩范围、矩阵、传递函数/HDR 元数据纳入帧与 BUS 契约；当前高度阈值
-  只能覆盖有限范围 BT.601/709
+- [x] 播放器本地 Vulkan 导入失败时动态回退 CPU 路径：RenderNode 丢弃失败的
+  外部帧并通知 VideoDecoderNode 关闭原生输出，后续帧走系统内存
+- [x] 色彩管线：range/matrix/transfer/primaries/HDR 元数据已纳入帧与 BUS 契约，
+  渲染侧按声明的传递函数走 EOTF → HDR 色调映射 → sRGB OETF；PQ/HLG 以内容
+  声明峰值（MaxCLL/mastering）为锚映射到 SDR 目标（kopms-vk-nv12-scene 四探针
+  覆盖 BT.709 与 PQ 两条路径）。剩余：HDR swapchain / 显示能力协商
 - [ ] KOPMS DRM 直出的合成结果 page-flip 真机验证（vkms / logind 环境）

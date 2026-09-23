@@ -1339,16 +1339,21 @@ int main(int argc, char** argv) {
             request.acquire_fence_kind = fence_fd >= 0 ? KOPAW_SYNC_FENCE_FD
                                                        : KOPAW_SYNC_FENCE_NONE;
             request.acquire_fence_fd = fence_fd;
+            request.color = frame.payload.color;
+            request.has_color_metadata =
+                frame.payload.struct_size >= KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE;
             request.session_id = frame.session_id;
             request.frame_id = frame.payload.frame_id;
 
             std::string error;
+            const bool was_backpressured = g_scene.backpressured(window_id);
             if (!g_scene.submit(window_id, request, &error)) {
                 KOP_LOG_DEBUG(kTag,
                               "KOPMS-C session=%llu frame=%u 拒收（%s）",
                               static_cast<unsigned long long>(frame.session_id),
                               frame.payload.frame_id, error.c_str());
-                return kopms::FrameDisposition::ReleaseDropped;
+                return was_backpressured ? kopms::FrameDisposition::ReleaseDropped
+                                         : kopms::FrameDisposition::ReleaseRejected;
             }
             if (getenv("KOPMS_RELEASE_DEBUG")) {
                 KOP_LOG_DEBUG(kTag, "handler frame=%u → window=%llu Retain",

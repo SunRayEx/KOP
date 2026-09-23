@@ -197,6 +197,7 @@ int main(int argc, char** argv) {
     kopaw::AudioFilterNode* afilter = nullptr;
     kopaw::AudioSinkNode* asink = nullptr;
     kopaw::IRenderBackend* backend = nullptr;
+    bool local_native_requested = false;
     bool ready = false;
 
     do {
@@ -236,6 +237,11 @@ int main(int argc, char** argv) {
                 opts.bus_socket = kopms_bus;
                 opts.window_id = kopms_window;
                 kopms_sink = new kopaw::KopmsSinkNode(std::move(opts));
+                kopms_sink->set_dmabuf_fallback([vdec] {
+                    vdec->set_native_output(false);
+                    vdec->set_native_dmabuf_format_mask(
+                        kopaw::kNativeDmabufFormatNone);
+                });
                 if (!kopms_sink->connect(&err)) {
                     KOP_LOG_ERROR(kTag, "KOPMS sink 连接失败: %s", err.c_str());
                     exit_code = 2;
@@ -299,11 +305,34 @@ int main(int argc, char** argv) {
                 KOP_LOG_WARN(kTag, "--zero-copy on 需要 Vulkan 渲染或 KOPMS 直通，已忽略");
                 native = false;
             }
+            if (native && !vdec->native_dmabuf_export_supported()) {
+                KOP_LOG_INFO(kTag,
+                             "当前硬解后端没有原生 DMA-BUF 导出器（CUDA 需要 "
+                             "EGL/DMA-BUF 互操作），保持 CPU 路径");
+                native = false;
+            }
+            uint32_t native_formats = kopaw::kNativeDmabufFormatNone;
+            if (native && sink_direct) {
+#if KOPAW_HAVE_KOPMS_SINK
+                native_formats = kopms_sink->native_dmabuf_format_mask();
+#endif
+                if (native_formats == kopaw::kNativeDmabufFormatNone) {
+                    KOP_LOG_WARN(kTag,
+                                 "KOPMS-S 未协商 DMA-BUF/format/modifier/色彩能力，"
+                                 "保持 CPU 路径");
+                    native = false;
+                }
+            }
+            // The local Vulkan device is created by RenderNode. Keep decoder
+            // output on CPU until that startup probe returns its format mask.
+            local_native_requested = native && backend != nullptr;
+            if (local_native_requested) native = false;
+            vdec->set_native_dmabuf_format_mask(native_formats);
             vdec->set_native_output(native);
-            if (native) {
+            if (native || local_native_requested) {
                 KOP_LOG_INFO(kTag,
                              "零拷贝：解码表面原生 DMA-BUF 直通下游"
-                             "（VAAPI 导出失败回退；导入失败报告错误）");
+                             "（VAAPI 导出/导入失败自动回退 CPU 路径）");
             }
         }
         ready = true;
@@ -368,6 +397,25 @@ int main(int argc, char** argv) {
 #endif
             {
                 vrender = new kopaw::RenderNode(g, win, backend);
+                vrender->set_dmabuf_capability_callback(
+                    [vdec, local_native_requested](uint32_t formats) {
+                        vdec->set_native_dmabuf_format_mask(formats);
+                        vdec->set_native_output(
+                            local_native_requested &&
+                            formats != kopaw::kNativeDmabufFormatNone);
+                        if (local_native_requested &&
+                            formats == kopaw::kNativeDmabufFormatNone) {
+                            KOP_LOG_WARN(kTag,
+                                         "本地 Vulkan 未协商 NV12/P010 DMA-BUF 导入，"
+                                         "保持 CPU 路径");
+                        }
+                    });
+                vrender->set_dmabuf_fallback(
+                    [vdec] {
+                        vdec->set_native_output(false);
+                        vdec->set_native_dmabuf_format_mask(
+                            kopaw::kNativeDmabufFormatNone);
+                    });
                 KopawNodeDesc d_render = vrender->desc();
                 vrender_id = kopaw_graph_add_node(g, &d_render);
                 vrender->set_node_id(vrender_id);

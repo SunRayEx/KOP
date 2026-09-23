@@ -25,7 +25,8 @@ constexpr uint64_t kServerCapabilities = KOPMS_PROTOCOL_CAP_DMABUF |
                                          KOPMS_PROTOCOL_CAP_WAYLAND_BRIDGE |
                                          KOPMS_PROTOCOL_CAP_HANDLE_FRAMES |
                                          KOPMS_PROTOCOL_CAP_MODIFIERS |
-                                         KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC;
+                                         KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC |
+                                         KOPMS_PROTOCOL_CAP_COLOR_METADATA;
 
 void close_fds(std::vector<int>* fds) {
     if (!fds) return;
@@ -409,6 +410,16 @@ bool KopmsServer::handle_message(Session* session, BusMessage&& message) {
                     return false;
                 }
                 KOP_LOG_DEBUG(kTag, "KOPMS-C session=%llu dropped frame=%u (backpressure)",
+                              static_cast<unsigned long long>(session->id),
+                              frame.frame_id);
+                return true;
+            }
+            if (disposition == FrameDisposition::ReleaseRejected) {
+                if (!send_release(session, frame.frame_id,
+                                  KOPMS_FRAME_RELEASE_REJECTED)) {
+                    return false;
+                }
+                KOP_LOG_DEBUG(kTag, "KOPMS-C session=%llu rejected frame=%u",
                               static_cast<unsigned long long>(session->id),
                               frame.frame_id);
                 return true;

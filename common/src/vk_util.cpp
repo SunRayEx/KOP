@@ -39,7 +39,8 @@ bool create_instance(const std::vector<const char*>& extra_instance_extensions,
 }
 
 bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
-                            DeviceContext* ctx, std::string* error) {
+                            DeviceContext* ctx, std::string* error,
+                            const std::string& prefer_name) {
     if (!ctx || ctx->instance == VK_NULL_HANDLE) {
         if (error) *error = "device selection requires an instance";
         return false;
@@ -106,15 +107,26 @@ bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
 
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
-        const int score = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 1000
+        // 同卡优先（导入侧与导出侧必须同一张物理卡），其次离散 > 集成 > 其它。
+        const bool preferred =
+            !prefer_name.empty() && props.deviceName == prefer_name;
+        const int base = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 1000
                           : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
                               ? 500
                               : 100;
+        const int score = preferred ? base + 10000 : base;
         if (score > best_score) {
             best_score = score;
             best = candidate;
             best_family = graphics;
             ctx->device_name = props.deviceName;
+            VkPhysicalDeviceIDProperties id_props{};
+            id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 props2{};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props2.pNext = &id_props;
+            vkGetPhysicalDeviceProperties2(candidate, &props2);
+            std::memcpy(ctx->device_uuid.data(), id_props.deviceUUID, VK_UUID_SIZE);
         }
     }
     if (best == VK_NULL_HANDLE) {
@@ -158,10 +170,13 @@ bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
     // 设备级外部内存/栅栏命令不经加载器导出，按需解析。
     ctx->get_memory_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
         vkGetDeviceProcAddr(ctx->device, "vkGetMemoryFdKHR"));
+    ctx->get_memory_fd_properties =
+        reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+            vkGetDeviceProcAddr(ctx->device, "vkGetMemoryFdPropertiesKHR"));
     ctx->get_fence_fd = reinterpret_cast<PFN_vkGetFenceFdKHR>(
         vkGetDeviceProcAddr(ctx->device, "vkGetFenceFdKHR"));
-    if (!ctx->get_memory_fd || !ctx->get_fence_fd) {
-        if (error) *error = "无法解析 vkGetMemoryFdKHR/vkGetFenceFdKHR";
+    if (!ctx->get_memory_fd || !ctx->get_memory_fd_properties || !ctx->get_fence_fd) {
+        if (error) *error = "无法解析 Vulkan 外部内存/栅栏 fd 命令";
         vkDestroyDevice(ctx->device, nullptr);
         ctx->device = VK_NULL_HANDLE;
         return false;

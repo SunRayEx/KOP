@@ -86,6 +86,9 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
 add_subdirectory(common)
 add_subdirectory(kopaw)
 
+# 透明网络架构：远程控制支撑层（SSH/RTC/RTP/UDP/RDP 等）
+add_subdirectory(kopnet)
+
 add_subdirectory(kopms)
 
 # KOP_AppSDK_Interface + 用户级测试应用（KOPAW_Test / KOPMS_Test）

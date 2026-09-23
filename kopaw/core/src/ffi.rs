@@ -22,8 +22,10 @@ pub const KOPAW_ABI_MAJOR: u32 = 5;
 /// multi-input nodes (KOPAW_CAP_MULTI_INPUT) and KopawFrame::drm_fourcc for
 /// external-memory frames. Both are additive: newer fields are appended and
 /// gated by struct_size, so 5.0/5.1 nodes and frames keep working.
-pub const KOPAW_ABI_MINOR: u32 = 2;
-pub const KOPAW_ABI_VERSION: u32 = 0x0005_0002;
+/// 5.3: explicit frame colorimetry and optional HDR metadata. The fields are
+/// appended to KopawFrame and negotiated with KOPAW_CAP_COLOR_METADATA.
+pub const KOPAW_ABI_MINOR: u32 = 3;
+pub const KOPAW_ABI_VERSION: u32 = 0x0005_0003;
 
 pub const KOPAW_CAP_FRAME_OWNERSHIP: u64 = 0x0001;
 pub const KOPAW_CAP_NODE_LIFECYCLE: u64 = 0x0002;
@@ -43,7 +45,9 @@ pub const KOPAW_CAP_VULKAN_EXTERNAL: u64 = 0x0100;
 /// the send_port callback (5.2). Self-driven multi-input nodes (recv_port)
 /// do not require this bit.
 pub const KOPAW_CAP_MULTI_INPUT: u64 = 0x0200;
-pub const KOPAW_ABI_CAPABILITIES: u64 = 0x03ff;
+/// Frames carry explicit color range/matrix/transfer and optional HDR data.
+pub const KOPAW_CAP_COLOR_METADATA: u64 = 0x0400;
+pub const KOPAW_ABI_CAPABILITIES: u64 = 0x07ff;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -136,6 +140,73 @@ pub struct KopawSyncFence {
     pub value: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Frame colorimetry (5.3, additive tail)
+// ---------------------------------------------------------------------------
+
+pub const KOPAW_COLOR_RANGE_UNKNOWN: u32 = 0;
+pub const KOPAW_COLOR_RANGE_LIMITED: u32 = 1;
+pub const KOPAW_COLOR_RANGE_FULL: u32 = 2;
+
+pub const KOPAW_COLOR_MATRIX_UNKNOWN: u32 = 0;
+pub const KOPAW_COLOR_MATRIX_BT601: u32 = 1;
+pub const KOPAW_COLOR_MATRIX_BT709: u32 = 2;
+pub const KOPAW_COLOR_MATRIX_BT2020_NCL: u32 = 3;
+pub const KOPAW_COLOR_MATRIX_BT2020_CL: u32 = 4;
+
+pub const KOPAW_COLOR_TRANSFER_UNKNOWN: u32 = 0;
+pub const KOPAW_COLOR_TRANSFER_BT709: u32 = 1;
+pub const KOPAW_COLOR_TRANSFER_SRGB: u32 = 2;
+pub const KOPAW_COLOR_TRANSFER_GAMMA22: u32 = 3;
+pub const KOPAW_COLOR_TRANSFER_PQ: u32 = 4;
+pub const KOPAW_COLOR_TRANSFER_HLG: u32 = 5;
+
+pub const KOPAW_COLOR_PRIMARIES_UNKNOWN: u32 = 0;
+pub const KOPAW_COLOR_PRIMARIES_BT601: u32 = 1;
+pub const KOPAW_COLOR_PRIMARIES_BT709: u32 = 2;
+pub const KOPAW_COLOR_PRIMARIES_BT2020: u32 = 3;
+pub const KOPAW_COLOR_PRIMARIES_P3: u32 = 4;
+
+pub const KOPAW_CHROMA_LOCATION_UNKNOWN: u32 = 0;
+pub const KOPAW_CHROMA_LOCATION_LEFT: u32 = 1;
+pub const KOPAW_CHROMA_LOCATION_CENTER: u32 = 2;
+pub const KOPAW_CHROMA_LOCATION_TOPLEFT: u32 = 3;
+pub const KOPAW_CHROMA_LOCATION_TOP: u32 = 4;
+pub const KOPAW_CHROMA_LOCATION_BOTTOMLEFT: u32 = 5;
+pub const KOPAW_CHROMA_LOCATION_BOTTOM: u32 = 6;
+
+pub const KOPAW_HDR_FLAG_MASTERING_DISPLAY: u32 = 1 << 0;
+pub const KOPAW_HDR_FLAG_CONTENT_LIGHT: u32 = 1 << 1;
+
+/// Optional HDR side data. Chromaticity coordinates use a 100000 scale;
+/// luminance is milli-cd/m^2 and MaxCLL/MaxFALL are cd/m^2.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct KopawHdrMetadata {
+    pub flags: u32,
+    pub max_luminance: u32,
+    pub min_luminance: u32,
+    pub max_cll: u32,
+    pub max_fall: u32,
+    pub display_primaries: [u32; 6],
+    pub white_point: [u32; 2],
+    pub reserved: [u32; 1],
+}
+
+/// Explicit frame colorimetry. Unknown values are preserved as unknown; a
+/// renderer must not infer BT.601/709 from frame dimensions.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct KopawColorMetadata {
+    pub range: u32,
+    pub matrix: u32,
+    pub transfer: u32,
+    pub primaries: u32,
+    pub chroma_location: u32,
+    pub flags: u32,
+    pub hdr: KopawHdrMetadata,
+}
+
 /// 输出端口句柄（emit 的寻址凭据）。
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -192,6 +263,9 @@ pub struct KopawFrame {
     /// 像素布局由 media_type 的既有约定解释（视频 = RGBA8 打包）；消费方仅在
     /// 读取外部平面时使用此字段。结构体按 struct_size 前缀兼容读取。
     pub drm_fourcc: u32,
+    /// 5.3：显式色彩范围、矩阵、传递函数、原色、色度位置和可选 HDR 元数据。
+    /// 消费方必须先检查 struct_size 是否覆盖此字段；未知值不得按高度猜测。
+    pub color: KopawColorMetadata,
 }
 
 // ---------------------------------------------------------------------------

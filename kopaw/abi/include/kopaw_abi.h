@@ -24,10 +24,12 @@ struct KopawGraph;
  * multi-input nodes (KOPAW_CAP_MULTI_INPUT) and KopawFrame::drm_fourcc for
  * external-memory frames. Both are additive: newer fields are appended and
  * gated by struct_size, so 5.0/5.1 nodes and frames keep working.
+ * 5.3: explicit frame colorimetry and optional HDR metadata. The fields are
+ * appended to KopawFrame and negotiated with KOPAW_CAP_COLOR_METADATA.
  */
-#define KOPAW_ABI_MINOR 2
+#define KOPAW_ABI_MINOR 3
 
-#define KOPAW_ABI_VERSION 327682
+#define KOPAW_ABI_VERSION 327683
 
 #define KOPAW_CAP_FRAME_OWNERSHIP 1
 
@@ -63,7 +65,12 @@ struct KopawGraph;
  */
 #define KOPAW_CAP_MULTI_INPUT 512
 
-#define KOPAW_ABI_CAPABILITIES 1023
+/**
+ * Frames carry explicit color range/matrix/transfer and optional HDR data.
+ */
+#define KOPAW_CAP_COLOR_METADATA 1024
+
+#define KOPAW_ABI_CAPABILITIES 2047
 
 /**
  * 帧标志位
@@ -122,6 +129,62 @@ struct KopawGraph;
 
 #define KOPAW_E_GENERIC 5
 
+#define KOPAW_COLOR_RANGE_UNKNOWN 0
+
+#define KOPAW_COLOR_RANGE_LIMITED 1
+
+#define KOPAW_COLOR_RANGE_FULL 2
+
+#define KOPAW_COLOR_MATRIX_UNKNOWN 0
+
+#define KOPAW_COLOR_MATRIX_BT601 1
+
+#define KOPAW_COLOR_MATRIX_BT709 2
+
+#define KOPAW_COLOR_MATRIX_BT2020_NCL 3
+
+#define KOPAW_COLOR_MATRIX_BT2020_CL 4
+
+#define KOPAW_COLOR_TRANSFER_UNKNOWN 0
+
+#define KOPAW_COLOR_TRANSFER_BT709 1
+
+#define KOPAW_COLOR_TRANSFER_SRGB 2
+
+#define KOPAW_COLOR_TRANSFER_GAMMA22 3
+
+#define KOPAW_COLOR_TRANSFER_PQ 4
+
+#define KOPAW_COLOR_TRANSFER_HLG 5
+
+#define KOPAW_COLOR_PRIMARIES_UNKNOWN 0
+
+#define KOPAW_COLOR_PRIMARIES_BT601 1
+
+#define KOPAW_COLOR_PRIMARIES_BT709 2
+
+#define KOPAW_COLOR_PRIMARIES_BT2020 3
+
+#define KOPAW_COLOR_PRIMARIES_P3 4
+
+#define KOPAW_CHROMA_LOCATION_UNKNOWN 0
+
+#define KOPAW_CHROMA_LOCATION_LEFT 1
+
+#define KOPAW_CHROMA_LOCATION_CENTER 2
+
+#define KOPAW_CHROMA_LOCATION_TOPLEFT 3
+
+#define KOPAW_CHROMA_LOCATION_TOP 4
+
+#define KOPAW_CHROMA_LOCATION_BOTTOMLEFT 5
+
+#define KOPAW_CHROMA_LOCATION_BOTTOM 6
+
+#define KOPAW_HDR_FLAG_MASTERING_DISPLAY (1 << 0)
+
+#define KOPAW_HDR_FLAG_CONTENT_LIGHT (1 << 1)
+
 /**
  * 图状态
  */
@@ -171,6 +234,35 @@ typedef struct KopawSyncFence {
   int32_t fd;
   uint64_t value;
 } KopawSyncFence;
+
+/**
+ * Optional HDR side data. Chromaticity coordinates use a 100000 scale;
+ * luminance is milli-cd/m^2 and MaxCLL/MaxFALL are cd/m^2.
+ */
+typedef struct KopawHdrMetadata {
+  uint32_t flags;
+  uint32_t max_luminance;
+  uint32_t min_luminance;
+  uint32_t max_cll;
+  uint32_t max_fall;
+  uint32_t display_primaries[6];
+  uint32_t white_point[2];
+  uint32_t reserved[1];
+} KopawHdrMetadata;
+
+/**
+ * Explicit frame colorimetry. Unknown values are preserved as unknown; a
+ * renderer must not infer BT.601/709 from frame dimensions.
+ */
+typedef struct KopawColorMetadata {
+  uint32_t range;
+  uint32_t matrix;
+  uint32_t transfer;
+  uint32_t primaries;
+  uint32_t chroma_location;
+  uint32_t flags;
+  struct KopawHdrMetadata hdr;
+} KopawColorMetadata;
 
 /**
  * 跨 ABI 传递的媒体帧。所有权模型：**引用计数 + 独占释放**。
@@ -248,6 +340,11 @@ typedef struct KopawFrame {
    * 读取外部平面时使用此字段。结构体按 struct_size 前缀兼容读取。
    */
   uint32_t drm_fourcc;
+  /**
+   * 5.3：显式色彩范围、矩阵、传递函数、原色、色度位置和可选 HDR 元数据。
+   * 消费方必须先检查 struct_size 是否覆盖此字段；未知值不得按高度猜测。
+   */
+  struct KopawColorMetadata color;
 } KopawFrame;
 
 /**

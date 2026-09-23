@@ -9,6 +9,7 @@
 |---|---|---|---|---|
 | 音视频管线 | **KOPAW**（Kongar Pipe Audio/Video Wire） | 媒体图引擎 + 节点库，对标 PipeWire 的管线能力 | **第一优先级** | MVP 已实现（CLI 播放器纵向切片） |
 | 显示服务器 | **KOPMS**（Kongar Pipe Monitor Server） | Wayland 兼容合成器，替代 Xorg | 第二阶段 | P3-M1 协议骨架完成；M2 平台防护骨架 |
+| 远程控制支撑 | **KOPNET**（Kongar Pipe Network） | 透明网络层：逻辑 Channel 多路复用 / 回压 / fd 透传 | 支撑层 | 三层模型 + relay 已落地（见 docs/kopnet-design.md） |
 
 ## 语言分工（已决策：按模块混合）
 
@@ -88,3 +89,9 @@ cargo test                             # kopaw-core 单元测试（在 kopaw/cor
    请求都必须有实现函数（不支持的语义为显式 no-op 并注明）。NULL 处理器会让
    libwayland-server `wl_abort` 杀死整个合成器进程（实测 GTK3 的 set_parent/
    region.add 即触发）。新增全局对象时必须同步核对生成头文件的接口成员表。
+9. **KOPNET 队列与 fd 所有权**（见 docs/kopnet-design.md）：
+   `BoundedPacketQueue::put(Packet&&)` 仅在返回 Ok 时接管包（含其 fd），
+   Timeout/Closed 时调用方保留所有权——重试循环里重复传同一个包必须安全；
+   隧道发送侧在帧真正写出（或失败）后必须关闭帧携带的 fd，停机时滞留帧同样回收；
+   传输层 fd 透传由 `supports_fds()` 显式声明，DMA-BUF fd 必须先 `dup` 再入队
+   （帧 release 与异步发送的时序解耦）。

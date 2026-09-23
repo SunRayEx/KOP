@@ -1,5 +1,6 @@
 #include "vk_ycbcr.hpp"
 
+#include <cstddef>
 #include <sys/stat.h>
 
 #include <vector>
@@ -19,6 +20,69 @@ bool same_object(int first, int second) {
     return first >= 0 && second >= 0 && fstat(first, &a) == 0 &&
            fstat(second, &b) == 0 && a.st_dev == b.st_dev &&
            a.st_ino == b.st_ino;
+}
+
+bool map_color(const KopawFrame* frame, YcbcrConfig* config, std::string* error) {
+    const size_t color_end = offsetof(KopawFrame, color) + sizeof(frame->color);
+    if (frame->struct_size < color_end) {
+        return fail(error, "YCbCr frame lacks explicit color metadata");
+    }
+    switch (frame->color.range) {
+        case KOPAW_COLOR_RANGE_LIMITED:
+            config->range = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
+            break;
+        case KOPAW_COLOR_RANGE_FULL:
+            config->range = VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
+            break;
+        default:
+            return fail(error, "YCbCr frame has unknown color range");
+    }
+    switch (frame->color.matrix) {
+        case KOPAW_COLOR_MATRIX_BT601:
+            config->model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601;
+            break;
+        case KOPAW_COLOR_MATRIX_BT709:
+            config->model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709;
+            break;
+        case KOPAW_COLOR_MATRIX_BT2020_NCL:
+            config->model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_2020;
+            break;
+        case KOPAW_COLOR_MATRIX_BT2020_CL:
+            return fail(error,
+                        "BT.2020 constant-luminance needs a shader conversion");
+        default:
+            return fail(error, "YCbCr frame has unknown color matrix");
+    }
+
+    // Vulkan represents horizontal and vertical chroma sites independently.
+    // An unspecified site keeps the historical midpoint sampler choice, but
+    // never changes the matrix or range selected above.
+    switch (frame->color.chroma_location) {
+        case KOPAW_CHROMA_LOCATION_LEFT:
+            config->x_chroma_location = VK_CHROMA_LOCATION_COSITED_EVEN;
+            config->y_chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
+            break;
+        case KOPAW_CHROMA_LOCATION_TOPLEFT:
+            config->x_chroma_location = VK_CHROMA_LOCATION_COSITED_EVEN;
+            config->y_chroma_location = VK_CHROMA_LOCATION_COSITED_EVEN;
+            break;
+        case KOPAW_CHROMA_LOCATION_TOP:
+            config->x_chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
+            config->y_chroma_location = VK_CHROMA_LOCATION_COSITED_EVEN;
+            break;
+        case KOPAW_CHROMA_LOCATION_CENTER:
+        case KOPAW_CHROMA_LOCATION_UNKNOWN:
+            config->x_chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
+            config->y_chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
+            break;
+        case KOPAW_CHROMA_LOCATION_BOTTOMLEFT:
+        case KOPAW_CHROMA_LOCATION_BOTTOM:
+            return fail(error,
+                        "bottom-aligned chroma needs explicit reconstruction");
+        default:
+            return fail(error, "YCbCr frame has invalid chroma location");
+    }
+    return true;
 }
 
 } // namespace
@@ -77,9 +141,7 @@ bool describe_ycbcr_frame(const KopawFrame* frame, YcbcrConfig* config,
         }
     }
     result.modifier = y.modifier;
-    result.model = video.height >= 720
-                       ? VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709
-                       : VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601;
+    if (!map_color(frame, &result, error)) return false;
     *config = result;
     return true;
 }
@@ -110,12 +172,15 @@ bool query_ycbcr_support(VkPhysicalDevice physical, uint32_t width,
         return fail(error,
                     "YCbCr modifier does not support two-plane sampling");
     }
-    if (features & VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT) {
-        config->chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
-    } else if (features & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT) {
-        config->chroma_location = VK_CHROMA_LOCATION_COSITED_EVEN;
-    } else {
-        return fail(error, "YCbCr modifier has no supported chroma location");
+    const auto supports_chroma = [features](VkChromaLocation location) {
+        return location == VK_CHROMA_LOCATION_MIDPOINT
+                   ? (features & VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT) != 0
+                   : (features & VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT) != 0;
+    };
+    if (!supports_chroma(config->x_chroma_location) ||
+        !supports_chroma(config->y_chroma_location)) {
+        return fail(error,
+                    "YCbCr modifier does not support the frame chroma location");
     }
     constexpr VkFormatFeatureFlags linear =
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |

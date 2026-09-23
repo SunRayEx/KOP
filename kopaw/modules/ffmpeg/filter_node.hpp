@@ -45,6 +45,10 @@ private:
 
     AVFrame* in_frm_ = nullptr;   // 每次送入前复制到 FFmpeg 自有缓冲
     AVFrame* out_frm_ = nullptr;  // buffersink 输出缓冲
+    // RGBA filter graphs do not expose KOPAW's ABI tail. Preserve the latest
+    // stream color contract across the CPU-only path; native YUV bypasses
+    // filters altogether.
+    KopawColorMetadata color_{};
 
     KopawGraph* g_ = nullptr;
     KopawOutput out_{};

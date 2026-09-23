@@ -168,6 +168,7 @@ private:
         o->frame.size = data_size;
         o->frame.stride = 0;
         o->frame.drm_fourcc = 0;
+        o->frame.color = {};
         o->frame.retain = &OwnedFrame::retain_cb;
         o->frame.release = &OwnedFrame::release_cb;
     }
@@ -207,6 +208,7 @@ inline OwnedFrame* make_frame(int32_t media_type, int64_t pts, int64_t dts, size
     o->frame.size = data_size;
     o->frame.stride = 0;
     o->frame.drm_fourcc = 0;
+    o->frame.color = {};
     o->frame.retain = &OwnedFrame::retain_cb;
     o->frame.release = &OwnedFrame::release_cb;
     return o;

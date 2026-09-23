@@ -34,7 +34,7 @@ parse_deps = false
 [export]
 include = [
     "KopawMediaType", "KopawVideoFormat", "KopawAudioFormat", "KopawFormat",
-    "KopawFrame", "KopawNodeVTable", "KopawNodeDesc", "KopawOutput",
+    "KopawFrame", "KopawColorMetadata", "KopawHdrMetadata", "KopawNodeVTable", "KopawNodeDesc", "KopawOutput",
     "KopawEventType",
 ]
 # KopawGraph 由 after_includes 中的前置声明保持不透明，不导出结构体定义

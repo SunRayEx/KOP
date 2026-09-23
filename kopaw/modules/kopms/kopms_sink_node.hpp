@@ -12,11 +12,14 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "kopaw_abi.h"
+#include "native_dmabuf.hpp"
 #include "render/vulkan/vk_dma_export.hpp"
 
 struct KopawGraph;
@@ -42,6 +45,12 @@ public:
     // 连接 BUS 并完成能力协商 + 窗口绑定；失败时 error 返回原因。
     bool connect(std::string* error);
     void disconnect();
+    void set_dmabuf_fallback(std::function<void()> callback) {
+        dmabuf_fallback_ = std::move(callback);
+    }
+    // KOPMS HELLO confirms transport, modifier, and metadata support. The
+    // scene verifies each concrete modifier again when the frame arrives.
+    uint32_t native_dmabuf_format_mask() const;
 
     KopawNodeDesc desc();
     void set_graph(KopawGraph* graph, uint32_t node_id) {
@@ -66,6 +75,8 @@ private:
     void pump_releases(int timeout_ms);
     void free_submission(Submission* sub);
     bool setup_window(std::string* error);
+    void notify_dmabuf_fallback();
+    void observe_frame_release(uint32_t frame_id, uint32_t status);
 
     Options options_;
     std::unique_ptr<Impl> impl_;
@@ -75,9 +86,12 @@ private:
     uint32_t node_id_ = 0;
     bool connected_ = false;
     bool sink_done_ = false;
+    std::function<void()> dmabuf_fallback_;
+    bool dmabuf_fallback_used_ = false;
     // 在飞提交表：key = Submission 指针。client 对 descriptor 的 release
     // 会经 free_submission 自动移除对应条目。
     std::unordered_map<uintptr_t, Submission*> pending_;
+    std::unordered_map<uint32_t, bool> native_frame_ids_;
 
     uint64_t frames_submitted_ = 0;
     uint64_t frames_released_ = 0;

@@ -94,8 +94,24 @@ int main() {
         if (!kop::vkutil::create_instance({}, &importer.instance, &reason))
             return fail(("importer instance: " + reason).c_str());
         std::vector<const char*> exts{VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
-        if (!kop::vkutil::pick_and_create_device(exts, &importer, &reason)) {
+        // 导入侧必须与导出侧同卡：生产链路里合成器与客户端同机同卡，双卡
+        // 机器上也不能让导入落到另一张卡（跨物理卡导入不被 Vulkan 保证）。
+        if (!kop::vkutil::pick_and_create_device(exts, &importer, &reason,
+                                                 exporter.device_name())) {
             return skip("importer device unavailable: " + reason);
+        }
+        const bool same_gpu =
+            importer.device_uuid == exporter.device_uuid();
+        std::fprintf(stderr,
+                     "vk dmabuf roundtrip: exporter=%s importer=%s same_gpu=%d\n",
+                     exporter.device_name().c_str(), importer.device_name.c_str(),
+                     same_gpu ? 1 : 0);
+        if (!same_gpu) {
+            return skip("importer landed on a different physical device "
+                        "(exporter uuid " +
+                        kop::vkutil::to_hex(exporter.device_uuid()) + " vs " +
+                        kop::vkutil::to_hex(importer.device_uuid) +
+                        "); cross-GPU DMA-BUF import is not required to work");
         }
 
         VkImageCreateInfo ii{};
@@ -106,7 +122,7 @@ int main() {
         ii.mipLevels = 1;
         ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT;
-        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
         ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkExternalMemoryImageCreateInfo external{};
@@ -133,6 +149,22 @@ int main() {
         }
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(importer.device, image, &req);
+        if (!importer.get_memory_fd_properties) {
+            return skip("importer lacks vkGetMemoryFdPropertiesKHR");
+        }
+        VkMemoryFdPropertiesKHR fd_properties{};
+        fd_properties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+        const VkResult fd_props_result = importer.get_memory_fd_properties(
+            importer.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+            gpu->planes[0].fd, &fd_properties);
+        if (fd_props_result != VK_SUCCESS) {
+            return skip("DMA-BUF fd properties unavailable (VkResult " +
+                        std::to_string(static_cast<int>(fd_props_result)) + ")");
+        }
+        const uint32_t compatible_bits = req.memoryTypeBits & fd_properties.memoryTypeBits;
+        if (compatible_bits == 0) {
+            return skip("exported DMA-BUF has no importer-compatible memory type");
+        }
         // 导入转移 fd 所有权：dup 一份给实现，原 fd 归帧。
         const int import_fd = ::dup(gpu->planes[0].fd);
         if (import_fd < 0) return fail("dup import fd");
@@ -149,11 +181,37 @@ int main() {
         ai.allocationSize = req.size;
         ai.pNext = &import_mem;
         ai.memoryTypeIndex =
-            kop::vkutil::find_memory_type(importer.physical, req.memoryTypeBits, 0,
+            kop::vkutil::find_memory_type(importer.physical, compatible_bits, 0,
                                           &reason);
-        if (ai.memoryTypeIndex == UINT32_MAX) return fail("import memory type");
+        if (ai.memoryTypeIndex == UINT32_MAX) {
+            ::close(import_fd);
+            return fail("import memory type");
+        }
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        if (vkAllocateMemory(importer.device, &ai, nullptr, &memory) != VK_SUCCESS) {
+        const VkResult alloc_result = vkAllocateMemory(importer.device, &ai, nullptr, &memory);
+        if (alloc_result != VK_SUCCESS) {
+            const off_t dmabuf_size = ::lseek(gpu->planes[0].fd, 0, SEEK_END);
+            std::fprintf(stderr,
+                         "importer vkAllocateMemory failed (VkResult %d, "
+                         "device=%s uuid=%s memtype=%u size=%llu, "
+                         "req_bits=0x%x fd_bits=0x%x dmabuf_size=%lld "
+                         "exporter=%s uuid=%s)\n",
+                         static_cast<int>(alloc_result),
+                         importer.device_name.c_str(),
+                         importer.uuid_hex().c_str(), ai.memoryTypeIndex,
+                         static_cast<unsigned long long>(ai.allocationSize),
+                         req.memoryTypeBits, fd_properties.memoryTypeBits,
+                         static_cast<long long>(dmabuf_size),
+                         exporter.device_name().c_str(),
+                         kop::vkutil::to_hex(exporter.device_uuid()).c_str());
+            ::close(import_fd);
+            if (alloc_result == VK_ERROR_INVALID_EXTERNAL_HANDLE ||
+                alloc_result == VK_ERROR_FEATURE_NOT_PRESENT ||
+                alloc_result == VK_ERROR_FORMAT_NOT_SUPPORTED ||
+                alloc_result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                return skip("DMA-BUF import unsupported (VkResult " +
+                            std::to_string(static_cast<int>(alloc_result)) + ")");
+            }
             return fail("importer vkAllocateMemory failed");
         }
         if (vkBindImageMemory(importer.device, image, memory, 0) != VK_SUCCESS) {

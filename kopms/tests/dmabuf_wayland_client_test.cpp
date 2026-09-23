@@ -238,14 +238,18 @@ bool dispatch_until(ClientState* state, bool (*condition)(const ClientState*),
                     int timeout_ms) {
     const int64_t deadline = now_mono_ms() + timeout_ms;
     while (!condition(state)) {
-        if (wl_display_dispatch_pending(state->display) > 0) continue;
+        // dispatch_pending() can keep returning work while a peer is sending
+        // unrelated events. Check the deadline before it so a compositor-side
+        // import failure cannot turn this into CTest's 60-second timeout.
+        if (now_mono_ms() > deadline || !state->running) return false;
+        const int pending = wl_display_dispatch_pending(state->display);
+        if (pending < 0) return false;
+        if (pending > 0) continue;
         if (wl_display_flush(state->display) < 0 && errno != EAGAIN) return false;
         struct pollfd pfd{wl_display_get_fd(state->display), POLLIN, 0};
         const int r = ::poll(&pfd, 1, 20);
         if (r < 0 && errno != EINTR) return false;
         if (r > 0 && wl_display_dispatch(state->display) < 0) return false;
-        if (now_mono_ms() > deadline) return false;
-        if (!state->running) return false;
     }
     return true;
 }
@@ -259,13 +263,15 @@ bool any_round_event_pending(const ClientState* state) {
 bool wait_for_events(ClientState* state, int timeout_ms) {
     const int64_t deadline = now_mono_ms() + timeout_ms;
     while (!any_round_event_pending(state)) {
-        if (wl_display_dispatch_pending(state->display) > 0) continue;
+        if (now_mono_ms() > deadline || !state->running) return false;
+        const int pending = wl_display_dispatch_pending(state->display);
+        if (pending < 0) return false;
+        if (pending > 0) continue;
         if (wl_display_flush(state->display) < 0 && errno != EAGAIN) return false;
         pollfd pfd{wl_display_get_fd(state->display), POLLIN, 0};
         const int r = ::poll(&pfd, 1, 50);
         if (r < 0 && errno != EINTR) return false;
         if (r > 0 && wl_display_dispatch(state->display) < 0) return false;
-        if (now_mono_ms() > deadline) return false;
     }
     return true;
 }
@@ -473,11 +479,25 @@ teardown:
         wl_display_disconnect(state.display);
     }
     exporter.shutdown();
-    // 终止合成器
+    // 终止合成器：SIGTERM 后给 2s 优雅退出窗口，仍未退出则 SIGKILL——
+    // 合成器主线程若卡在未 signal 的 fence 等待上，SIGTERM 的默认动作无法
+    // 执行，会让本测试一路挂到 CTest 的 60s 超时。
     if (child > 0) {
         kill(child, SIGTERM);
+        const int64_t grace = now_mono_ms() + 2000;
         int status = 0;
-        waitpid(child, &status, 0);
+        for (;;) {
+            const pid_t r = waitpid(child, &status, WNOHANG);
+            if (r == child) break;
+            if (r < 0) break;
+            if (now_mono_ms() > grace) {
+                kill(child, SIGKILL);
+                waitpid(child, &status, 0);
+                break;
+            }
+            ::usleep(20000);
+        }
     }
-    return result ? 1 : 0;
+    // Preserve CTest's skip status (77).  Only an actual failure is 1.
+    return result;
 }

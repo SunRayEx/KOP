@@ -3,6 +3,7 @@
 // 面向应用/测试开发者的高层接口，屏蔽内部细节：
 //   - kop::sdk::Pipeline        KOPAW 管线（媒体 → 解码 → 帧回调，无窗口）
 //   - kop::sdk::FramePublisher  KOPMS 零拷贝发布（CPU 帧 → DMA-BUF → BUS）
+//   - kop::sdk::NetTunnel       KOPNET 透明网络（逻辑通道，URI 驱动）
 //   - kop::sdk::TestReport      用户级测试报告（KOPAW_Test/KOPMS_Test 共用）
 //
 // 契约红线（与内部 ABI 一致，详见 docs/architecture.md）：
@@ -14,6 +15,7 @@
 
 #include "kop/sdk/kopaw_pipeline.hpp"
 #include "kop/sdk/kopms_publisher.hpp"
+#include "kop/sdk/net_tunnel.hpp"
 #include "kop/sdk/report.hpp"
 #include "kop/sdk/version.hpp"
 

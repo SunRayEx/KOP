@@ -4,6 +4,7 @@
 // vaExportSurfaceHandle 原生导出为 KOPAW_MEMORY_DMABUF（NV12/P010）帧直发下游；
 // 导出不可用时自动回退系统内存路径。CPU 帧路径行为不变。
 #pragma once
+#include <atomic>
 #include <string>
 
 // FFmpeg 8 起公共头不再自带 extern "C" 保护，C++ 使用方必须自行包裹。
@@ -16,6 +17,7 @@ extern "C" {
 
 #include "kopaw_abi.h"
 #include "hwaccel.hpp"
+#include "native_dmabuf.hpp"
 #if KOPAW_HAVE_LIBVA
 #include "vaapi_export.hpp"
 #endif
@@ -35,8 +37,19 @@ public:
     void set_graph(KopawGraph* g) { g_ = g; }
     // 请求原生 DMA-BUF 输出（须在图 start 前调用）。仅当 VAAPI 硬解激活且
     // 驱动支持导出时生效；KOPAW_ZERO_COPY=0 可强制关闭。
-    void set_native_output(bool on) { native_output_ = on; }
-    bool native_output() const { return native_output_; }
+    void set_native_output(bool on) { native_output_.store(on, std::memory_order_release); }
+    bool native_output() const {
+        return native_output_.load(std::memory_order_acquire);
+    }
+    void set_native_dmabuf_format_mask(uint32_t formats) {
+        native_format_mask_.store(formats, std::memory_order_release);
+    }
+    uint32_t native_dmabuf_format_mask() const {
+        return native_format_mask_.load(std::memory_order_acquire);
+    }
+    // CUDA/CUVID remains CPU-fallback only until a CUDA-EGL/DMA-BUF interop
+    // exporter exists; do not advertise a synthetic native path.
+    bool native_dmabuf_export_supported() const;
 
     int32_t send_impl(KopawFrame* f);
 
@@ -63,7 +76,8 @@ private:
     bool hw_active_ = false;
 
     // P2 原生导出状态：惰性初始化；一次不可用后永久回退，避免每帧重试
-    bool native_output_ = false;
+    std::atomic<bool> native_output_{false};
+    std::atomic<uint32_t> native_format_mask_{kNativeDmabufFormatNone};
     bool native_failed_ = false;
 #if KOPAW_HAVE_LIBVA
     VaapiDmabufExporter va_export_;

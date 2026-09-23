@@ -118,10 +118,14 @@ bool KopmsClient::submit(KopmsFrameDescriptor* frame, uint32_t* frame_id,
         set_error(error, "KOPMS-C is not connected and negotiated");
         return false;
     }
+    const auto release_on_failure = [frame] {
+        if (frame && frame->release) frame->release(frame);
+    };
     if ((capabilities_ & (KOPMS_PROTOCOL_CAP_DMABUF |
                           KOPMS_PROTOCOL_CAP_FRAME_RELEASE)) !=
         (KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE)) {
         set_error(error, "KOPMS-S did not negotiate DMA-BUF release capability");
+        release_on_failure();
         return false;
     }
     const uint32_t id = next_frame_id();
@@ -130,11 +134,20 @@ bool KopmsClient::submit(KopmsFrameDescriptor* frame, uint32_t* frame_id,
     std::string make_error;
     if (!make_frame_submit(frame, id, &frame_payload, &fds, &make_error)) {
         set_error(error, make_error);
+        release_on_failure();
         return false;
+    }
+    if ((capabilities_ & KOPMS_PROTOCOL_CAP_COLOR_METADATA) == 0) {
+        // Keep wire compatibility with a 1.1 peer: trim the optional tail.
+        frame_payload.color = {};
+        frame_payload.struct_size = KOPMS_FRAME_SUBMIT_BASE_SIZE;
+    } else {
+        frame_payload.struct_size = KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE;
     }
     const std::vector<uint8_t> payload = encode_frame_submit(frame_payload);
     if (payload.size() > max_payload_ || fds.size() > max_fds_) {
         set_error(error, "frame exceeds the negotiated KOPMS-S limits");
+        release_on_failure();
         return false;
     }
 
@@ -331,6 +344,9 @@ bool KopmsClient::process_message(BusMessage&& message, std::string* error) {
             pending_frames_.erase(it);
             last_released_frame_id_ = release.frame_id;
             last_release_status_ = release.status;
+            if (frame_release_observer_) {
+                frame_release_observer_(release.frame_id, release.status);
+            }
             if (getenv("KOPMS_RELEASE_DEBUG")) {
                 std::fprintf(stderr, "[kopms-client] FRAME_RELEASE frame=%u status=%u pending=%zu\n",
                              release.frame_id, release.status, pending_frames_.size());

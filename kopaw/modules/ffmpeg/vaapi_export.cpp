@@ -12,10 +12,46 @@ extern "C" {
 }
 
 #include "kop/log.h"
+#include "color_metadata.hpp"
 
 namespace kopaw {
 
 static const char* kTag = "va-export";
+
+namespace {
+
+constexpr uint32_t kDrmFormatNv12 = 0x3231564Eu;
+constexpr uint32_t kDrmFormatP010 = 0x30313050u;
+
+uint32_t native_format_from_sw(AVPixelFormat format) {
+    switch (format) {
+        case AV_PIX_FMT_NV12:
+            return kNativeDmabufFormatNv12;
+        case AV_PIX_FMT_P010LE:
+            return kNativeDmabufFormatP010;
+        default:
+            return kNativeDmabufFormatNone;
+    }
+}
+
+uint32_t native_format_from_fourcc(uint32_t fourcc) {
+    switch (fourcc) {
+        case kDrmFormatNv12:
+            return kNativeDmabufFormatNv12;
+        case kDrmFormatP010:
+            return kNativeDmabufFormatP010;
+        default:
+            return kNativeDmabufFormatNone;
+    }
+}
+
+void close_prime_objects(const VADRMPRIMESurfaceDescriptor& prime) {
+    for (uint32_t i = 0; i < prime.num_objects; ++i) {
+        if (prime.objects[i].fd >= 0) close(prime.objects[i].fd);
+    }
+}
+
+}  // namespace
 
 bool VaapiDmabufExporter::init(VADisplay display) {
     if (!display) return false;
@@ -27,7 +63,9 @@ bool VaapiDmabufExporter::init(VADisplay display) {
     return true;
 }
 
-OwnedFrame* VaapiDmabufExporter::export_frame(const AVFrame* hw, std::string* error) {
+OwnedFrame* VaapiDmabufExporter::export_frame(const AVFrame* hw,
+                                               uint32_t accepted_formats,
+                                               std::string* error) {
     if (!display_) {
         if (error) *error = "导出器未初始化";
         return nullptr;
@@ -39,9 +77,13 @@ OwnedFrame* VaapiDmabufExporter::export_frame(const AVFrame* hw, std::string* er
     }
     const auto* fctx =
         reinterpret_cast<const AVHWFramesContext*>(hw->hw_frames_ctx->data);
-    if (fctx->sw_format != AV_PIX_FMT_NV12 && fctx->sw_format != AV_PIX_FMT_P010LE) {
-        // P2 覆盖 8bit NV12 与 10bit P010（HEVC Main10）；其余格式回退软拷贝
-        if (error) *error = "表面格式非 NV12/P010，暂不支持原生导出";
+    const uint32_t expected_format = native_format_from_sw(fctx->sw_format);
+    if (expected_format == kNativeDmabufFormatNone) {
+        if (error) *error = "表面格式未注册原生 DMA-BUF 导出器";
+        return nullptr;
+    }
+    if (!native_dmabuf_format_supported(accepted_formats, expected_format)) {
+        if (error) *error = "下游未协商该原生表面格式";
         return nullptr;
     }
     const auto surface = static_cast<VASurfaceID>(
@@ -76,8 +118,15 @@ OwnedFrame* VaapiDmabufExporter::export_frame(const AVFrame* hw, std::string* er
     // 对象数 >1 的驱动形态导入方无法用单份外部内存描述，回退软拷贝路径
     if (prime.num_objects != 1 || prime.num_layers != 1 ||
         prime.layers[0].num_planes != 2) {
-        for (uint32_t i = 0; i < prime.num_objects; ++i) close(prime.objects[i].fd);
+        close_prime_objects(prime);
         if (error) *error = "不支持的导出布局（objects/layers/planes 不符）";
+        return nullptr;
+    }
+    const uint32_t exported_format = native_format_from_fourcc(prime.layers[0].drm_format);
+    if (exported_format == kNativeDmabufFormatNone ||
+        !native_dmabuf_format_supported(accepted_formats, exported_format)) {
+        close_prime_objects(prime);
+        if (error) *error = "下游未协商导出器返回的 DRM 表面格式";
         return nullptr;
     }
 
@@ -86,6 +135,7 @@ OwnedFrame* VaapiDmabufExporter::export_frame(const AVFrame* hw, std::string* er
     o->frame.drm_fourcc = prime.layers[0].drm_format;
     o->frame.format.video.width = static_cast<uint32_t>(hw->width);
     o->frame.format.video.height = static_cast<uint32_t>(hw->height);
+    o->frame.color = color_metadata_from_av_frame(hw);
     o->frame.size = static_cast<uintptr_t>(prime.objects[0].size);
     o->frame.dma_fd = prime.objects[0].fd;
     // DMABUF 帧的本地句柄约定为首个对象 fd（跨进程传输走协议层的 fd 通道）

@@ -13,7 +13,9 @@ namespace {
 constexpr size_t kHeaderSize = KOPMS_PROTOCOL_HEADER_SIZE;
 constexpr size_t kHelloSize = KOPMS_HELLO_PAYLOAD_SIZE;
 constexpr size_t kHelloAckSize = KOPMS_HELLO_ACK_PAYLOAD_SIZE;
+constexpr size_t kFrameBaseSize = KOPMS_FRAME_SUBMIT_BASE_SIZE;
 constexpr size_t kFrameSize = KOPMS_FRAME_SUBMIT_PAYLOAD_SIZE;
+constexpr size_t kFrameColorOffset = KOPMS_FRAME_SUBMIT_BASE_SIZE;
 constexpr size_t kReleaseSize = KOPMS_FRAME_RELEASE_PAYLOAD_SIZE;
 constexpr size_t kGoodbyeSize = KOPMS_GOODBYE_PAYLOAD_SIZE;
 constexpr size_t kErrorPrefixSize = KOPMS_ERROR_PREFIX_SIZE;
@@ -73,6 +75,53 @@ bool check_struct(const std::vector<uint8_t>& payload, size_t minimum,
     }
     if (struct_size) *struct_size = size;
     return true;
+}
+
+void encode_color(const KopawColorMetadata& color, uint8_t* data) {
+    const uint32_t words[] = {
+        color.range,
+        color.matrix,
+        color.transfer,
+        color.primaries,
+        color.chroma_location,
+        color.flags,
+        color.hdr.flags,
+        color.hdr.max_luminance,
+        color.hdr.min_luminance,
+        color.hdr.max_cll,
+        color.hdr.max_fall,
+        color.hdr.display_primaries[0],
+        color.hdr.display_primaries[1],
+        color.hdr.display_primaries[2],
+        color.hdr.display_primaries[3],
+        color.hdr.display_primaries[4],
+        color.hdr.display_primaries[5],
+        color.hdr.white_point[0],
+        color.hdr.white_point[1],
+        color.hdr.reserved[0],
+    };
+    for (size_t i = 0; i < std::size(words); ++i) put_u32(data + i * 4, words[i]);
+}
+
+void decode_color(const uint8_t* data, KopawColorMetadata* color) {
+    if (!color) return;
+    uint32_t words[20] = {};
+    for (size_t i = 0; i < std::size(words); ++i) words[i] = get_u32(data + i * 4);
+    color->range = words[0];
+    color->matrix = words[1];
+    color->transfer = words[2];
+    color->primaries = words[3];
+    color->chroma_location = words[4];
+    color->flags = words[5];
+    color->hdr.flags = words[6];
+    color->hdr.max_luminance = words[7];
+    color->hdr.min_luminance = words[8];
+    color->hdr.max_cll = words[9];
+    color->hdr.max_fall = words[10];
+    for (size_t i = 0; i < 6; ++i) color->hdr.display_primaries[i] = words[11 + i];
+    color->hdr.white_point[0] = words[17];
+    color->hdr.white_point[1] = words[18];
+    color->hdr.reserved[0] = words[19];
 }
 
 }  // namespace
@@ -168,8 +217,14 @@ bool decode_hello_ack(const std::vector<uint8_t>& payload,
 }
 
 std::vector<uint8_t> encode_frame_submit(const KopmsFrameSubmitPayload& frame) {
-    std::vector<uint8_t> payload(kFrameSize, 0);
-    put_u32(payload.data(), frame.struct_size);
+    // A caller can intentionally advertise the legacy prefix when the peer
+    // did not negotiate color metadata. Never emit bytes beyond that prefix.
+    const size_t payload_size = frame.struct_size >= kFrameSize ? kFrameSize
+                              : frame.struct_size >= kFrameBaseSize ? kFrameBaseSize
+                                                                    : kFrameBaseSize;
+    const uint32_t declared_size = static_cast<uint32_t>(payload_size);
+    std::vector<uint8_t> payload(payload_size, 0);
+    put_u32(payload.data(), declared_size);
     put_u32(payload.data() + 4, frame.frame_id);
     put_u32(payload.data() + 8, frame.media_type);
     put_u32(payload.data() + 12, frame.width);
@@ -191,14 +246,18 @@ std::vector<uint8_t> encode_frame_submit(const KopmsFrameSubmitPayload& frame) {
     put_u32(payload.data() + 148,
             static_cast<uint32_t>(frame.acquire_fence.fd_index));
     put_u64(payload.data() + 152, frame.acquire_fence.value);
+    if (payload_size >= kFrameColorOffset + sizeof(KopawColorMetadata)) {
+        encode_color(frame.color, payload.data() + kFrameColorOffset);
+    }
     return payload;
 }
 
 bool decode_frame_submit(const std::vector<uint8_t>& payload,
                          KopmsFrameSubmitPayload* frame, std::string* error) {
-    if (!frame || !check_struct(payload, kFrameSize, nullptr, error)) return false;
+    uint32_t declared_size = 0;
+    if (!frame || !check_struct(payload, kFrameBaseSize, &declared_size, error)) return false;
     std::memset(frame, 0, sizeof(*frame));
-    frame->struct_size = get_u32(payload.data());
+    frame->struct_size = declared_size;
     frame->frame_id = get_u32(payload.data() + 4);
     frame->media_type = get_u32(payload.data() + 8);
     frame->width = get_u32(payload.data() + 12);
@@ -218,6 +277,10 @@ bool decode_frame_submit(const std::vector<uint8_t>& payload,
     frame->acquire_fence.kind = get_u32(payload.data() + 144);
     frame->acquire_fence.fd_index = static_cast<int32_t>(get_u32(payload.data() + 148));
     frame->acquire_fence.value = get_u64(payload.data() + 152);
+    if (declared_size >= kFrameColorOffset + sizeof(KopawColorMetadata) &&
+        payload.size() >= kFrameColorOffset + sizeof(KopawColorMetadata)) {
+        decode_color(payload.data() + kFrameColorOffset, &frame->color);
+    }
     return true;
 }
 
@@ -365,8 +428,13 @@ bool decode_error(const std::vector<uint8_t>& payload, KopmsErrorCode* code,
 
 bool validate_frame_submit_caps(const KopmsFrameSubmitPayload& frame, size_t fd_count,
                                 uint64_t negotiated_caps, std::string* error) {
-    if (frame.struct_size < kFrameSize) {
+    if (frame.struct_size < kFrameBaseSize) {
         set_error(error, "frame struct_size is too small");
+        return false;
+    }
+    const bool has_color = frame.struct_size >= kFrameColorOffset + sizeof(KopawColorMetadata);
+    if (has_color && (negotiated_caps & KOPMS_PROTOCOL_CAP_COLOR_METADATA) == 0) {
+        set_error(error, "frame color metadata requires the color capability");
         return false;
     }
     if (frame.frame_id == 0) {
@@ -408,16 +476,22 @@ bool validate_frame_submit_caps(const KopmsFrameSubmitPayload& frame, size_t fd_
     }
 
     std::array<bool, KOPMS_PROTOCOL_MAX_FDS> used{};
+    size_t expected_fds = 0;
     for (uint32_t i = 0; i < frame.plane_count; ++i) {
         const int32_t index = frame.planes[i].fd_index;
-        if (index < 0 || static_cast<size_t>(index) >= fd_count || used[index]) {
+        if (index < 0 || static_cast<size_t>(index) >= fd_count) {
             set_error(error, "frame plane fd indexes are invalid");
             return false;
         }
-        used[index] = true;
+        // NV12/P010 planes may legitimately share one DMA-BUF object and
+        // therefore one SCM_RIGHTS fd index. Count unique descriptors, not
+        // planes; the scene validates that their objects really match.
+        if (!used[index]) {
+            used[index] = true;
+            ++expected_fds;
+        }
     }
 
-    size_t expected_fds = frame.plane_count;
     switch (frame.acquire_fence.kind) {
         case KOPAW_SYNC_FENCE_NONE:
         case KOPAW_SYNC_FENCE_TIMELINE:
@@ -463,7 +537,7 @@ bool validate_frame_submit(const KopmsFrameSubmitPayload& frame, size_t fd_count
     return validate_frame_submit_caps(
         frame, fd_count,
         KOPMS_PROTOCOL_CAP_HANDLE_FRAMES | KOPMS_PROTOCOL_CAP_MODIFIERS |
-            KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC,
+            KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC | KOPMS_PROTOCOL_CAP_COLOR_METADATA,
         error);
 }
 
@@ -529,6 +603,9 @@ bool make_frame_submit(const KopmsFrameDescriptor* frame, uint32_t frame_id,
         output->acquire_fence.fd_index = static_cast<int32_t>(fds->size());
         fds->push_back(frame->acquire_fence.fd);
     }
+    const size_t color_end = offsetof(KopmsFrameDescriptor, color) +
+                             sizeof(frame->color);
+    if (frame->struct_size >= color_end) output->color = frame->color;
     return validate_frame_submit(*output, fds->size(), error);
 }
 

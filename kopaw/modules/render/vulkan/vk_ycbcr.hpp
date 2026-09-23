@@ -12,14 +12,17 @@ struct YcbcrConfig {
     uint64_t modifier = 0;
     VkSamplerYcbcrModelConversion model =
         VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601;
-    VkChromaLocation chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
+    VkSamplerYcbcrRange range = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
+    VkChromaLocation x_chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
+    VkChromaLocation y_chroma_location = VK_CHROMA_LOCATION_MIDPOINT;
     VkFilter filter = VK_FILTER_NEAREST;
     uint32_t descriptor_count = 0;
     VkExtent2D max_extent{};
 };
 
-// Native frames currently carry no matrix/range metadata: retain the SD/HD
-// heuristic and limited-range contract until the frame ABI carries colorimetry.
+// Native YCbCr frames must carry the 5.3 color tail. Matrix/range are never
+// derived from dimensions; unsupported or absent values make the caller use
+// its CPU fallback path.
 bool describe_ycbcr_frame(const KopawFrame* frame, YcbcrConfig* config,
                           std::string* error);
 

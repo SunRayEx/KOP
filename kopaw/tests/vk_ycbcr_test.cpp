@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <unistd.h>
 
 #include "frame.hpp"
@@ -31,6 +32,7 @@ unsigned queries = 0;
 
 KopawFrame make_frame(int fd) {
     KopawFrame frame{};
+    frame.struct_size = sizeof(frame);
     frame.media_type = KOPAW_MEDIA_VIDEO;
     frame.memory_type = KOPAW_MEMORY_DMABUF;
     frame.drm_fourcc = kopaw::kDrmFormatNv12;
@@ -43,6 +45,11 @@ KopawFrame make_frame(int fd) {
     frame.size = 1280 * 1080;
     frame.retain = [](KopawFrame*) {};
     frame.release = [](KopawFrame*) {};
+    frame.color.range = KOPAW_COLOR_RANGE_LIMITED;
+    frame.color.matrix = KOPAW_COLOR_MATRIX_BT709;
+    frame.color.transfer = KOPAW_COLOR_TRANSFER_BT709;
+    frame.color.primaries = KOPAW_COLOR_PRIMARIES_BT709;
+    frame.color.chroma_location = KOPAW_CHROMA_LOCATION_CENTER;
     return frame;
 }
 
@@ -124,9 +131,15 @@ int main() {
         kopaw::query_ycbcr_support(VK_NULL_HANDLE, 1280, 720, &config, &error));
     CHECK(config.descriptor_count == 3);
     CHECK(config.filter == VK_FILTER_LINEAR);
-    CHECK(config.chroma_location == VK_CHROMA_LOCATION_MIDPOINT);
+    CHECK(config.range == VK_SAMPLER_YCBCR_RANGE_ITU_NARROW);
+    CHECK(config.x_chroma_location == VK_CHROMA_LOCATION_MIDPOINT);
+    CHECK(config.y_chroma_location == VK_CHROMA_LOCATION_MIDPOINT);
 
+    // Matrix selection is contract-driven. Resolution never selects BT.601.
     frame.format.video.height = 480;
+    CHECK(kopaw::describe_ycbcr_frame(&frame, &config, &error));
+    CHECK(config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709);
+    frame.color.matrix = KOPAW_COLOR_MATRIX_BT601;
     CHECK(kopaw::describe_ycbcr_frame(&frame, &config, &error));
     CHECK(config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601);
     frame = make_frame(fileno(object));
@@ -143,11 +156,26 @@ int main() {
     CHECK(
         kopaw::query_ycbcr_support(VK_NULL_HANDLE, 1280, 720, &config, &error));
 
+    frame.color.range = KOPAW_COLOR_RANGE_FULL;
+    frame.color.matrix = KOPAW_COLOR_MATRIX_BT2020_NCL;
+    CHECK(kopaw::describe_ycbcr_frame(&frame, &config, &error));
+    CHECK(config.model == VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_2020);
+    CHECK(config.range == VK_SAMPLER_YCBCR_RANGE_ITU_FULL);
+    frame = make_frame(fileno(object));
+    CHECK(kopaw::describe_ycbcr_frame(&frame, &config, &error));
+
     features = kSampled | VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
+    CHECK(!kopaw::query_ycbcr_support(VK_NULL_HANDLE, 1280, 720, &config,
+                                      &error));
+    frame.color.chroma_location = KOPAW_CHROMA_LOCATION_TOPLEFT;
+    CHECK(kopaw::describe_ycbcr_frame(&frame, &config, &error));
+    CHECK(config.x_chroma_location == VK_CHROMA_LOCATION_COSITED_EVEN);
+    CHECK(config.y_chroma_location == VK_CHROMA_LOCATION_COSITED_EVEN);
     CHECK(
         kopaw::query_ycbcr_support(VK_NULL_HANDLE, 1280, 720, &config, &error));
-    CHECK(config.chroma_location == VK_CHROMA_LOCATION_COSITED_EVEN);
     CHECK(config.filter == VK_FILTER_NEAREST);
+    frame = make_frame(fileno(object));
+    CHECK(kopaw::describe_ycbcr_frame(&frame, &config, &error));
     features = kSampled | kMidpoint |
                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
     CHECK(
@@ -187,6 +215,21 @@ int main() {
     CHECK(queries > 0);
 
     auto invalid = frame;
+    invalid.struct_size = static_cast<uint32_t>(offsetof(KopawFrame, color));
+    CHECK(!kopaw::describe_ycbcr_frame(&invalid, &config, &error));
+    invalid = frame;
+    invalid.color.range = KOPAW_COLOR_RANGE_UNKNOWN;
+    CHECK(!kopaw::describe_ycbcr_frame(&invalid, &config, &error));
+    invalid = frame;
+    invalid.color.matrix = KOPAW_COLOR_MATRIX_UNKNOWN;
+    CHECK(!kopaw::describe_ycbcr_frame(&invalid, &config, &error));
+    invalid = frame;
+    invalid.color.matrix = KOPAW_COLOR_MATRIX_BT2020_CL;
+    CHECK(!kopaw::describe_ycbcr_frame(&invalid, &config, &error));
+    invalid = frame;
+    invalid.color.chroma_location = KOPAW_CHROMA_LOCATION_BOTTOM;
+    CHECK(!kopaw::describe_ycbcr_frame(&invalid, &config, &error));
+    invalid = frame;
     invalid.planes[1].fd = fileno(other);
     CHECK(!kopaw::describe_ycbcr_frame(&invalid, &config, &error));
     invalid.planes[1].fd = dup(frame.planes[0].fd);

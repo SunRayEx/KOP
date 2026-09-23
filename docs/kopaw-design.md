@@ -104,7 +104,7 @@ KOP 的音视频管线子系统，第一优先级。本文记录 MVP 已实现�
 - player `--zero-copy on|off|auto`（默认 auto）：仅在 Vulkan 本地渲染直连
   或 KOPMS 直通（无滤镜/插件节点）时请求原生输出；`KOPAW_ZERO_COPY=0` 强制关闭。
   VAAPI 导出失败后解码器永久回退 `av_hwframe_transfer_data` 软拷贝路径；
-  渲染端导入失败则当前帧返回错误，尚未实现运行时把已选原生路径重新协商为 CPU 路径；
+  本地渲染端导入失败时丢弃当前帧，RenderNode 通知解码器关闭原生输出，后续帧自动回到 CPU 路径；
 - `KopmsSinkNode` 识别 `KOPAW_MEMORY_DMABUF` 且有 `drm_fourcc` 的帧，直接把
   planes/fence 包装为 BUS2LAYER `FRAME_SUBMIT`，不会先转成 RGBA 再二次导出；
 - CUVID 原生导出依赖 CUDA-EGL/DMA-BUF 互操作，暂留软拷贝回退；
@@ -180,8 +180,10 @@ KOPAW 的 NV12/P010 原生帧使用 `VkSamplerYcbcrConversion` 完成有限范�
 色度重建和 YCbCr→RGB，随后与 RGBA 共用 `quad.frag`；KOPAW 不再使用
 `nv12.frag` 的位深/矩阵 push constants。该着色器仍会被嵌入，因为 KOPMS 使用
 RGB identity 的 YCbCr 转换提取/上采样平面，再在 shader 中应用矩阵。
-当前帧 ABI 未携带色彩元数据，沿用高度 ≥720 为 BT.709、其余为 BT.601
-的约定；这不等同于 FFmpeg 的默认矩阵，也不覆盖 full-range、BT.2020/HDR。
+帧 ABI（5.3）携带完整 `KopawColorMetadata`，两条渲染路径都按帧声明的
+传递函数走 EOTF → 色调映射 → sRGB OETF（共享 `shaders/color.glsl` 与
+`common/include/kop/color_pipeline.hpp`）；transfer 未声明时直通。渲染器
+不得根据宽高推断矩阵或范围。
 
 - 设备显式启用 Vulkan 1.3 dynamic rendering 和可选的 sampler YCbCr
   conversion；DMA-BUF、DRM modifier、foreign queue 扩展缺失时仍可渲染 CPU RGBA。
@@ -218,10 +220,9 @@ RGB identity 的 YCbCr 转换提取/上采样平面，再在 shader 中应用矩
   `recv_port` 依旧可用；tee 广播保持不变；
 - 帧池对解码输出生效；demuxer 包帧仍为每包分配（体积小）；
 - VAAPI 硬解表面可原生导出单对象 NV12/P010 DMA-BUF，直通本地 Vulkan 或
-  KOPMS BUS；导出失败会回退软拷贝。当前本地渲染器尚不能在 DMA-BUF 导入失败后
-  动态切回 CPU 路径，因此 `auto` 不是所有 Vulkan 设备上的导入成功保证；
-- 当前 ABI 没有色彩范围、矩阵或 HDR 元数据，只能按高度选择 BT.601/709 的有限范围
-  转换；full-range、BT.2020 和 HDR 仍待协议与渲染路径共同扩展；
+  KOPMS BUS；导出失败会回退软拷贝，本地 Vulkan 导入失败后也会在下一帧切回 CPU 路径；
+- 帧携带 range/matrix/transfer/primaries/HDR 元数据，渲染时按声明的传递函数
+  走完整色彩管线（EOTF→色调映射→sRGB）；不再按高度猜矩阵；
 - CUVID 原生导出（需 CUDA-EGL 互操作）与 NV12/P010 以外的原生表面格式待演进；
 - 图内仍未提供通用编码器节点；编码/封装目前集中在 `kopaw-transcode` 工具。
 - 网络输入已在 transcode 路径可用，复杂协议重连策略和生产级 jitter buffer 仍待演进。

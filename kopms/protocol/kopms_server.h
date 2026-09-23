@@ -41,6 +41,8 @@ enum class FrameDisposition {
     Retain,
     // 回压拒收：立即以 KOPMS_FRAME_RELEASE_DROPPED 释放（M4 帧回压信号）。
     ReleaseDropped,
+    // 导入/契约失败：生产者应关闭原生路径并回退其 CPU 路径。
+    ReleaseRejected,
 };
 
 using FrameHandler = std::function<FrameDisposition(KopmsReceivedFrame& frame)>;

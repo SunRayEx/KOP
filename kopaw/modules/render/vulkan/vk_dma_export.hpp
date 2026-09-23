@@ -44,6 +44,12 @@ public:
 
     uint64_t exported_frames() const { return exported_frames_; }
     uint64_t upload_us_total() const { return upload_us_total_; }
+    const std::string& device_name() const { return ctx_.device_name; }
+
+    // 导出侧物理设备 UUID：导入侧据此核对是否同卡。
+    const std::array<uint8_t, VK_UUID_SIZE>& device_uuid() const {
+        return ctx_.device_uuid;
+    }
 
 private:
     struct Slot {

@@ -348,6 +348,7 @@ int32_t VideoFilterNode::drain_sink(int64_t default_pts) {
         output->frame.format.video.height = static_cast<uint32_t>(height);
         output->frame.stride = static_cast<uint32_t>(row);
         output->frame.size = bytes;
+        output->frame.color = color_;
         av_frame_unref(out_frm_);
 
         const int32_t emit_rc = kopaw_graph_emit(g_, out_, output->ptr());
@@ -388,6 +389,7 @@ int32_t VideoFilterNode::send_impl(KopawFrame* frame) {
         const int32_t rc = configure(frame);
         if (rc != KOPAW_OK) return rc;
     }
+    color_ = frame->color;
 
     av_frame_unref(in_frm_);
     in_frm_->format = AV_PIX_FMT_RGBA;

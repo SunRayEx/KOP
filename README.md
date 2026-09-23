@@ -194,6 +194,8 @@ KOPAW/KOPMS 为可执行程序与动态节点组合，第三方插件通过稳�
 - PortAudio/GLFW/glslang 系统缺失时由 CMake FetchContent 源码构建，首次配置需联网；
 - VAAPI 可导出单对象双平面 NV12/P010 DMA-BUF；KOPAW Vulkan 后端以固定功能
   `VkSamplerYcbcrConversion` 导入，KOPMS 场景也可经 BUS 直通该类帧。VAAPI
-  导出失败会回退系统内存，但本地 Vulkan 导入失败尚不能在运行中重新协商 CPU 路径；
-- 当前帧/BUS 契约不携带色彩范围、矩阵或 HDR 元数据，有限范围 BT.601/709 由高度推断；
-  CUVID 原生导出、full-range/BT.2020/HDR、dmabuf v4 feedback 和真机 KMS 直出验证属后续。
+  导出失败会回退系统内存；本地 Vulkan 导入失败时当前帧丢弃并通知解码器，
+  后续帧自动重新走 CPU 路径；
+- 帧与 BUS 契约携带完整色彩元数据（range/matrix/transfer/primaries/HDR），
+  渲染侧按声明的传递函数走 EOTF → 色调映射 → sRGB，不从分辨率推断；
+  CUVID 原生导出、HDR swapchain、dmabuf v4 feedback 和真机 KMS 直出验证属后续。

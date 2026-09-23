@@ -41,10 +41,13 @@ Wayland client ── Wayland protocol ─────────────�
 ```
 
 BUS 层固定 32 字节 little-endian 消息头，包含 magic、主/次版本、类型、flags、
-方向序列号、payload 字节数和 ancillary FD 数量。HELLO/HELLO_ACK 协商能力位与
-上限；FRAME_SUBMIT 只传帧元数据，平面和 acquire fence 通过 FD 索引引用，禁止
-把 raw 指针或 CPU `wl_shm` 内容塞入 BUS。KOPMS-S 在校验结构体大小、媒体类型、
-平面/FD 索引和 fence 后发送 FRAME_RELEASE。
+方向序列号、payload 字节数和 ancillary FD 数量。当前协议 minor 为 1.2：
+HELLO/HELLO_ACK 协商能力位与上限；FRAME_SUBMIT 只传帧元数据，平面和 acquire fence
+通过 FD 索引引用，禁止把 raw 指针或 CPU `wl_shm` 内容塞入 BUS。基础
+FRAME_SUBMIT 前缀为 160 字节，1.2 对端协商
+`KOPMS_PROTOCOL_CAP_COLOR_METADATA` 后可追加 80 字节色彩/HDR tail（总计 240
+字节）；旧 1.1 对端仍可只发送基础前缀。KOPMS-S 在校验结构体大小、媒体类型、
+平面/FD 索引、modifier 和 fence 后发送 FRAME_RELEASE。
 
 KOPMS-C 在提交前 retain descriptor，在收到 release 后调用 descriptor 的 release；
 KOPMS-S 负责收到的 FD，直到同步 release 或 session 关闭才释放。服务端 handler
@@ -84,10 +87,39 @@ HELLO 能力协商和 `SCM_RIGHTS` 传输，但控制 payload 不携带 FD，媒
 在服务端读取 `SCM_RIGHTS` 后由本地 DMA-BUF FD 物化。客户端的数字 FD 不能跨进程复用，
 服务端只在保持对应 FD 生命周期期间暴露该句柄。
 
+### 帧色彩契约（KOPAW ABI 5.3 / BUS minor 1.2）
+
+`KopawFrame`、`KopmsFrameDescriptor` 和 BUS `FRAME_SUBMIT` 使用同一份
+`KopawColorMetadata`：
+
+- `range` 明确 limited/full；`matrix` 明确 BT.601、BT.709、BT.2020 NCL（以及
+  可被识别但当前拒绝的 BT.2020 constant-luminance）；
+- `transfer`、`primaries` 和 `chroma_location`（center/left/top/topleft 等）
+  随帧保留；
+- `hdr` 可携带 mastering-display 与 content-light（MaxCLL/MaxFALL）数据，
+  由 `flags` 标记是否存在。
+
+色彩字段是结构体尾部扩展，读取前必须检查 `struct_size`；BUS 只有在 HELLO
+交集包含 `KOPMS_PROTOCOL_CAP_COLOR_METADATA`（0x80）时才发送/接受 tail。
+因此 1.1 或不支持该能力的 peer 仍可使用 160 字节前缀，但 YUV 原生帧不能
+用缺省值补齐色彩信息。任何渲染器都不得根据宽高（例如“≥720 行就是 BT.709”）
+推断矩阵或范围。
+
+KOPMS Vulkan 场景目前对双平面 NV12/P010 接受 limited/full、BT.601/709/2020
+NCL，以及 center/left/top/topleft 色度位置；unknown 色度位置按 center 处理。
+未知 range/matrix、BT.2020 constant-luminance、bottom/bottom-left 色度位置会
+拒收该原生帧并返回 `FRAME_RELEASE_REJECTED`，生产端随后切换 CPU 路径。传递
+函数、原色和 HDR side data 会原样保留；合成目标是 SDR（sRGB 编码的 8-bit
+UNORM 缓冲），因此片段着色器按帧声明的 transfer 走完整色彩管线：EOTF 线性化
+→（PQ/HLG 时以内容声明峰值为锚做色调映射）→ sRGB OETF 编码。PQ/HLG 帧会
+记录一条告警，说明只做了 SDR 色调映射、不是完整 HDR 输出链。transfer 未声明
+（UNKNOWN）时整条管线直通，不做任何推断。
+
 compositor 默认发布 `<wayland-socket>.bus`，也可以用 `--bus-socket NAME` 或
-`KOPMS_BUS_SOCKET` 指定。当前 handler 仅验证 DMA-BUF 生命周期并立即 release，
-nested OpenGL 仍只显示独立的 `wl_shm` 路径；真正的 Vulkan/DRM 导入、fence 等待
-和场景合成属于后续 M3。
+`KOPMS_BUS_SOCKET` 指定。M3/M4 handler 会把 BUS 帧交给 Vulkan 场景，导入时校验
+实际 format/modifier、内存类型和 acquire fence；场景导入失败立即回 `REJECTED`，
+回压则回 `DROPPED`，不会把失败帧误送到 nested `wl_shm`。Wayland 客户端的
+`wl_shm` 仍是独立的协议验证路径，linux-dmabuf 则与 BUS 共用 Vulkan 场景。
 
 `KOPMS_GPU_MODE=SINGLE|HYBRID` 在 compositor 启动时解析。缺省为 SINGLE，非法值
 回退并记录警告；模式只改变句柄解释和校验策略，不改变 BUS2LAYER 的消息头、ring 或 FD
@@ -166,8 +198,9 @@ AddFB2 + atomic page-flip，flip 完成事件到达后场景才释放参与合�
   `DrmImportedBuffer` 按引用生命周期释放。
 - explicit sync_file fence 使用有界 `poll()` 等待；timeline fence 暂不伪装成已支持。
   importer 不关闭借用 fd，server 必须在 frame release 前保持它们有效。
-- 该模块目前是可测试的导入防护层，尚未在 compositor handler 中启用；M2.4 的 bootstrap
-  buffer 只验证输出生命周期，不把 KOPAW DMA-BUF 直接提交到物理输出。
+- 该模块目前是可测试的导入防护层；Vulkan 场景负责 GPU 合成导入，物理直出仍先
+  通过 bootstrap buffer 和 TEST_ONLY 验证输出生命周期，不把未经合成的 KOPAW
+  DMA-BUF 直接提交到物理输出。
 - `DrmKmsSession::test_modeset()` 使用 `DRM_MODE_ATOMIC_TEST_ONLY`；只有显式调用
   `modeset()` 后通常才调用 `page_flip()`；后者通过 DRM event fd 等待完成回调，并阻止
   在 event 未完成时释放 master。
@@ -214,6 +247,9 @@ AddFB2 + atomic page-flip，flip 完成事件到达后场景才释放参与合�
 - `struct_size`/`version` 为扩展入口（当前 descriptor version=2）；`dma_buf_handle` 是
   唯一的媒体内存标识。DMA-BUF 描述包含每平面的 fd、offset、stride 和 modifier；同步
   对象包含 fence 类型、fd 和 timeline value。
+- descriptor 的尾部可携带 `pts`/`dts` 以及 `KopawColorMetadata`；消费者必须按
+  `struct_size` 判断尾部是否存在。色彩 tail 与 BUS 1.2 的 80 字节 tail 字段布局一致，
+  覆盖 range、matrix、transfer、primaries、chroma location 和可选 HDR side data。
 - descriptor 通过 `retain`/`release` 管理引用，`FrameLease` 提供 RAII 转移；消费者不得
   自行关闭 DMA-BUF 或 fence fd。
 - descriptor 的 CPU 地址别名只服务于 SINGLE 进程内 ABI 校验和未来工具，M1 compositor
@@ -255,6 +291,15 @@ DRM 直出模式
 - Wayland buffer：场景释放回调发送 `wl_buffer.release`，explicit-sync 的
   `get_release` 请求按最近一次合成 fence 回 `fenced_release`（合成未发生则
   `immediate_release`）。
+- **合成 fence 的 payload 只能导出一次**：`vkGetFenceFdKHR`（SYNC_FD）把已 signal
+  的 fence payload 转移到 fd，fence 随即回到未 signal 状态；且按 Vulkan 语义，对未
+  signal 的 fence 调用该接口在 Mesa/ANV 上会**阻塞等待**（`DRM_IOCTL_SYNCOBJ_WAIT`）。
+  因此 `cache_release_fence()` 只能在 `wait_composite_fence()` 真正等待成功之后执行，
+  并用 `fence_signalled_` 标记“当前持有可导出 payload”，导出后清零、`vkResetFences`
+  后清零。早先以“曾经合成过”（`composite_count_ > 0`）为门限，会在连续两次无新内容的
+  `render()` 之间对已转移过 payload 的 fence 重复导出 → 合成器永久卡在 syncobj 等待，
+  客户端的 `wl_buffer.release` / 帧回调再也无法到达（`kopms-dmabuf-client` 表现为
+  CTest 60 秒超时）。
 - KOPAW 侧 `KopmsSinkNode`（`--kopms-bus`）：导出图像池上限即在飞上限，send 阻塞
   泵 FRAME_RELEASE 形成生产端背压；CPU RGBA 使用导出器，带 `drm_fourcc` 的
   `KOPAW_MEMORY_DMABUF` 帧直接封装提交；有界 500ms 超时防止图停止时挂死。
@@ -265,24 +310,51 @@ DRM 直出模式
   描述符当前要求两个平面 fd 相同。格式、planes、offset、stride 和 modifier 仍经
   `KopmsFrameDescriptor`/Wayland dmabuf 的原有入口传递。
 - Vulkan 的 YCbCr conversion 以 RGB identity 模型完成平面提取与色度上采样；
-  `nv12.frag` 再按 push constant 的位深及高度（≥720 为 BT.709，否则 BT.601）
-  应用有限范围 YCbCr→RGB 矩阵。它与 KOPAW 本地渲染器的“固定功能完成完整
-  BT.601/709 转换、复用 `quad.frag`”不同，不能把两者的管线和色彩元数据能力混为一谈。
+  RGB identity 不做 YCbCr→RGB 运算，采样返回的是格式通道的原序，对
+  `G8_B8R8`/`G10X6_B10X6R10X6` 两平面格式即 `(Cr, Y, Cb)`（R、B 取自 chroma
+  平面，G 取自 luma 平面），由 `nv12.frag` 先重排为 (Y, Cb, Cr) 再应用矩阵。
+  `nv12.frag` 由 push constant 接收位深、显式 matrix 和 range，再应用
+  YCbCr→RGB 矩阵。矩阵不再由高度阈值推断：BT.601、BT.709 和 BT.2020 NCL
+  分别使用帧色彩 tail 指定的模型，limited/full 也由 tail 指定。KOPAW 本地
+  Vulkan 渲染器则把同一元数据映射到 `VkSamplerYcbcrConversion`；两条路径的
+  采样实现不同，但共享“不猜测色彩”的契约。
+- `chroma_location` 选择 immutable sampler 的 midpoint/cosited 变体；unknown
+  位置保持 midpoint。当前 bottom/bottom-left 色度位置及 BT.2020 constant-
+  luminance 尚无对应重建 shader，会拒收原生帧并触发 CPU fallback。
 - YUV 导入需要场景设备具备 YCbCr conversion；有 modifier 时还依赖 DRM modifier
-  导入能力。acquire sync-fence 在导入前有界等待；VAAPI 导出帧已由生产端
-  `vaSyncSurface` 同步，因此携带 `KOPAW_SYNC_FENCE_NONE`。
+  导入能力。导入前会再次以实际 format/modifier 查询设备支持，并把 image
+  requirements 与 `vkGetMemoryFdPropertiesKHR` 的 memoryTypeBits 取交集；任何
+  Vulkan 创建、分配、绑定或视图失败都视为该帧原生导入失败。acquire sync-fence
+  在导入前有界等待；VAAPI 导出帧已由生产端 `vaSyncSurface` 同步，因此携带
+  `KOPAW_SYNC_FENCE_NONE`。
 
-能力协商（协议 minor 1.1，32 字节头/双 lane/SCM_RIGHTS 不变）：
+能力协商（协议 minor 1.2，32 字节头/双 lane/SCM_RIGHTS 不变）：
 
+- `KOPMS_PROTOCOL_CAP_DMABUF`：允许媒体帧通过 DMA-BUF 平面提交；
+- `KOPMS_PROTOCOL_CAP_FRAME_RELEASE`：服务端在场景完成或拒收后回送释放状态；
 - `KOPMS_PROTOCOL_CAP_HANDLE_FRAMES`：KOPAW_MEMORY_VULKAN 帧端到端可用；
-- `KOPMS_PROTOCOL_CAP_MODIFIERS`：非零 modifier 平面必须协商；
-- `KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC`：acquire fence 必须协商；
+- `KOPMS_PROTOCOL_CAP_MODIFIERS`：实际 DRM format/modifier 必须协商并在导入时
+  再验证（不能把声明支持当作所有 modifier 都可用）；
+- `KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC`：acquire fence 可通过 FD 索引传递并有界等待；
+- `KOPMS_PROTOCOL_CAP_COLOR_METADATA`：允许 FRAME_SUBMIT 的 80 字节色彩/HDR tail；
 - `KOPMS_CONTROL_WINDOW_ATTACH`（operation 7）：owner 会话把窗口绑定为自己的
   native 帧目标，会话断开自动解绑。
 
-已知边界：多平面图像目前只接受单对象双平面 NV12/P010；色彩范围、矩阵和 HDR
-元数据尚未通过 descriptor/BUS 传递。窗口模式 swapchain 为串行呈现（M4 验证基线）；
-DRM 直出的真机 flip 验证需要 logind 会话或 vkms。
+启动时能力交集决定是否打开原生输出：KOPAW Vulkan backend 仅在实际具备
+YCbCr、DMA-BUF、DRM modifier 和 fd-properties 能力时报告 NV12/P010 mask；
+`KopmsSinkNode` 还要求 BUS 协商 DMABUF、FRAME_RELEASE、MODIFIERS 和 COLOR_METADATA。
+每一帧仍会检查具体 modifier、平面布局和色彩值，不能把启动 mask 当作导入成功保证。
+如果本地 Vulkan 导入失败，RenderNode 丢弃失败帧并通知 VideoDecoderNode 关闭
+native output，后续帧回到 CPU；如果 KOPMS 场景拒绝 BUS 原生帧，则以
+`FRAME_RELEASE_REJECTED` 通知 sink，sink 执行同一回退。回压拒收使用
+`FRAME_RELEASE_DROPPED`，不应误判为设备导入失败。
+
+已知边界：多平面图像目前只接受单对象双平面 NV12/P010；VAAPI 以外的原生表面
+格式需新增 exporter 和能力位后才能直通。CUDA/CUVID 当前不伪造 DMA-BUF 能力，
+原生导出需要 CUDA-EGL/DMA-BUF interop，暂时走 CPU 软拷贝。Wayland
+`linux-dmabuf` bridge 当前公布 RGBA 格式；它没有色彩管理 tail，YUV 原生帧应从
+BUS 入口提交。窗口模式 swapchain 为串行呈现（M4 验证基线）；DRM 直出的真机
+flip 验证需要 logind 会话或 vkms。
 
 ## 验证
 
@@ -303,8 +375,8 @@ BUS2LAYER 与 M3/M4 协议自测不依赖 X11/GPU（Vulkan 回环测试无 DMA-B
 ```
 
 `kopms-vk-nv12-scene-test` 创建实际的 LINEAR NV12 DMA-BUF，经与 BUS 相同的
-`VulkanScene` 导入/合成路径回读 BT.601 有限范围结果；没有 DMA-BUF 能力的驱动以
-退出码 77 跳过。
+`VulkanScene` 导入/合成路径回读显式色彩 metadata 指定的 BT.601 limited 结果；
+没有 DMA-BUF/YCbCr 能力的驱动以退出码 77 跳过。
 
 零拷贝基准（五项指标，JSON 输出）：
 
@@ -332,8 +404,12 @@ WAYLAND_DISPLAY=kop-0 ./build/relwithdebinfo/kopms/kopms-test-client 5
 
 ## 后续里程碑
 
-- 色彩范围、矩阵、传递函数/HDR 元数据的 descriptor/BUS 协商；KOPMS YUV 路径
-  仍使用 RGB identity + shader 矩阵，后续可与 KOPAW 的固定功能转换策略统一；
+- 扩展更多原生 surface 格式与 modifier：新增 exporter、Vulkan 导入验证和对应
+  HELLO format mask 后再启用，不能把未实现的格式标记为支持；CUDA/CUVID
+  原生导出需先落地 CUDA-EGL/DMA-BUF interop；
 - 窗口模式 swapchain 流水化（多帧 in-flight）与 presentation-time 反馈；
+- HDR 输出链路的剩余部分（HDR swapchain、display capabilities、per-window
+  EOTF 协商）；当前 PQ/HLG 帧已按内容声明峰值色调映射到 SDR 目标，但不是
+  完整 HDR 输出链；
 - DRM 直出合成结果的真机 page-flip 验证（vkms / logind 双显卡 PRIME）；
 - KOPMS-S/C 的 descriptor 与 release 契约保持为 Vulkan/DRM 的上游边界。

@@ -1,5 +1,6 @@
 #include "kopms_sink_node.hpp"
 
+#include <cstddef>
 #include <cstring>
 #include <unordered_map>
 
@@ -31,12 +32,16 @@ struct KopmsSinkNode::Submission {
     KopmsFrameDescriptor desc{};
     KopawFrame* gpu_frame = nullptr;
     KopmsSinkNode* self = nullptr;
+    uint32_t frame_id = 0;
+    bool client_retained = false;
+    bool native_input = false;
 };
 
 void KopmsSinkNode::desc_retain(KopmsFrameDescriptor* desc) {
     auto* sub = static_cast<Submission*>(desc->user_data);
     if (sub && sub->gpu_frame && sub->gpu_frame->retain) {
         sub->gpu_frame->retain(sub->gpu_frame);
+        sub->client_retained = true;
     }
 }
 
@@ -55,11 +60,13 @@ KopmsSinkNode::~KopmsSinkNode() { disconnect(); }
 void KopmsSinkNode::free_submission(Submission* sub) {
     if (!sub) return;
     pending_.erase(reinterpret_cast<uintptr_t>(sub));
+    if (sub->frame_id != 0) native_frame_ids_.erase(sub->frame_id);
     if (sub->gpu_frame && sub->gpu_frame->release) {
-        // 两份引用在此归还：client submit 时的 retain（FRAME_RELEASE 对应）
-        // 与 sink 自持的原始导出引用。引用归零 → fd 关闭 → 图像回池。
+        // Return the sink's original reference and, if submit reached its
+        // retain step, the client reference. Validation failures before retain
+        // therefore remain balanced as well.
         sub->gpu_frame->release(sub->gpu_frame);
-        sub->gpu_frame->release(sub->gpu_frame);
+        if (sub->client_retained) sub->gpu_frame->release(sub->gpu_frame);
     }
     delete sub;
     ++frames_released_;
@@ -71,7 +78,7 @@ bool KopmsSinkNode::connect(std::string* error) {
     // 全 CPU 帧且导出不可用时在 send 路径明确报错丢弃。
     if (!exporter_.inited()) {
         std::string export_err;
-        if (exporter_.init(options_.max_export_images, &export_err)) {
+        if (!exporter_.init(options_.max_export_images, &export_err)) {
             exporter_ready_ = true;
         } else {
             KOP_LOG_WARN(kTag, "Vulkan 导出器不可用（%s）：仅支持 DMA-BUF 帧直通",
@@ -84,11 +91,16 @@ bool KopmsSinkNode::connect(std::string* error) {
                           KOPMS_PROTOCOL_CAP_HANDLE_FRAMES |
                           KOPMS_PROTOCOL_CAP_MODIFIERS |
                           KOPMS_PROTOCOL_CAP_EXPLICIT_SYNC |
+                          KOPMS_PROTOCOL_CAP_COLOR_METADATA |
                           KOPMS_PROTOCOL_CAP_CONTROL_STATE;
     if (!impl_->client.connect(options_.bus_socket, error) ||
         !impl_->client.hello(caps, error)) {
         return false;
     }
+    impl_->client.set_frame_release_observer(
+        [this](uint32_t frame_id, uint32_t status) {
+            observe_frame_release(frame_id, status);
+        });
     if ((impl_->client.capabilities() &
          (KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE)) !=
         (KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE)) {
@@ -137,6 +149,34 @@ void KopmsSinkNode::disconnect() {
     impl_->client.disconnect();
     // disconnect() 已对全部在飞 descriptor 调 release → free_submission。
     connected_ = false;
+    native_frame_ids_.clear();
+}
+
+uint32_t KopmsSinkNode::native_dmabuf_format_mask() const {
+    if (!connected_ || !impl_) return kNativeDmabufFormatNone;
+    constexpr uint64_t required = KOPMS_PROTOCOL_CAP_DMABUF |
+                                  KOPMS_PROTOCOL_CAP_FRAME_RELEASE |
+                                  KOPMS_PROTOCOL_CAP_MODIFIERS |
+                                  KOPMS_PROTOCOL_CAP_COLOR_METADATA;
+    return (impl_->client.capabilities() & required) == required
+               ? kNativeDmabufFormatKnown
+               : kNativeDmabufFormatNone;
+}
+
+void KopmsSinkNode::notify_dmabuf_fallback() {
+    if (dmabuf_fallback_used_ || !dmabuf_fallback_) return;
+    dmabuf_fallback_used_ = true;
+    KOP_LOG_WARN(kTag,
+                 "KOPMS 拒绝原生 DMA-BUF 导入，关闭解码器原生输出并回退 CPU 路径");
+    dmabuf_fallback_();
+}
+
+void KopmsSinkNode::observe_frame_release(uint32_t frame_id, uint32_t status) {
+    const auto it = native_frame_ids_.find(frame_id);
+    if (it != native_frame_ids_.end() && it->second &&
+        status == KOPMS_FRAME_RELEASE_REJECTED) {
+        notify_dmabuf_fallback();
+    }
 }
 
 void KopmsSinkNode::pump_releases(int timeout_ms) {
@@ -195,6 +235,13 @@ int32_t KopmsSinkNode::send_impl(KopawFrame* frame) {
     KopawFrame* gpu = nullptr;
     uint32_t drm_format = 0;
     if (frame->memory_type == KOPAW_MEMORY_DMABUF && frame->drm_fourcc != 0) {
+        if (native_dmabuf_format_mask() == kNativeDmabufFormatNone) {
+            KOP_LOG_WARN(kTag, "KOPMS 未协商原生 YUV DMA-BUF 能力，丢弃本帧");
+            notify_dmabuf_fallback();
+            frame->release(frame);
+            ++frames_dropped_;
+            return KOPAW_OK;
+        }
         // P2 直通：解码原生 DMA-BUF 帧（NV12 等）直接包装提交。
         // 引用计数桥直接作用于该帧：client submit 的 retain 与 sink 自持
         // 引用都落到 KopawFrame 引用计数上，语义与导出帧完全一致。
@@ -220,6 +267,8 @@ int32_t KopmsSinkNode::send_impl(KopawFrame* frame) {
     auto* sub = new Submission();
     sub->gpu_frame = gpu;
     sub->self = this;
+    sub->native_input = gpu == frame &&
+                        frame->memory_type == KOPAW_MEMORY_DMABUF;
     KopmsFrameDescriptor& d = sub->desc;
     d.struct_size = sizeof(d);
     d.version = KOPMS_FRAME_DESCRIPTOR_VERSION;
@@ -240,15 +289,21 @@ int32_t KopmsSinkNode::send_impl(KopawFrame* frame) {
     d.release = &KopmsSinkNode::desc_release;
     d.pts = gpu->pts;
     d.dts = gpu->dts;
+    const size_t color_end = offsetof(KopawFrame, color) + sizeof(gpu->color);
+    if (gpu->struct_size >= color_end) d.color = gpu->color;
 
     uint32_t frame_id = 0;
+    const bool native_input = sub->native_input;
     if (!impl_->client.submit(&sub->desc, &frame_id, &error)) {
         // submit 失败：client 已对 descriptor 执行 release → free_submission
         // 回收了自持引用并删除 sub；这里只记账。
         KOP_LOG_WARN(kTag, "FRAME_SUBMIT 失败（%s）", error.c_str());
+        if (native_input) notify_dmabuf_fallback();
         ++frames_dropped_;
     } else {
+        sub->frame_id = frame_id;
         pending_.emplace(reinterpret_cast<uintptr_t>(sub), sub);
+        native_frame_ids_.emplace(frame_id, sub->native_input);
         ++frames_submitted_;
     }
     // 导出路径：sink 额外持有的源帧引用在此归还（直通帧由 Submission 管理，

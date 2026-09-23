@@ -9,15 +9,15 @@ set(TMP_DIR "${OUT_FILE}.tmp")
 file(MAKE_DIRECTORY "${TMP_DIR}")
 
 execute_process(
-    COMMAND "${GLSLANG}" -V "${SHADER_DIR}/quad.vert" -o "${TMP_DIR}/vert.spv"
+    COMMAND "${GLSLANG}" -V -I"${SHADER_DIR}" "${SHADER_DIR}/quad.vert" -o "${TMP_DIR}/vert.spv"
     RESULT_VARIABLE rc
     COMMAND_ERROR_IS_FATAL ANY)
 execute_process(
-    COMMAND "${GLSLANG}" -V "${SHADER_DIR}/quad.frag" -o "${TMP_DIR}/frag.spv"
+    COMMAND "${GLSLANG}" -V -I"${SHADER_DIR}" "${SHADER_DIR}/quad.frag" -o "${TMP_DIR}/frag.spv"
     RESULT_VARIABLE rc
     COMMAND_ERROR_IS_FATAL ANY)
 execute_process(
-    COMMAND "${GLSLANG}" -V "${SHADER_DIR}/nv12.frag" -o "${TMP_DIR}/frag_nv12.spv"
+    COMMAND "${GLSLANG}" -V -I"${SHADER_DIR}" "${SHADER_DIR}/nv12.frag" -o "${TMP_DIR}/frag_nv12.spv"
     RESULT_VARIABLE rc
     COMMAND_ERROR_IS_FATAL ANY)
 

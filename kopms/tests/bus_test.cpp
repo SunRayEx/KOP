@@ -169,7 +169,8 @@ bool run() {
     hello.protocol_major = KOPMS_PROTOCOL_MAJOR;
     hello.protocol_minor = KOPMS_PROTOCOL_MINOR;
     hello.capabilities = KOPMS_PROTOCOL_CAP_DMABUF | KOPMS_PROTOCOL_CAP_FRAME_RELEASE |
-                         KOPMS_PROTOCOL_CAP_CONTROL_STATE;
+                         KOPMS_PROTOCOL_CAP_CONTROL_STATE |
+                         KOPMS_PROTOCOL_CAP_COLOR_METADATA;
     hello.max_payload = KOPMS_PROTOCOL_MAX_PAYLOAD;
     hello.max_fds = KOPMS_PROTOCOL_MAX_FDS;
     if (!client.send_message(KOPMS_PROTOCOL_MAJOR, KOPMS_PROTOCOL_MINOR,
@@ -188,7 +189,8 @@ bool run() {
     KopmsHelloAckPayload ack{};
     if (!kopms::decode_hello_ack(message.payload, &ack, &error) || ack.status != 0 ||
         (ack.capabilities & KOPMS_PROTOCOL_CAP_DMABUF) == 0 ||
-        (ack.capabilities & KOPMS_PROTOCOL_CAP_CONTROL_STATE) == 0) {
+        (ack.capabilities & KOPMS_PROTOCOL_CAP_CONTROL_STATE) == 0 ||
+        (ack.capabilities & KOPMS_PROTOCOL_CAP_COLOR_METADATA) == 0) {
         return fail("HELLO_ACK negotiation is invalid");
     }
     message.clear();
