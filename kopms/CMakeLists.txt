@@ -293,6 +293,9 @@ if(BUILD_TESTING)
 
         # P3-M4 Wayland 兼容面端到端：真实客户端进程走 linux-dmabuf /
         # explicit-sync → 场景导入 → release。需要显示环境（无则以 77 跳过）。
+        # 这两个协议文件只在系统装了 wayland-protocols 时才生成，缺失时
+        # 跳过该 test，而不是引用不存在的源文件导致配置失败。
+        if(KOPMS_HAVE_LINUX_DMABUF_PROTO AND KOPMS_HAVE_EXPLICIT_SYNC_PROTO)
         add_executable(kopms-dmabuf-client-test tests/dmabuf_wayland_client_test.cpp
             ${KOPMS_PROTO_DIR}/xdg-shell-protocol.c
             ${KOPMS_PROTO_DIR}/linux-dmabuf-protocol.c
@@ -309,6 +312,7 @@ if(BUILD_TESTING)
         set_tests_properties(kopms-dmabuf-client PROPERTIES
             SKIP_RETURN_CODE 77
             TIMEOUT 60)
+        endif()
 
         # 输入/输出持久压测：合成器 soak 自驱动 → 反馈客户端渲染 → 计数核对。
         add_executable(kopms-input-soak-test tests/input_soak_test.cpp)

@@ -41,6 +41,7 @@ jobs:
             libswscale-dev libswresample-dev libavfilter-dev \
             libvulkan-dev libgl-dev glslang-tools \
             libwayland-dev libxkbcommon-dev \
+            wayland-protocols \
             libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev libxext-dev \
             libasound2-dev \
