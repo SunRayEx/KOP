@@ -33,7 +33,10 @@ jobs:
             build-essential cmake ninja-build pkg-config clang \
             nasm yasm \
             libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev libavfilter-dev
+            libswscale-dev libswresample-dev libavfilter-dev \
+            # KOPMS 的 GLFW 无条件参与配置，即便关掉两个渲染后端也需这些头
+            libxrandr-dev libxinerama-dev \
+            libwayland-dev libxkbcommon-dev
 
       - name: Configure fuzzers
         run: |

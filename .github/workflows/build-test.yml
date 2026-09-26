@@ -41,6 +41,9 @@ jobs:
             libswscale-dev libswresample-dev libavfilter-dev \
             libvulkan-dev libgl-dev glslang-tools \
             libwayland-dev libxkbcommon-dev \
+            # GLFW（KOPMS 的 nested M1 输出）在 X11 后端下强制要求这两个头文件
+            libxrandr-dev libxinerama-dev \
+            libxi-dev libxcursor-dev \
             libasound2-dev \
             ${{ matrix.compiler == 'clang' && 'clang' || '' }}
 
