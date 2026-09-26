@@ -48,6 +48,7 @@ add_library(kopaw-modules STATIC ${KOPAW_MODULES_SOURCES})
 
 target_include_directories(kopaw-modules PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/ffmpeg  # FFmpeg 封装层统一入口
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/kopaw/abi/include
 )

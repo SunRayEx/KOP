@@ -4,8 +4,10 @@
 
 #include <cstring>
 
+#include "ffmpeg_error.hpp"
+
 #if KOPAW_HAVE_LIBVA
-#include <libavutil/hwcontext_vaapi.h>
+#include <libavutil/hwcontext_vaapi.h>  // AVVAAPIDeviceContext
 #endif
 
 #include "../frame.hpp"
@@ -30,13 +32,7 @@ KopawNodeVTable make_vtable() {
 const KopawNodeVTable kVTable = make_vtable();
 }  // namespace
 
-VideoDecoderNode::~VideoDecoderNode() {
-    sws_freeContext(sws_);
-    if (pkt_) av_packet_free(&pkt_);
-    if (frm_) av_frame_free(&frm_);
-    if (ctx_) avcodec_free_context(&ctx_);
-    if (hw_.device_ref) av_buffer_unref(&hw_.device_ref);
-}
+VideoDecoderNode::~VideoDecoderNode() = default;
 
 bool VideoDecoderNode::native_dmabuf_export_supported() const {
 #if KOPAW_HAVE_LIBVA
@@ -77,7 +73,7 @@ bool VideoDecoderNode::open(AVCodecParameters* params, std::string* error) {
         }
         KOP_LOG_WARN(kTag, "硬解打开失败（%s），回退软解", error->c_str());
         close_context();
-        if (hw_.device_ref) av_buffer_unref(&hw_.device_ref);
+        hw_.device_ref.reset();
         hw_ = HwAccelConfig{};
     }
     if (!open_context(params, false, error)) return false;
@@ -92,9 +88,9 @@ bool VideoDecoderNode::open_context(AVCodecParameters* params, bool hw, std::str
         *error = "找不到视频解码器";
         return false;
     }
-    ctx_ = avcodec_alloc_context3(codec);
+    ctx_.reset(avcodec_alloc_context3(codec));
     if (!ctx_) return false;
-    if (avcodec_parameters_to_context(ctx_, params) < 0) {
+    if (avcodec_parameters_to_context(ctx_.get(), params) < 0) {
         *error = "视频解码参数拷贝失败";
         return false;
     }
@@ -103,14 +99,12 @@ bool VideoDecoderNode::open_context(AVCodecParameters* params, bool hw, std::str
     if (hw) {
         ctx_->opaque = this;
         ctx_->get_format = &VideoDecoderNode::get_hw_format;
-        ctx_->hw_device_ctx = av_buffer_ref(hw_.device_ref);
+        ctx_->hw_device_ctx = av_buffer_ref(hw_.device_ref.get());
     }
-    if (avcodec_open2(ctx_, codec, nullptr) < 0) {
+    if (avcodec_open2(ctx_.get(), codec, nullptr) < 0) {
         *error = hw ? "硬解 avcodec_open2 失败" : "视频解码器打开失败";
         return false;
     }
-    pkt_ = av_packet_alloc();
-    frm_ = av_frame_alloc();
     if (!pkt_ || !frm_) {
         *error = "AVPacket/AVFrame 分配失败";
         return false;
@@ -119,11 +113,10 @@ bool VideoDecoderNode::open_context(AVCodecParameters* params, bool hw, std::str
 }
 
 void VideoDecoderNode::close_context() {
-    sws_freeContext(sws_);
-    sws_ = nullptr;
-    if (pkt_) av_packet_free(&pkt_);
-    if (frm_) av_frame_free(&frm_);
-    if (ctx_) avcodec_free_context(&ctx_);
+    sws_.reset();
+    pkt_.reset();
+    frm_.reset();
+    ctx_.reset();
 }
 
 KopawNodeDesc VideoDecoderNode::desc(KopawGraph* g) {
@@ -145,11 +138,10 @@ int32_t VideoDecoderNode::emit_converted(AVFrame* frame) {
     // 源参数变化（少见）时重建 sws 上下文
     if (!sws_ || sws_src_w_ != frame->width || sws_src_h_ != frame->height ||
         sws_src_fmt_ != frame->format) {
-        sws_freeContext(sws_);
-        sws_ = sws_getContext(frame->width, frame->height,
-                              static_cast<AVPixelFormat>(frame->format), frame->width,
-                              frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr,
-                              nullptr, nullptr);
+        sws_.reset(sws_getContext(frame->width, frame->height,
+                                  static_cast<AVPixelFormat>(frame->format), frame->width,
+                                  frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr,
+                                  nullptr, nullptr));
         if (!sws_) return KOPAW_E_GENERIC;
         sws_src_w_ = frame->width;
         sws_src_h_ = frame->height;
@@ -172,7 +164,7 @@ int32_t VideoDecoderNode::emit_converted(AVFrame* frame) {
                                frame->linesize[2], frame->linesize[3]};
     uint8_t* dst[1] = {o->data()};
     const int dst_stride[1] = {static_cast<int>(frame->width) * 4};
-    sws_scale(sws_, src, src_stride, 0, frame->height, dst, dst_stride);
+    sws_scale(sws_.get(), src, src_stride, 0, frame->height, dst, dst_stride);
 
     return kopaw_graph_emit(g_, out_, o->ptr());
 }
@@ -186,18 +178,14 @@ int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
         return kopaw_graph_emit(g_, out_, native->ptr());
     }
     // 硬解帧在加速器内存：拉回系统内存（NV12，转换交给 sws）
-    AVFrame* sw = av_frame_alloc();
-    if (!sw) return KOPAW_E_GENERIC;
-    if (av_hwframe_transfer_data(sw, raw, 0) < 0 || sw->data[0] == nullptr) {
+    AvFrame sw;
+    if (av_hwframe_transfer_data(sw.get(), raw, 0) < 0 || sw->data[0] == nullptr) {
         KOP_LOG_WARN(kTag, "硬解帧回传失败，丢弃该帧");
-        av_frame_free(&sw);
         return KOPAW_OK;
     }
-    av_frame_copy_props(sw, raw);
+    av_frame_copy_props(sw.get(), raw);
     sw->pts = raw->pts;
-    int32_t rc = emit_converted(sw);
-    av_frame_free(&sw);
-    return rc;
+    return emit_converted(sw.get());
 }
 
 OwnedFrame* VideoDecoderNode::try_export_native(AVFrame* raw) {
@@ -242,10 +230,10 @@ OwnedFrame* VideoDecoderNode::try_export_native(AVFrame* raw) {
 
 void VideoDecoderNode::flush_and_finish() {
     // 冲刷解码器残余帧
-    avcodec_send_packet(ctx_, nullptr);
-    while (avcodec_receive_frame(ctx_, frm_) >= 0) {
-        decode_frame_to_rgba(frm_);
-        av_frame_unref(frm_);
+    avcodec_send_packet(ctx_.get(), nullptr);
+    while (avcodec_receive_frame(ctx_.get(), frm_.get()) >= 0) {
+        decode_frame_to_rgba(frm_.get());
+        frm_.unref();
     }
     OwnedFrame* eos = make_frame(KOPAW_MEDIA_VIDEO, 0, 0, 0);
     eos->frame.flags |= KOPAW_FRAME_FLAG_EOS;
@@ -263,7 +251,7 @@ int32_t VideoDecoderNode::send_impl(KopawFrame* f) {
     // 包帧数据拷入 FFmpeg 自有缓冲（失败时帧未消费，返回非 OK 由引擎释放）
     const uint8_t* input = cpu_data(f);
     if (!input) return KOPAW_E_INVALID;
-    if (av_new_packet(pkt_, static_cast<int>(f->size)) < 0) {
+    if (!pkt_.new_packet(static_cast<int>(f->size))) {
         return KOPAW_E_GENERIC;
     }
     memcpy(pkt_->data, input, f->size);
@@ -272,22 +260,22 @@ int32_t VideoDecoderNode::send_impl(KopawFrame* f) {
     pkt_->flags = (f->flags & KOPAW_FRAME_FLAG_KEY) ? AV_PKT_FLAG_KEY : 0;
     f->release(f);
 
-    int rc = avcodec_send_packet(ctx_, pkt_);
-    av_packet_unref(pkt_);
-    if (rc < 0 && rc != AVERROR(EAGAIN)) {
-        KOP_LOG_WARN(kTag, "send_packet 错误 %d，跳过该包", rc);
+    int rc = avcodec_send_packet(ctx_.get(), pkt_.get());
+    pkt_.unref();
+    if (rc < 0 && !av_is_retry(rc)) {
+        KOP_LOG_WARN(kTag, "send_packet 错误 %s，跳过该包", av_error_string(rc));
         return KOPAW_OK;
     }
 
     while (true) {
-        rc = avcodec_receive_frame(ctx_, frm_);
-        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+        rc = avcodec_receive_frame(ctx_.get(), frm_.get());
+        if (av_is_retry(rc)) break;
         if (rc < 0) {
-            KOP_LOG_WARN(kTag, "receive_frame 错误 %d", rc);
+            KOP_LOG_WARN(kTag, "receive_frame 错误 %s", av_error_string(rc));
             break;
         }
-        int32_t erc = decode_frame_to_rgba(frm_);
-        av_frame_unref(frm_);
+        int32_t erc = decode_frame_to_rgba(frm_.get());
+        frm_.unref();
         if (erc != KOPAW_OK) return KOPAW_OK;  // 下游停止：静默退出
     }
     return KOPAW_OK;
