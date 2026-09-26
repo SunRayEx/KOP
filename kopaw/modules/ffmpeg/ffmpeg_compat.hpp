@@ -50,6 +50,9 @@ inline void frame_get_channel_layout(const AVFrame* frame, ChannelLayout* out) {
 inline void codec_set_channel_layout(AVCodecContext* ctx, const ChannelLayout* layout) {
     av_channel_layout_copy(&ctx->ch_layout, layout);
 }
+inline void codec_ctx_get_channel_layout(const AVCodecContext* ctx, ChannelLayout* out) {
+    av_channel_layout_copy(out, &ctx->ch_layout);
+}
 
 // 重采样器参数：现代版用 swr_alloc_set_opts2（AVChannelLayout 参数）
 inline int swr_set_opts(SwrContext** swr, const ChannelLayout* out_layout,
@@ -101,6 +104,10 @@ inline void frame_get_channel_layout(const AVFrame* frame, ChannelLayout* out) {
 inline void codec_set_channel_layout(AVCodecContext* ctx, const ChannelLayout* layout) {
     ctx->channel_layout = layout->mask;
     ctx->channels = layout->nb_channels;
+}
+inline void codec_ctx_get_channel_layout(const AVCodecContext* ctx, ChannelLayout* out) {
+    out->mask = static_cast<uint64_t>(ctx->channel_layout);
+    out->nb_channels = ctx->channels;
 }
 
 // 旧版用 swr_alloc_set_opts（int64_t 参数）

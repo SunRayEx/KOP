@@ -282,14 +282,17 @@ bool configure_filter(StreamCtx* stream, const AVFrame* frame, std::string* erro
     } else {
         source = avfilter_get_by_name("abuffer");
         sink = avfilter_get_by_name("abuffersink");
-        if (!source || !sink || frame->sample_rate <= 0 || frame->ch_layout.nb_channels <= 0) {
+        kopaw::compat::ChannelLayout layout_ctx;
+        kopaw::compat::frame_get_channel_layout(frame, &layout_ctx);
+        if (!source || !sink || frame->sample_rate <= 0
+            || layout_ctx.nb_channels <= 0) {
             if (error) *error = "音频帧格式无效，无法创建 lavfi 输入";
             return false;
         }
         const char* sample_format = av_get_sample_fmt_name(static_cast<AVSampleFormat>(frame->format));
         char layout[256] = {};
-        if (!sample_format || av_channel_layout_describe(&frame->ch_layout, layout,
-                                                          sizeof(layout)) < 0) {
+        if (!sample_format || !kopaw::compat::channel_layout_describe(
+                                 &layout_ctx, layout, sizeof(layout))) {
             if (error) *error = "音频采样格式或声道布局无效";
             return false;
         }
@@ -407,17 +410,17 @@ int choose_sample_rate(const AVCodec* codec, int preferred) {
     return rates[0];
 }
 
-bool choose_channel_layout(const AVCodec* codec, const AVChannelLayout& preferred,
-                           AVChannelLayout* selected) {
+bool choose_channel_layout(const AVCodec* codec, const kopaw::compat::ChannelLayout& preferred,
+                           kopaw::compat::ChannelLayout* selected) {
     if (!selected) return false;
     if (kopaw::compat::channel_layout_copy(selected, &preferred) < 0) return false;
-    const AVChannelLayout* layouts = kopaw::compat::codec_channel_layouts(codec);
+    const kopaw::compat::ChannelLayout* layouts = kopaw::compat::codec_channel_layouts(codec);
     if (!layouts) return true;
-    for (const AVChannelLayout* layout = layouts; layout->nb_channels; ++layout) {
-        if (av_channel_layout_compare(&preferred, layout) == 0) return true;
+    for (const kopaw::compat::ChannelLayout* layout = layouts; layout->nb_channels; ++layout) {
+        if (kopaw::compat::channel_layout_compare(&preferred, layout) == 0) return true;
     }
-    av_channel_layout_uninit(selected);
-    return av_channel_layout_copy(selected, &layouts[0]) >= 0;
+    kopaw::compat::channel_layout_uninit(selected);
+    return kopaw::compat::channel_layout_copy(selected, &layouts[0]) >= 0;
 }
 
 bool create_encoder(StreamCtx* stream, AVFrame* format_frame, AVFormatContext* output,
@@ -433,6 +436,7 @@ bool create_encoder(StreamCtx* stream, AVFrame* format_frame, AVFormatContext* o
         if (error) *error = "分配编码器上下文失败";
         return false;
     }
+    kopaw::compat::ChannelLayout enc_layout{};
     if (stream->video) {
         if (format_frame->width <= 0 || format_frame->height <= 0) {
             if (error) *error = "视频滤镜输出尺寸无效";
@@ -447,16 +451,19 @@ bool create_encoder(StreamCtx* stream, AVFrame* format_frame, AVFormatContext* o
         stream->enc->bit_rate = parse_bitrate(options.video_bitrate);
         if (stream->enc->priv_data) av_opt_set(stream->enc->priv_data, "crf", "28", 0);
     } else {
-        if (format_frame->sample_rate <= 0 || format_frame->ch_layout.nb_channels <= 0) {
+        kopaw::compat::ChannelLayout fmt_layout;
+        kopaw::compat::frame_get_channel_layout(format_frame, &fmt_layout);
+        if (format_frame->sample_rate <= 0 || fmt_layout.nb_channels <= 0) {
             if (error) *error = "音频滤镜输出格式无效";
             return false;
         }
         stream->enc->sample_rate = choose_sample_rate(codec, format_frame->sample_rate);
         stream->enc->sample_fmt = choose_sample_format(codec, AV_SAMPLE_FMT_FLTP);
-        if (!choose_channel_layout(codec, format_frame->ch_layout, &stream->enc->ch_layout)) {
+        if (!choose_channel_layout(codec, fmt_layout, &enc_layout)) {
             if (error) *error = "编码器不接受音频声道布局";
             return false;
         }
+        kopaw::compat::codec_set_channel_layout(stream->enc, &enc_layout);
         stream->enc->time_base = AVRational{1, stream->enc->sample_rate};
         stream->enc->bit_rate = parse_bitrate(options.audio_bitrate);
     }
@@ -643,17 +650,20 @@ int main(int argc, char** argv) {
             format_frame.sample_rate = stream.dec->sample_rate;
             if (stream.video) {
                 // no-op: video fields above are the complete format description
-            } else if (stream.dec->ch_layout.nb_channels > 0) {
-                av_channel_layout_copy(&format_frame.ch_layout, &stream.dec->ch_layout);
             } else {
-                av_channel_layout_default(
-                    &format_frame.ch_layout,
-                    stream.dec->ch_layout.nb_channels > 0 ? stream.dec->ch_layout.nb_channels : 2);
+                kopaw::compat::ChannelLayout dec_layout;
+                kopaw::compat::codec_ctx_get_channel_layout(stream.dec, &dec_layout);
+                if (dec_layout.nb_channels > 0) {
+                    kopaw::compat::frame_set_channel_layout(&format_frame, &dec_layout);
+                } else {
+                    kopaw::compat::ChannelLayout def;
+                    kopaw::compat::channel_layout_default(&def, 2);
+                    kopaw::compat::frame_set_channel_layout(&format_frame, &def);
+                }
             }
             std::string error;
             const bool created = create_encoder(&stream, &format_frame, output.context,
                                                 options, &error);
-            av_channel_layout_uninit(&format_frame.ch_layout);
             if (!created) {
                 KOP_LOG_ERROR(kTag, "%s", error.c_str());
                 return 1;
@@ -801,8 +811,10 @@ int main(int argc, char** argv) {
             audio->format = stream.enc->sample_fmt;
             audio->sample_rate = stream.enc->sample_rate;
             audio->nb_samples = target;
-            if (av_channel_layout_copy(&audio->ch_layout, &stream.enc->ch_layout) < 0 ||
-                av_frame_get_buffer(audio, 0) < 0) {
+            kopaw::compat::ChannelLayout enc_layout;
+            kopaw::compat::codec_ctx_get_channel_layout(stream.enc, &enc_layout);
+            kopaw::compat::frame_set_channel_layout(audio, &enc_layout);
+            if (av_frame_get_buffer(audio, 0) < 0) {
                 av_frame_free(&audio);
                 pipeline_error = "分配编码音频缓冲失败";
                 return false;
@@ -816,7 +828,7 @@ int main(int argc, char** argv) {
             }
             if (read < target) {
                 av_samples_set_silence(audio->extended_data, read, target - read,
-                                        stream.enc->ch_layout.nb_channels,
+                                        enc_layout.nb_channels,
                                         stream.enc->sample_fmt);
             }
             audio->pts = stream.next_pts;
@@ -830,22 +842,20 @@ int main(int argc, char** argv) {
 
     auto ensure_audio_converter = [&](StreamCtx& stream, const AVFrame* frame) -> bool {
         if (stream.swr) return true;
-        AVChannelLayout input_layout{};
-        if (av_channel_layout_copy(&input_layout, &frame->ch_layout) < 0) {
-            pipeline_error = "复制输入音频声道布局失败";
-            return false;
-        }
-        const int rc_swr = swr_alloc_set_opts2(
-            &stream.swr, &stream.enc->ch_layout, stream.enc->sample_fmt,
+        kopaw::compat::ChannelLayout input_layout{};
+        kopaw::compat::frame_get_channel_layout(frame, &input_layout);
+        kopaw::compat::ChannelLayout enc_layout;
+        kopaw::compat::codec_ctx_get_channel_layout(stream.enc, &enc_layout);
+        const int rc_swr = kopaw::compat::swr_set_opts(
+            &stream.swr, &enc_layout, stream.enc->sample_fmt,
             stream.enc->sample_rate, &input_layout,
-            static_cast<AVSampleFormat>(frame->format), frame->sample_rate, 0, nullptr);
-        av_channel_layout_uninit(&input_layout);
+            static_cast<AVSampleFormat>(frame->format), frame->sample_rate);
         if (rc_swr < 0 || !stream.swr || swr_init(stream.swr) < 0) {
             pipeline_error = "初始化音频格式转换失败";
             return false;
         }
         stream.audio_fifo = av_audio_fifo_alloc(stream.enc->sample_fmt,
-                                                stream.enc->ch_layout.nb_channels, 1);
+                                                enc_layout.nb_channels, 1);
         if (!stream.audio_fifo) {
             pipeline_error = "分配音频缓冲失败";
             return false;
@@ -898,8 +908,10 @@ int main(int argc, char** argv) {
             converted->format = stream.enc->sample_fmt;
             converted->sample_rate = stream.enc->sample_rate;
             converted->nb_samples = capacity;
-            if (av_channel_layout_copy(&converted->ch_layout, &stream.enc->ch_layout) < 0 ||
-                av_frame_get_buffer(converted, 0) < 0) {
+            kopaw::compat::ChannelLayout enc_layout2;
+            kopaw::compat::codec_ctx_get_channel_layout(stream.enc, &enc_layout2);
+            kopaw::compat::frame_set_channel_layout(converted, &enc_layout2);
+            if (av_frame_get_buffer(converted, 0) < 0) {
                 av_frame_free(&converted);
                 pipeline_error = "分配转换音频缓冲失败";
                 return false;
@@ -936,8 +948,10 @@ int main(int argc, char** argv) {
                 converted->format = stream.enc->sample_fmt;
                 converted->sample_rate = stream.enc->sample_rate;
                 converted->nb_samples = capacity;
-                if (av_channel_layout_copy(&converted->ch_layout, &stream.enc->ch_layout) < 0 ||
-                    av_frame_get_buffer(converted, 0) < 0) {
+                kopaw::compat::ChannelLayout enc_layout3;
+                kopaw::compat::codec_ctx_get_channel_layout(stream.enc, &enc_layout3);
+                kopaw::compat::frame_set_channel_layout(converted, &enc_layout3);
+                if (av_frame_get_buffer(converted, 0) < 0) {
                     av_frame_free(&converted);
                     pipeline_error = "分配音频冲刷缓冲失败";
                     return false;
