@@ -26,6 +26,7 @@ if(KOPAW_BUILD_VULKAN)
         modules/render/vulkan/vulkan_backend.cpp
         modules/render/vulkan/vk_ycbcr.cpp
         modules/render/vulkan/vk_dma_export.cpp
+        modules/render/vulkan/vk_hdr.cpp
         modules/ffmpeg/hwaccel.cpp)
     # P2 硬解零拷贝：VAAPI 表面原生 DMA-BUF 导出（libva 可选依赖）
     find_package(PkgConfig QUIET)
@@ -147,6 +148,7 @@ set_target_properties(kopaw-plugin-demo PROPERTIES OUTPUT_NAME "kopaw-plugin-dem
 add_executable(kopaw-transcode tools/kopaw-transcode/src/main.cpp)
 target_include_directories(kopaw-transcode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/ffmpeg  # ffmpeg.hpp 统一入口
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/kopaw/abi/include
 )
@@ -166,6 +168,18 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/abi/include
             ${Vulkan_INCLUDE_DIRS})
         add_test(NAME kopaw-vk-ycbcr COMMAND kopaw-vk-ycbcr-test)
+
+        # HDR 显示能力协商与 HDR10 编码数学（无 GPU/显示器依赖）。
+        add_executable(kopaw-vk-hdr-test
+            tests/vk_hdr_test.cpp
+            modules/render/vulkan/vk_hdr.cpp)
+        target_include_directories(kopaw-vk-hdr-test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/modules
+            ${CMAKE_CURRENT_SOURCE_DIR}/abi/include
+            ${CMAKE_SOURCE_DIR}/common/include
+            ${Vulkan_INCLUDE_DIRS})
+        target_link_libraries(kopaw-vk-hdr-test PRIVATE kop-common)
+        add_test(NAME kopaw-vk-hdr COMMAND kopaw-vk-hdr-test)
     endif()
 
     add_executable(kopaw-filter-node-test tests/filter_node_test.cpp)

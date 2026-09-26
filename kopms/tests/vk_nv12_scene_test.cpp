@@ -222,11 +222,20 @@ int main() {
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                          &to_dst);
+    // staging 按各 plane 的实际 rowPitch 填充：驱动常把 NV12 的 Y 步长对齐到
+    // 大于 width 的值（本机 width=64、Y pitch=128）。必须把这些步长作为
+    // bufferRowLength 告诉拷贝命令，否则逐行读取会错位，产生隔行式坏图。
     VkBufferImageCopy regions[2]{};
     regions[0].bufferOffset = 0;
+    regions[0].bufferRowLength =
+        static_cast<uint32_t>(plane_layout[0].rowPitch);  // R8: 1B/texel
+    regions[0].bufferImageHeight = kH;
     regions[0].imageSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1};
     regions[0].imageExtent = {kW, kH, 1};
     regions[1].bufferOffset = y_bytes;
+    regions[1].bufferRowLength =
+        static_cast<uint32_t>(plane_layout[1].rowPitch) / 2;  // R8G8: 2B/texel
+    regions[1].bufferImageHeight = kH / 2;
     regions[1].imageSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1};
     regions[1].imageExtent = {kW / 2, kH / 2, 1};
     vkCmdCopyBufferToImage(cmd, stage, image, VK_IMAGE_LAYOUT_GENERAL, 2, regions);
@@ -251,9 +260,15 @@ int main() {
         vkBeginCommandBuffer(cmd, &vbegin);
         VkBufferImageCopy vregions[2]{};
         vregions[0].bufferOffset = 0;
+        vregions[0].bufferRowLength =
+            static_cast<uint32_t>(plane_layout[0].rowPitch);
+        vregions[0].bufferImageHeight = kH;
         vregions[0].imageSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1};
         vregions[0].imageExtent = {kW, kH, 1};
         vregions[1].bufferOffset = y_bytes;
+        vregions[1].bufferRowLength =
+            static_cast<uint32_t>(plane_layout[1].rowPitch) / 2;
+        vregions[1].bufferImageHeight = kH / 2;
         vregions[1].imageSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1};
         vregions[1].imageExtent = {kW / 2, kH / 2, 1};
         vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, stage, 2,
@@ -269,6 +284,7 @@ int main() {
         vkWaitForFences(producer.device, 1, &vfence, VK_TRUE, 5'000'000'000ull);
         vkDestroyFence(producer.device, vfence, nullptr);
         if (bytes[0] != 64 || bytes[40] != 200 ||
+            bytes[plane_layout[0].rowPitch * 20 + 40] != 200 ||
             bytes[y_bytes] != 128) {
             return fail("producer NV12 content check");
         }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <string>
 
+#include "hdr_mode.hpp"
 #include "kopaw_abi.h"  // 自带 extern "C" 保护
 #include "native_dmabuf.hpp"
 
@@ -50,6 +51,10 @@ public:
     virtual void shutdown() = 0;
 
     virtual const char* name() const = 0;
+
+    // 交换链 HDR 输出策略（默认 Auto）。在 init 之前调用；后端不支持的
+    // 模式静默退化为 SDR。
+    virtual void set_hdr_mode(HdrMode /*mode*/) {}
 
     // 是否支持直接消费外部内存帧（KOPAW_MEMORY_DMABUF）。
     // The mask is negotiated before native output is enabled. Per-frame

@@ -22,21 +22,8 @@
 #include <utility>
 #include <vector>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavfilter/avfilter.h>
-#include <libavfilter/buffersink.h>
-#include <libavfilter/buffersrc.h>
-#include <libavutil/audio_fifo.h>
-#include <libavutil/avutil.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
-#include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
-#include <libswscale/swscale.h>
-}
+#include "ffmpeg.hpp"  // FFmpeg 统一入口（外部工具经 modules include 路径引用）
+#include "ffmpeg_compat.hpp"  // 跨版本编解码能力/声道布局抽象
 
 #include "ffmpeg/io_control.hpp"
 #include "kop/log.h"
@@ -393,40 +380,44 @@ bool flush_filter(StreamCtx* stream, const FrameHandler& handler, std::string* e
 }
 
 AVPixelFormat choose_pixel_format(const AVCodec* codec, AVPixelFormat preferred) {
-    if (!codec->pix_fmts) return preferred;
-    for (const AVPixelFormat* format = codec->pix_fmts; *format != AV_PIX_FMT_NONE; ++format) {
+    const AVPixelFormat* fmts = kopaw::compat::codec_pix_fmts(codec);
+    if (!fmts) return preferred;
+    for (const AVPixelFormat* format = fmts; *format != AV_PIX_FMT_NONE; ++format) {
         if (*format == preferred) return preferred;
     }
-    return codec->pix_fmts[0];
+    return fmts[0];
 }
 
 AVSampleFormat choose_sample_format(const AVCodec* codec, AVSampleFormat preferred) {
-    if (!codec->sample_fmts) return preferred;
-    for (const AVSampleFormat* format = codec->sample_fmts; *format != AV_SAMPLE_FMT_NONE;
+    const AVSampleFormat* fmts = kopaw::compat::codec_sample_fmts(codec);
+    if (!fmts) return preferred;
+    for (const AVSampleFormat* format = fmts; *format != AV_SAMPLE_FMT_NONE;
          ++format) {
         if (*format == preferred) return preferred;
     }
-    return codec->sample_fmts[0];
+    return fmts[0];
 }
 
 int choose_sample_rate(const AVCodec* codec, int preferred) {
-    if (!codec->supported_samplerates) return preferred;
-    for (const int* rate = codec->supported_samplerates; *rate; ++rate) {
+    const int* rates = kopaw::compat::codec_sample_rates(codec);
+    if (!rates) return preferred;
+    for (const int* rate = rates; *rate; ++rate) {
         if (*rate == preferred) return preferred;
     }
-    return codec->supported_samplerates[0];
+    return rates[0];
 }
 
 bool choose_channel_layout(const AVCodec* codec, const AVChannelLayout& preferred,
                            AVChannelLayout* selected) {
     if (!selected) return false;
-    if (av_channel_layout_copy(selected, &preferred) < 0) return false;
-    if (!codec->ch_layouts) return true;
-    for (const AVChannelLayout* layout = codec->ch_layouts; layout->nb_channels; ++layout) {
+    if (kopaw::compat::channel_layout_copy(selected, &preferred) < 0) return false;
+    const AVChannelLayout* layouts = kopaw::compat::codec_channel_layouts(codec);
+    if (!layouts) return true;
+    for (const AVChannelLayout* layout = layouts; layout->nb_channels; ++layout) {
         if (av_channel_layout_compare(&preferred, layout) == 0) return true;
     }
     av_channel_layout_uninit(selected);
-    return av_channel_layout_copy(selected, &codec->ch_layouts[0]) >= 0;
+    return av_channel_layout_copy(selected, &layouts[0]) >= 0;
 }
 
 bool create_encoder(StreamCtx* stream, AVFrame* format_frame, AVFormatContext* output,
