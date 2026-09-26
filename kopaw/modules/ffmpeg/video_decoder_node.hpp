@@ -10,6 +10,7 @@
 // FFmpeg 统一入口（libav* 只经此头引用，extern "C" 在那里包裹一次）。
 #include "ffmpeg.hpp"
 
+#include "../frame.hpp"  // OwnedFrame（try_export_native 的返回类型）
 #include "kopaw_abi.h"
 #include "hwaccel.hpp"
 #include "native_dmabuf.hpp"

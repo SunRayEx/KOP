@@ -55,11 +55,8 @@ extern "C" {
 #include <libswscale/version.h>
 }
 
-// KOPAW 支持的 FFmpeg 版本窗口。低于此版本时兼容层尽力而为（见
-// ffmpeg_compat.hpp），CI 矩阵只覆盖窗口内的版本。
-#define KOPAV_MIN_LIBAVUTIL_MAJOR 56  // FFmpeg 4.4（Ubuntu 22.04）
-#define KOPAV_MIN_LIBAVUTIL_MINOR 0
-
+// 错误映射（av_error_string / av_status）：与 libav 头同属统一入口。
+// KopavStatus 需先于 include 定义——ffmpeg_error.hpp 的函数签名要用它。
 namespace kopaw {
 
 // FFmpeg 错误码到 KOPAW 状态码的统一映射（见 ffmpeg_error.hpp）。
@@ -73,3 +70,10 @@ enum class KopavStatus {
 };
 
 }  // namespace kopaw
+
+#include "ffmpeg_error.hpp"
+
+// KOPAW 支持的 FFmpeg 版本窗口。低于此版本时兼容层尽力而为（见
+// ffmpeg_compat.hpp），CI 矩阵只覆盖窗口内的版本。
+#define KOPAV_MIN_LIBAVUTIL_MAJOR 56  // FFmpeg 4.4（Ubuntu 22.04）
+#define KOPAV_MIN_LIBAVUTIL_MINOR 0

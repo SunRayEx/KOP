@@ -186,7 +186,8 @@ int32_t DemuxerNode::run_impl() {
             }
             if (rc == AVERROR(EAGAIN)) {
                 if (!network) {
-                    KOP_LOG_ERROR(kTag, "本地输入返回暂时无数据: %s", av_err2str(rc));
+                    KOP_LOG_ERROR(kTag, "本地输入返回暂时无数据: %s",
+                                 kopaw::av_error_string(rc));
                     failure = KOPAW_E_GENERIC;
                     break;
                 }
