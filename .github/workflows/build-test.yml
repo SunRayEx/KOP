@@ -1,0 +1,111 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的并发任务自动取消旧的，省 CI 额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.04 是 CI 常备；22.04 覆盖较老工具链（gcc 12 / clang 14）
+        os: [ubuntu-24.04]
+        compiler: [gcc, clang]
+        include:
+          - os: ubuntu-22.04
+            compiler: gcc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # 构建期依赖：FFmpeg（音视频模块）、Vulkan/GL、Wayland（KOPMS）、
+          # GLFW（窗口）；CI 只验证可构建性 + 单元/集成测试，不跑图形应用。
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            nasm yasm \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev libavfilter-dev \
+            libvulkan-dev libgl-dev glslang-tools \
+            libwayland-dev libxkbcommon-dev \
+            libasound2-dev \
+            ${{ matrix.compiler == 'clang' && 'clang' || '' }}
+
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
+
+      - name: Show toolchain
+        run: |
+          cmake --version
+          ${CXX:-g++} --version
+          pkg-config --modversion libavcodec || true
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKOP_BUILD_FUZZERS=OFF
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: Test
+        # 无显示服务器的环境里跳过需要 GPU/DRM 的测试；KOPMS 的设备类测试
+        # 在 CI 中本就无法真正打开设备（通过设备探针自动跳过）。
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}-${{ matrix.compiler }}
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/CTestTestfile.cmake
+          if-no-files-found: ignore
+
+  # 单独的 Rust 引擎检查：KOPAW 的图引擎核心（cargo test）
+  rust-core:
+    name: kopaw-core (cargo)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build pkg-config
+
+      - name: Format check
+        run: cargo fmt --manifest-path kopaw/core/Cargo.toml -- --check
+
+      - name: Clippy (best effort)
+        continue-on-error: true
+        run: cargo clippy --manifest-path kopaw/core/Cargo.toml --all-targets
+
+      - name: Test
+        run: cargo test --manifest-path kopaw/core/Cargo.toml

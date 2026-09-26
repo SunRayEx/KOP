@@ -1,0 +1,82 @@
+name: Fuzz
+
+# 模糊测试：CI 里跑短预算的冒烟（默认 -runs），发现崩溃即拦截。
+# 本地深挖用 cmake --build --target fuzz-long（libFuzzer 模式下可持续运行）。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: '每个靶的执行次数（libFuzzer -runs）'
+        default: '100000'
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # clang 提供 libFuzzer + 完整 sanitizer 运行时；GCC 的 libasan 在
+          # 部分发行版是独立包，统一用 clang 避免“运行时缺失”的坑。
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config clang \
+            nasm yasm \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev libavfilter-dev
+
+      - name: Configure fuzzers
+        run: |
+          cmake -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKOP_BUILD_FUZZERS=ON \
+            -DKOP_FUZZ_CXX=clang++ \
+            -DKOPAW_BUILD_VULKAN=OFF -DKOPAW_BUILD_OPENGL=OFF \
+            -DKOPNET_BUILD_NODES=OFF
+
+      - name: Build fuzzers
+        run: |
+          cmake --build build-fuzz --target \
+            kopnet-rtp-fuzz kopnet-tunnel-fuzz kopnet-frame-envelope-fuzz
+
+      - name: Run fuzzers (libFuzzer smoke)
+        env:
+          RUNS: ${{ github.event.inputs.runs || '100000' }}
+        run: |
+          set -e
+          mkdir -p artifacts
+          fail=0
+          for target in kopnet-rtp-fuzz kopnet-tunnel-fuzz kopnet-frame-envelope-fuzz; do
+            echo "::group::$target"
+            # -rss_limit_mb 防止内存类 bug 拖垮 CI；超时兜底
+            ./build-fuzz/fuzz/$target \
+              -runs="$RUNS" \
+              -max_len=4096 \
+              -rss_limit_mb=2048 \
+              -timeout=30 \
+              -artifact_prefix=artifacts/ \
+              || fail=1
+            echo "::endgroup::"
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::模糊测试发现崩溃，输入见 artifacts/"
+            exit 1
+          fi
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: artifacts/
+          if-no-files-found: ignore

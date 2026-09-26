@@ -185,6 +185,22 @@ RGB identity 的 YCbCr 转换提取/上采样平面，再在 shader 中应用矩
 `common/include/kop/color_pipeline.hpp`）；transfer 未声明时直通。渲染器
 不得根据宽高推断矩阵或范围。
 
+输出端两种模式由 push constant 的 `out_mode` 选择（前 20 字节布局不变，SDR
+消费端按原样填充即可）：
+
+- `out_mode=0`（SDR，默认）：HDR 内容以声明峰值为锚色调映射到 sRGB 8-bit UNORM；
+  KOPMS 合成场景固定走该路径。
+- `out_mode=1`（HDR10）：统一到绝对亮度 cd/m²（PQ 的 EOTF 输出已是绝对值，
+  HLG 乘名义峰 1000，SDR 传递函数乘 BT.2408 参考白 203）→ 内容原色矩阵
+  （BT.709 / Display-P3 → Rec.2020，矩阵值从色度坐标推导并与单元测试逐项比对）
+  → ST.2084 PQ OETF，写入 A2B10G10R10 + HDR10_ST2084 交换链。HDR10 是绝对
+  编码，应用侧不做色调映射，高光收敛交给显示器。
+
+显示能力协商见 `vk_hdr.hpp`：表面存在 A2B10G10R10+ST.2084 对即为 HDR10 可用。
+播放器 `--hdr auto`（默认）在首帧内容为 PQ/HLG 且表面可用时重建交换链升级为
+HDR10；`--hdr on` 强制 HDR10（SDR 内容按参考白抬升）；不可用时安全回退 SDR。
+协商逻辑是纯函数，`kopaw-vk-hdr-test` 用合成格式表覆盖全部分支，无需 GPU。
+
 - 设备显式启用 Vulkan 1.3 dynamic rendering 和可选的 sampler YCbCr
   conversion；DMA-BUF、DRM modifier、foreign queue 扩展缺失时仍可渲染 CPU RGBA。
 - 按实际格式与 DRM modifier 查询采样、色度位置和外部内存导入能力，优先
