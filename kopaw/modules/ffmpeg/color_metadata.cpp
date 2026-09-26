@@ -4,11 +4,7 @@
 #include <cstdint>
 #include <limits>
 
-extern "C" {
-#include <libavutil/frame.h>
-#include <libavutil/mastering_display_metadata.h>
-#include <libavutil/pixfmt.h>
-}
+#include "ffmpeg.hpp"
 
 namespace kopaw {
 namespace {

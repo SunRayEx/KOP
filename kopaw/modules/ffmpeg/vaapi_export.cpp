@@ -5,9 +5,6 @@
 #include <cstring>
 
 extern "C" {
-#include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_vaapi.h>
-#include <libavutil/pixfmt.h>
 #include <va/va_drmcommon.h>
 }
 

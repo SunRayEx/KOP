@@ -39,7 +39,7 @@ static bool try_device_type(AVCodecID codec_id, AVHWDeviceType type, HwAccelConf
     out->name = av_hwdevice_get_type_name(type);
     out->type = type;
     out->hw_pix_fmt = hw_fmt;
-    out->device_ref = dev;
+    out->device_ref = AvBufferRef(dev);
     return true;
 }
 

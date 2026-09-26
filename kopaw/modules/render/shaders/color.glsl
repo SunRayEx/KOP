@@ -19,6 +19,20 @@
 #define KOPAW_TF_PQ      4
 #define KOPAW_TF_HLG     5
 
+// KOPAW_COLOR_PRIMARIES_*（kopaw_abi.h）
+#define KOPAW_P_UNKNOWN 0
+#define KOPAW_P_BT601   1
+#define KOPAW_P_BT709   2
+#define KOPAW_P_BT2020  3
+#define KOPAW_P_P3      4
+
+// 输出模式
+#define KOPAW_OUT_SDR   0  // sRGB 编码 8-bit UNORM
+#define KOPAW_OUT_HDR10 1  // PQ 编码 Rec.2020（A2B10G10R10 + HDR10_ST2084）
+
+// SDR 内容搬到 HDR10 输出时的参考白（BT.2408 推荐 203 cd/m²）。
+#define KOPAW_SDR_REF_CD 203.0
+
 // 单通道 EOTF：非线性编码值 → 线性亮度（PQ 为 cd/m²，其余为相对值）。
 float kopaw_eotf1(float v, int tf) {
     if (tf == KOPAW_TF_SRGB) {
@@ -71,6 +85,42 @@ vec3 kopaw_srgb_oetf(vec3 l) {
                 kopaw_srgb_oetf1(l.b));
 }
 
+// ST.2084 OETF（EOTF 的严格逆）：线性亮度 cd/m² → 非线性编码值 [0,1]。
+// 与 kopaw_eotf1 的 PQ 分支互为逆运算（先升 m1 次幂是关键）。
+float kopaw_pq_oetf1(float l_cd) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float l = pow(clamp(l_cd, 0.0, 10000.0) / 10000.0, m1);
+    return pow((c1 + c2 * l) / (1.0 + c3 * l), m2);
+}
+
+vec3 kopaw_pq_oetf(vec3 l_cd) {
+    return vec3(kopaw_pq_oetf1(l_cd.r), kopaw_pq_oetf1(l_cd.g),
+                kopaw_pq_oetf1(l_cd.b));
+}
+
+// 内容原色 → Rec.2020 的线性矩阵（两者都以 D65 为白点，故是 3x3 旋转）。
+// BT.2020 内容恒等；Display-P3 与 BT.709/BT.601（近似）各自展开到 2020。
+// 数值与 color_pipeline_test 的色度坐标推导结果逐项比对过。
+mat3 kopaw_primaries_to_2020(int primaries) {
+    if (primaries == KOPAW_P_BT2020) {
+        return mat3(1.0);
+    }
+    if (primaries == KOPAW_P_P3) {
+        // Display-P3（D65）→ Rec.2020
+        return mat3(0.7538330, 0.0457438, -0.0012103,
+                    0.1985974, 0.9417772, 0.0176017,
+                    0.0475696, 0.0124789, 0.9836086);
+    }
+    // BT.709（BT.601 近似）→ Rec.2020
+    return mat3(0.6274040, 0.0690970, 0.0163910,
+                0.3292830, 0.9195410, 0.0880130,
+                0.0433130, 0.0113620, 0.8955960);
+}
+
 // 完整链：非线性 RGB →（EOTF）→ 线性 →（HDR 色调映射）→（sRGB OETF）→ 输出。
 vec3 kopaw_apply_color(vec3 nonlin, int transfer, float peak_in) {
     if (transfer == KOPAW_TF_UNKNOWN) return nonlin;
@@ -82,4 +132,30 @@ vec3 kopaw_apply_color(vec3 nonlin, int transfer, float peak_in) {
         lin = kopaw_tonemap(lin, 1.0);
     }
     return kopaw_srgb_oetf(lin);
+}
+
+// 完整链（含 HDR10 输出）：out_mode=KOPAW_OUT_HDR10 时统一到绝对亮度 cd/m²
+// （PQ 已是绝对值；HLG 乘名义峰 1000；SDR 传递函数乘参考白），过原色矩阵到
+// Rec.2020，再 PQ 编码。HDR10 是绝对编码：应用侧不做色调映射，高光收敛交给
+// 显示器自身的 EOTF/色调映射，这是标准 HDR10 行为。
+vec3 kopaw_apply_color_out(vec3 nonlin, int transfer, float peak_in,
+                          int out_mode, int primaries, float sdr_ref) {
+    if (out_mode != KOPAW_OUT_HDR10)
+        return kopaw_apply_color(nonlin, transfer, peak_in);
+    if (sdr_ref <= 0.0) sdr_ref = KOPAW_SDR_REF_CD;
+    if (transfer == KOPAW_TF_UNKNOWN) {
+        // 未声明内容按 SDR 参考白抬升后进 HDR10。
+        vec3 abs_lin = nonlin * sdr_ref;
+        return kopaw_pq_oetf(kopaw_primaries_to_2020(primaries) * abs_lin);
+    }
+    vec3 lin = kopaw_eotf(nonlin, transfer);
+    vec3 abs_lin;
+    if (transfer == KOPAW_TF_PQ) {
+        abs_lin = lin;                   // EOTF 输出已是 cd/m²
+    } else if (transfer == KOPAW_TF_HLG) {
+        abs_lin = lin * 1000.0;          // 相对亮度，名义峰 1000 cd/m²
+    } else {
+        abs_lin = lin * sdr_ref;         // SDR 相对亮度 → 绝对值
+    }
+    return kopaw_pq_oetf(kopaw_primaries_to_2020(primaries) * abs_lin);
 }

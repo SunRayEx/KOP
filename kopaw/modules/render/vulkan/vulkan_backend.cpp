@@ -100,6 +100,21 @@ bool VulkanBackend::create_instance(std::string* error) {
     }
     std::vector<const char*> exts(glfw_exts, glfw_exts + n_ext);
 
+    // HDR10 输出需要 VK_EXT_swapchain_colorspace 枚举带色彩空间的表面格式；
+    // 驱动不支持时跳过，显示能力协商自动回退 SDR。
+    uint32_t n_inst_ext = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n_inst_ext, nullptr);
+    std::vector<VkExtensionProperties> inst_exts(n_inst_ext);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n_inst_ext, inst_exts.data());
+    for (auto& e : inst_exts) {
+        if (strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) ==
+            0) {
+            exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+            ext_swapchain_colorspace_ = true;
+            break;
+        }
+    }
+
     std::vector<const char*> layers;
     const char* want_validation = getenv("KOPAW_VK_VALIDATION");
     if (want_validation && want_validation[0] == '1') {
@@ -125,6 +140,13 @@ bool VulkanBackend::create_instance(std::string* error) {
     ci.ppEnabledLayerNames = layers.data();
     return vkfail(vkCreateInstance(&ci, nullptr, &inst_), "vkCreateInstance",
                   error);
+}
+
+void VulkanBackend::set_hdr_mode(HdrMode mode) {
+    if (hdr_mode_ != mode) {
+        KOP_LOG_INFO(kTag, "HDR 输出模式 = %d", static_cast<int>(mode));
+    }
+    hdr_mode_ = mode;
 }
 
 bool VulkanBackend::create_surface(GLFWwindow* window, std::string* error) {
@@ -334,18 +356,39 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
                "获取表面能力", error))
         return true;
 
-    uint32_t n_fmt = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surf_, &n_fmt, nullptr);
-    std::vector<VkSurfaceFormatKHR> fmts(n_fmt);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surf_, &n_fmt, fmts.data());
-    sc_fmt_ = fmts[0].format;
-    for (auto& f : fmts) {
-        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM ||
-             f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
-            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            sc_fmt_ = f.format;
-            break;
-        }
+    // 枚举表面格式：有 VK_EXT_swapchain_colorspace 时用 2KHR 版本拿色彩空间，
+    // 否则退回 1.0 版本（无 HDR10 对，协商自然回退 SDR）。
+    std::vector<VkSurfaceFormatKHR> fmts;
+    if (ext_swapchain_colorspace_) {
+        VkPhysicalDeviceSurfaceInfo2KHR si{};
+        si.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+        si.surface = surf_;
+        uint32_t n_fmt2 = 0;
+        vkGetPhysicalDeviceSurfaceFormats2KHR(pd_, &si, &n_fmt2, nullptr);
+        std::vector<VkSurfaceFormat2KHR> fmts2(n_fmt2);
+        for (auto& f : fmts2)
+            f.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+        vkGetPhysicalDeviceSurfaceFormats2KHR(pd_, &si, &n_fmt2, fmts2.data());
+        fmts.reserve(n_fmt2);
+        for (auto& f : fmts2) fmts.push_back(f.surfaceFormat);
+    } else {
+        uint32_t n_fmt = 0;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surf_, &n_fmt, nullptr);
+        fmts.resize(n_fmt);
+        vkGetPhysicalDeviceSurfaceFormatsKHR(pd_, surf_, &n_fmt, fmts.data());
+    }
+
+    surface_hdr_capable_ = surface_supports_hdr10(fmts.data(),
+                                                  (uint32_t)fmts.size());
+    const kopaw::SurfaceOutput so = select_surface_output(
+        fmts.data(), (uint32_t)fmts.size(), hdr_mode_, content_hdr_);
+    sc_fmt_ = so.format;
+    sc_color_space_ = so.color_space;
+    hdr_output_ = so.hdr10;
+    if (hdr_output_) {
+        KOP_LOG_INFO(kTag, "交换链选择 HDR10 输出：A2B10G10R10 + ST.2084");
+    } else if (hdr_mode_ == HdrMode::On && !surface_hdr_capable_) {
+        KOP_LOG_INFO(kTag, "表面不具备 HDR10 能力，交换链回退 SDR 输出");
     }
 
     uint32_t n_pm = 0;
@@ -375,7 +418,7 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
     ci.surface = surf_;
     ci.minImageCount = img_count;
     ci.imageFormat = sc_fmt_;
-    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    ci.imageColorSpace = sc_color_space_;
     ci.imageExtent = ext_;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -391,9 +434,25 @@ bool VulkanBackend::create_swapchain_objects(std::string* error) {
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = pm;
     ci.clipped = VK_TRUE;
-    if (vkfail(vkCreateSwapchainKHR(dev_, &ci, nullptr, &sc_),
-               "vkCreateSwapchainKHR", error))
-        return true;
+    const VkResult sc_rc = vkCreateSwapchainKHR(dev_, &ci, nullptr, &sc_);
+    if (sc_rc != VK_SUCCESS) {
+        // HDR10 交换链在某些合成器上可能创建失败（能力枚举与实际创建不完全
+        // 等价）：失败时退回 SDR 重试一次，不让播放中断。
+        if (hdr_output_) {
+            KOP_LOG_INFO(kTag, "HDR10 交换链创建失败，回退 SDR 重试");
+            hdr_output_ = false;
+            ci.imageFormat = sc_fmt_ = VK_FORMAT_B8G8R8A8_UNORM;
+            ci.imageColorSpace = sc_color_space_ =
+                VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+            if (vkCreateSwapchainKHR(dev_, &ci, nullptr, &sc_) != VK_SUCCESS) {
+                *error = "vkCreateSwapchainKHR（SDR 回退也失败）";
+                return true;
+            }
+        } else {
+            *error = "vkCreateSwapchainKHR 失败";
+            return true;
+        }
+    }
 
     uint32_t n_img = 0;
     vkGetSwapchainImagesKHR(dev_, sc_, &n_img, nullptr);
@@ -1050,6 +1109,35 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
     const uint32_t h = frame->format.video.height;
     if (w == 0 || h == 0) return true;
 
+    // 帧色彩元数据（transfer/primaries/峰值）：ABI 结构不够长时按未知处理。
+    const size_t color_end = offsetof(KopawFrame, color) + sizeof(frame->color);
+    const bool has_color_meta = frame->struct_size >= color_end;
+    const int32_t transfer =
+        has_color_meta ? static_cast<int32_t>(frame->color.transfer)
+                        : KOPAW_COLOR_TRANSFER_UNKNOWN;
+    const int32_t primaries =
+        has_color_meta ? static_cast<int32_t>(frame->color.primaries)
+                        : KOPAW_COLOR_PRIMARIES_UNKNOWN;
+
+    // 首帧后按内容传递函数协商交换链模式（Auto 且内容为 PQ/HLG 且表面支持
+    // HDR10 时升级为 HDR10 输出；On 已在初始化时决定）。流内 transfer 恒定，
+    // 只升级不降级。
+    if (!hdr_mode_known_) {
+        hdr_mode_known_ = true;
+        content_hdr_ = content_is_hdr(transfer);
+        if (hdr_mode_ == HdrMode::Auto && content_hdr_ && surface_hdr_capable_ &&
+            !hdr_output_) {
+            KOP_LOG_INFO(kTag,
+                         "内容为 HDR 传递函数且表面支持 HDR10，"
+                         "重建交换链为 HDR10 输出");
+            if (recreate_swapchain(&err)) {
+                KOP_LOG_ERROR(kTag, "%s", err.c_str());
+                device_lost_ = true;
+                return false;
+            }
+        }
+    }
+
     // 窗口缩放：帧缓冲尺寸与交换链不一致时重建（含最小化恢复）
     {
         int fb_w = 0, fb_h = 0;
@@ -1073,7 +1161,7 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
             KOP_LOG_ERROR(kTag, "设备未启用 YCbCr DMA-BUF 导入");
             return false;
         }
-        if (!hdr_sdr_warning_logged_ &&
+        if (!hdr_sdr_warning_logged_ && !hdr_output_ &&
             (frame->color.transfer == KOPAW_COLOR_TRANSFER_PQ ||
              frame->color.transfer == KOPAW_COLOR_TRANSFER_HLG)) {
             hdr_sdr_warning_logged_ = true;
@@ -1251,19 +1339,19 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, play_, 0,
                                 1, &dsets_[cur_tex_], 0, nullptr);
     }
-    // 两条管线共用 quad.frag：按帧声明的 transfer 走 EOTF→色调映射→sRGB OETF；
-    // transfer 未知时着色器直通，保留旧路径。
-    const size_t color_end = offsetof(KopawFrame, color) + sizeof(frame->color);
+    // 两条管线共用 quad.frag：按帧声明的 transfer 走 EOTF→色调映射→sRGB OETF
+    // （SDR 输出），或统一到绝对亮度后 PQ 编码（HDR10 输出）；
+    // transfer 未知时 SDR 直通，保留旧路径。
     const kop::ColorPushConstants color_pc{
         0,
         0,
         0,
-        frame->struct_size >= color_end
-            ? static_cast<int32_t>(frame->color.transfer)
-            : KOPAW_COLOR_TRANSFER_UNKNOWN,
-        frame->struct_size >= color_end
-            ? kop::declared_peak_luminance(frame->color)
-            : 1000.0f};
+        transfer,
+        has_color_meta ? kop::declared_peak_luminance(frame->color) : 1000.0f,
+        hdr_output_ ? kop::kColorOutHdr10 : kop::kColorOutSdr,
+        primaries,
+        kopaw::sdr_reference_white_cd(),
+    };
     vkCmdPushConstants(cmd, native_yuv ? yuv->layout : play_,
                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(color_pc),
                        &color_pc);

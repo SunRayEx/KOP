@@ -5,12 +5,10 @@
 #include <utility>
 #include <vector>
 
-// FFmpeg 8 起公共头不再自带 extern "C" 保护，C++ 使用方必须自行包裹。
-// （注意：kopaw_abi.h 自带保护，绝不能再包一层。）
-extern "C" {
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-}
+// FFmpeg 统一入口：extern "C" 包裹与版本兼容只在 ffmpeg.hpp/ffmpeg_compat.hpp
+// 里各做一次（见模块顶部说明）。
+#include "ffmpeg.hpp"
+#include "ffmpeg_raii.hpp"  // AvFormatContext / AvPacket
 
 #include "kopaw_abi.h"
 #include "io_control.hpp"
@@ -66,7 +64,9 @@ private:
     static bool has_option(const std::vector<std::pair<std::string, std::string>>& opts,
                            const char* key);
 
-    AVFormatContext* fmt_ = nullptr;
+    // 使用 RAII（AvFormatContext = 析构 avformat_close_input）；
+    // open() 里经 avformat_open_input 的 ** 参数进出一次。
+    AvFormatContext fmt_;
     int video_stream_ = -1;
     int audio_stream_ = -1;
     KopawGraph* g_ = nullptr;

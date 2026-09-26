@@ -19,10 +19,7 @@ static const AVRational kUsTb = {1, 1000000};
 
 DemuxerNode::~DemuxerNode() {
     io_.end();
-    if (fmt_) {
-        avformat_close_input(&fmt_);
-        fmt_ = nullptr;
-    }
+    fmt_.reset();  // avformat_close_input
 }
 
 bool DemuxerNode::open(const std::string& path,
@@ -36,10 +33,7 @@ bool DemuxerNode::open(const std::string& path,
     stopped_.store(false, std::memory_order_release);
     video_stream_ = -1;
     audio_stream_ = -1;
-    if (fmt_) {
-        avformat_close_input(&fmt_);
-        fmt_ = nullptr;
-    }
+    fmt_.reset();  // 重新打开前先归还旧上下文
 
     // 网络协议初始化（幂等；http/rtsp 等输入必需）
     static const bool net = [] {
@@ -49,6 +43,8 @@ bool DemuxerNode::open(const std::string& path,
     (void)net;
 
     const bool network = is_network_url(path);
+    // 选项字典：avformat_open_input 成功时会接管并释放它，因此只在“到达
+    // open 之前”的早返回路径手工释放（仅此一处）。
     AVDictionary* dict = nullptr;
     for (const auto& kv : opts) av_dict_set(&dict, kv.first.c_str(), kv.second.c_str(), 0);
     // rw_timeout 使用微秒；保留用户显式的协议选项优先级。
@@ -59,7 +55,7 @@ bool DemuxerNode::open(const std::string& path,
         av_dict_set_int(&dict, "max_delay", static_cast<int64_t>(buffer_ms_) * 1000, 0);
     }
 
-    fmt_ = avformat_alloc_context();
+    fmt_.reset(avformat_alloc_context());
     if (!fmt_) {
         av_dict_free(&dict);
         if (error) *error = "分配输入上下文失败";
@@ -68,9 +64,12 @@ bool DemuxerNode::open(const std::string& path,
     fmt_->interrupt_callback.callback = &ffmpeg_interrupt_callback;
     fmt_->interrupt_callback.opaque = &io_;
     io_.begin(network ? timeout_ms_ : 0);
-    int rc = avformat_open_input(&fmt_, path.c_str(), nullptr, &dict);
+    // avformat_open_input 接管传入的上下文（失败时释放并置空），因此先把
+    // RAII 持有的裸指针交出，调用后再放回；dict 同时被该调用释放。
+    AVFormatContext* raw = fmt_.release();
+    int rc = avformat_open_input(&raw, path.c_str(), nullptr, &dict);
     io_.end();
-    av_dict_free(&dict);
+    fmt_.reset(raw);  // 失败时 raw 已被置空
     if (rc < 0) {
         char buf[256];
         av_strerror(rc, buf, sizeof(buf));
@@ -78,11 +77,11 @@ bool DemuxerNode::open(const std::string& path,
             *error = io_.was_timed_out() ? "打开网络输入超时: " : "打开输入失败: ";
             *error += buf;
         }
-        if (fmt_) avformat_close_input(&fmt_);
+        fmt_.reset();  // 失败时 open 已释放并置空，此处幂等
         return false;
     }
     io_.begin(network ? timeout_ms_ : 0);
-    rc = avformat_find_stream_info(fmt_, nullptr);
+    rc = avformat_find_stream_info(fmt_.get(), nullptr);
     io_.end();
     if (rc < 0) {
         char buf[256];
@@ -91,14 +90,14 @@ bool DemuxerNode::open(const std::string& path,
             *error = io_.was_timed_out() ? "探测网络流超时: " : "探测流信息失败: ";
             *error += buf;
         }
-        avformat_close_input(&fmt_);
+        fmt_.reset();
         return false;
     }
-    video_stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    audio_stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    video_stream_ = av_find_best_stream(fmt_.get(), AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    audio_stream_ = av_find_best_stream(fmt_.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (video_stream_ < 0 && audio_stream_ < 0) {
         if (error) *error = "输入中没有可播放的音视频流";
-        avformat_close_input(&fmt_);
+        fmt_.reset();
         return false;
     }
     KOP_LOG_INFO(kTag, "已打开 %s（视频流:%d 音频流:%d）", path.c_str(), video_stream_,
@@ -160,7 +159,7 @@ void DemuxerNode::emit_eos(KopawOutput out, int32_t media_type) {
 }
 
 int32_t DemuxerNode::run_impl() {
-    AVPacket* pkt = av_packet_alloc();
+    AvPacket pkt;
     if (!pkt) return KOPAW_E_GENERIC;
 
     const bool network = fmt_ && fmt_->iformat && fmt_->url && is_network_url(fmt_->url);
@@ -175,7 +174,7 @@ int32_t DemuxerNode::run_impl() {
                                      : eagain_since + timeout_us)
                 : 0;
         io_.begin_until(read_deadline);
-        int rc = av_read_frame(fmt_, pkt);
+        int rc = av_read_frame(fmt_.get(), pkt.get());
         io_.end();
         if (rc < 0) {
             if (stopped_.load(std::memory_order_acquire)) {
@@ -187,7 +186,8 @@ int32_t DemuxerNode::run_impl() {
             }
             if (rc == AVERROR(EAGAIN)) {
                 if (!network) {
-                    KOP_LOG_ERROR(kTag, "本地输入返回暂时无数据: %s", av_err2str(rc));
+                    KOP_LOG_ERROR(kTag, "本地输入返回暂时无数据: %s",
+                                 kopaw::av_error_string(rc));
                     failure = KOPAW_E_GENERIC;
                     break;
                 }
@@ -215,15 +215,14 @@ int32_t DemuxerNode::run_impl() {
         }
         eagain_since = 0;
         if (pkt->stream_index == video_stream_ && video_stream_ >= 0) {
-            emit_packet(pkt, fmt_->streams[video_stream_]->time_base, video_out_,
+            emit_packet(pkt.get(), fmt_->streams[video_stream_]->time_base, video_out_,
                         KOPAW_MEDIA_VIDEO);
         } else if (pkt->stream_index == audio_stream_ && audio_stream_ >= 0) {
-            emit_packet(pkt, fmt_->streams[audio_stream_]->time_base, audio_out_,
+            emit_packet(pkt.get(), fmt_->streams[audio_stream_]->time_base, audio_out_,
                         KOPAW_MEDIA_AUDIO);
         }
-        av_packet_unref(pkt);
+        pkt.unref();
     }
-    av_packet_free(&pkt);
     if (clean_eof) {
         if (video_stream_ >= 0) emit_eos(video_out_, KOPAW_MEDIA_VIDEO);
         if (audio_stream_ >= 0) emit_eos(audio_out_, KOPAW_MEDIA_AUDIO);

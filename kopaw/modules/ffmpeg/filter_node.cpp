@@ -95,19 +95,19 @@ bool validate_filter_chain(const std::string& description, const char* kind,
         return false;
     }
 
-    AVFilterGraph* probe = avfilter_graph_alloc();
+    AvFilterGraph probe(avfilter_graph_alloc());
     if (!probe) {
         set_error(error, "avfilter_graph_alloc 失败");
         return false;
     }
     AVFilterInOut* inputs = nullptr;
     AVFilterInOut* outputs = nullptr;
-    const int rc = avfilter_graph_parse2(probe, description.c_str(), &inputs, &outputs);
+    const int rc =
+        avfilter_graph_parse2(probe.get(), description.c_str(), &inputs, &outputs);
     const size_t input_count = count_inout(inputs);
     const size_t output_count = count_inout(outputs);
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
-    avfilter_graph_free(&probe);
 
     if (rc < 0) {
         if (error) {
@@ -168,30 +168,18 @@ const KopawNodeVTable kAudioVTable = make_audio_vtable();
 
 }  // namespace
 
-VideoFilterNode::~VideoFilterNode() {
-    if (in_frm_) av_frame_free(&in_frm_);
-    if (out_frm_) av_frame_free(&out_frm_);
-    if (fg_) avfilter_graph_free(&fg_);
-}
-
 bool VideoFilterNode::open(const std::string& graph_desc, std::string* error) {
-    if (fg_ || in_frm_ || out_frm_) {
+    if (opened_) {
         set_error(error, "视频滤镜节点已打开");
         return false;
     }
     if (!validate_filter_chain(graph_desc, "视频", error)) return false;
-
-    AVFrame* input = av_frame_alloc();
-    AVFrame* output = av_frame_alloc();
-    if (!input || !output) {
-        if (input) av_frame_free(&input);
-        if (output) av_frame_free(&output);
+    if (!in_frm_ || !out_frm_) {
         set_error(error, "AVFrame 分配失败");
         return false;
     }
     graph_desc_ = graph_desc;
-    in_frm_ = input;
-    out_frm_ = output;
+    opened_ = true;
     configured_ = false;
     flushed_ = false;
     return true;
@@ -215,7 +203,7 @@ KopawNodeDesc VideoFilterNode::desc(KopawGraph* graph) {
 int32_t VideoFilterNode::configure(const KopawFrame* frame) {
     if (!valid_video_frame(frame)) return KOPAW_E_INVALID;
 
-    AVFilterGraph* graph = avfilter_graph_alloc();
+    AvFilterGraph graph(avfilter_graph_alloc());
     if (!graph) return KOPAW_E_GENERIC;
 
     char args[256] = {};
@@ -224,27 +212,24 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
         "video_size=%ux%u:pix_fmt=rgba:time_base=1/1000000:pixel_aspect=1/1",
         frame->format.video.width, frame->format.video.height);
     if (arg_len < 0 || static_cast<size_t>(arg_len) >= sizeof(args)) {
-        avfilter_graph_free(&graph);
         return KOPAW_E_INVALID;
     }
 
     const AVFilter* source_filter = avfilter_get_by_name("buffer");
     const AVFilter* sink_filter = avfilter_get_by_name("buffersink");
     AVFilterContext* source = source_filter
-                                  ? avfilter_graph_alloc_filter(graph, source_filter, "in")
+                                  ? avfilter_graph_alloc_filter(graph.get(), source_filter, "in")
                                   : nullptr;
     AVFilterContext* sink = sink_filter
-                                ? avfilter_graph_alloc_filter(graph, sink_filter, "out")
+                                ? avfilter_graph_alloc_filter(graph.get(), sink_filter, "out")
                                 : nullptr;
     if (!source || !sink) {
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
     int rc = avfilter_init_str(source, args);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "buffersrc 初始化失败: %s (%s)", args,
                       ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
@@ -252,13 +237,11 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
     rc = av_opt_set(sink, "pixel_formats", "rgba", AV_OPT_SEARCH_CHILDREN);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "设置视频输出格式失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
     rc = avfilter_init_dict(sink, nullptr);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "buffersink 初始化失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
@@ -267,7 +250,6 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
     if (!outputs || !inputs) {
         avfilter_inout_free(&outputs);
         avfilter_inout_free(&inputs);
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
     outputs->name = av_strdup("in");
@@ -279,28 +261,25 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
     if (!outputs->name || !inputs->name) {
         avfilter_inout_free(&outputs);
         avfilter_inout_free(&inputs);
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
-    rc = avfilter_graph_parse_ptr(graph, graph_desc_.c_str(), &inputs, &outputs, nullptr);
+    rc = avfilter_graph_parse_ptr(graph.get(), graph_desc_.c_str(), &inputs, &outputs, nullptr);
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "视频滤镜图解析失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
-    rc = avfilter_graph_config(graph, nullptr);
+    rc = avfilter_graph_config(graph.get(), nullptr);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "视频滤镜图 config 失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
-    fg_ = graph;
     src_ = source;
     sink_ = sink;
+    fg_ = std::move(graph);  // 所有权移交成员，graph 变量之后不再可用
     configured_ = true;
     flushed_ = false;
     KOP_LOG_INFO(kTag, "视频滤镜图已生效: %s", graph_desc_.c_str());
@@ -311,12 +290,12 @@ int32_t VideoFilterNode::drain_sink(int64_t default_pts) {
     if (!sink_ || !out_frm_) return KOPAW_E_INVALID;
 
     while (true) {
-        av_frame_unref(out_frm_);
-        const int rc = av_buffersink_get_frame(sink_, out_frm_);
+        out_frm_.unref();
+        const int rc = av_buffersink_get_frame(sink_, out_frm_.get());
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return KOPAW_OK;
         if (rc < 0) {
             KOP_LOG_ERROR(kTag, "视频 buffersink 取帧失败: %s", ffmpeg_error(rc).c_str());
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
 
@@ -325,7 +304,7 @@ int32_t VideoFilterNode::drain_sink(int64_t default_pts) {
         if (out_frm_->format != AV_PIX_FMT_RGBA || width <= 0 || height <= 0 ||
             !out_frm_->data[0] || out_frm_->linesize[0] <= 0) {
             KOP_LOG_ERROR(kTag, "视频 buffersink 输出帧格式无效");
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
         const size_t row = static_cast<size_t>(width) * 4;
@@ -333,7 +312,7 @@ int32_t VideoFilterNode::drain_sink(int64_t default_pts) {
             row > std::numeric_limits<uint32_t>::max() ||
             row > std::numeric_limits<size_t>::max() / static_cast<size_t>(height)) {
             KOP_LOG_ERROR(kTag, "视频 buffersink 输出 stride 无效");
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
         const size_t bytes = row * static_cast<size_t>(height);
@@ -349,7 +328,7 @@ int32_t VideoFilterNode::drain_sink(int64_t default_pts) {
         output->frame.stride = static_cast<uint32_t>(row);
         output->frame.size = bytes;
         output->frame.color = color_;
-        av_frame_unref(out_frm_);
+        out_frm_.unref();
 
         const int32_t emit_rc = kopaw_graph_emit(g_, out_, output->ptr());
         if (emit_rc != KOPAW_OK) return emit_rc;
@@ -391,20 +370,20 @@ int32_t VideoFilterNode::send_impl(KopawFrame* frame) {
     }
     color_ = frame->color;
 
-    av_frame_unref(in_frm_);
+    in_frm_.unref();
     in_frm_->format = AV_PIX_FMT_RGBA;
     in_frm_->width = static_cast<int>(frame->format.video.width);
     in_frm_->height = static_cast<int>(frame->format.video.height);
     in_frm_->pts = frame->pts;
     const uint8_t* input = cpu_data(frame);
-    if (!input || av_frame_get_buffer(in_frm_, 0) < 0 || !in_frm_->data[0] ||
+    if (!input || av_frame_get_buffer(in_frm_.get(), 0) < 0 || !in_frm_->data[0] ||
         in_frm_->linesize[0] <= 0) {
-        av_frame_unref(in_frm_);
+        in_frm_.unref();
         return KOPAW_E_GENERIC;
     }
     const size_t row = static_cast<size_t>(frame->format.video.width) * 4;
     if (static_cast<size_t>(in_frm_->linesize[0]) < row) {
-        av_frame_unref(in_frm_);
+        in_frm_.unref();
         return KOPAW_E_GENERIC;
     }
     for (uint32_t y = 0; y < frame->format.video.height; ++y) {
@@ -412,16 +391,16 @@ int32_t VideoFilterNode::send_impl(KopawFrame* frame) {
                input + static_cast<size_t>(y) * frame->stride, row);
     }
 
-    const int rc = av_buffersrc_add_frame_flags(src_, in_frm_, AV_BUFFERSRC_FLAG_KEEP_REF);
+    const int rc = av_buffersrc_add_frame_flags(src_, in_frm_.get(), AV_BUFFERSRC_FLAG_KEEP_REF);
     if (rc < 0) {
-        av_frame_unref(in_frm_);
+        in_frm_.unref();
         KOP_LOG_WARN(kTag, "视频 buffersrc 推帧失败: %s", ffmpeg_error(rc).c_str());
         return rc == AVERROR_EOF ? KOPAW_E_EOS : KOPAW_E_GENERIC;
     }
     // buffersrc now owns its reference; release our temporary reference and
     // then hand the original KOPAW frame back exactly once.
     const int64_t default_pts = frame->pts;
-    av_frame_unref(in_frm_);
+    in_frm_.unref();
     frame->release(frame);
 
     const int32_t drain_rc = drain_sink(default_pts);
@@ -433,30 +412,18 @@ int32_t VideoFilterNode::send_impl(KopawFrame* frame) {
     return KOPAW_OK;
 }
 
-AudioFilterNode::~AudioFilterNode() {
-    if (in_frm_) av_frame_free(&in_frm_);
-    if (out_frm_) av_frame_free(&out_frm_);
-    if (fg_) avfilter_graph_free(&fg_);
-}
-
 bool AudioFilterNode::open(const std::string& graph_desc, std::string* error) {
-    if (fg_ || in_frm_ || out_frm_) {
+    if (opened_) {
         set_error(error, "音频滤镜节点已打开");
         return false;
     }
     if (!validate_filter_chain(graph_desc, "音频", error)) return false;
-
-    AVFrame* input = av_frame_alloc();
-    AVFrame* output = av_frame_alloc();
-    if (!input || !output) {
-        if (input) av_frame_free(&input);
-        if (output) av_frame_free(&output);
+    if (!in_frm_ || !out_frm_) {
         set_error(error, "AVFrame 分配失败");
         return false;
     }
     graph_desc_ = graph_desc;
-    in_frm_ = input;
-    out_frm_ = output;
+    opened_ = true;
     configured_ = false;
     flushed_ = false;
     return true;
@@ -480,15 +447,16 @@ KopawNodeDesc AudioFilterNode::desc(KopawGraph* graph) {
 int32_t AudioFilterNode::configure(const KopawFrame* frame) {
     if (!valid_audio_frame(frame)) return KOPAW_E_INVALID;
 
-    AVChannelLayout input_layout{};
-    av_channel_layout_default(&input_layout,
-                              static_cast<int>(frame->format.audio.channels));
+    compat::ChannelLayout input_layout{};
+    compat::channel_layout_default(&input_layout,
+                                   static_cast<int>(frame->format.audio.channels));
     char layout[256] = {};
-    const int layout_rc = av_channel_layout_describe(&input_layout, layout, sizeof(layout));
-    av_channel_layout_uninit(&input_layout);
-    if (layout_rc < 0) return KOPAW_E_GENERIC;
+    const bool layout_rc =
+        compat::channel_layout_describe(&input_layout, layout, sizeof(layout));
+    compat::channel_layout_uninit(&input_layout);
+    if (!layout_rc) return KOPAW_E_GENERIC;
 
-    AVFilterGraph* graph = avfilter_graph_alloc();
+    AvFilterGraph graph(avfilter_graph_alloc());
     if (!graph) return KOPAW_E_GENERIC;
     char args[512] = {};
     const int arg_len = snprintf(
@@ -496,33 +464,29 @@ int32_t AudioFilterNode::configure(const KopawFrame* frame) {
         "time_base=1/1000000:sample_rate=%u:sample_fmt=flt:channels=%u:channel_layout=%s",
         frame->format.audio.sample_rate, frame->format.audio.channels, layout);
     if (arg_len < 0 || static_cast<size_t>(arg_len) >= sizeof(args)) {
-        avfilter_graph_free(&graph);
         return KOPAW_E_INVALID;
     }
 
     const AVFilter* source_filter = avfilter_get_by_name("abuffer");
     const AVFilter* sink_filter = avfilter_get_by_name("abuffersink");
     AVFilterContext* source = source_filter
-                                  ? avfilter_graph_alloc_filter(graph, source_filter, "in")
+                                  ? avfilter_graph_alloc_filter(graph.get(), source_filter, "in")
                                   : nullptr;
     AVFilterContext* sink = sink_filter
-                                ? avfilter_graph_alloc_filter(graph, sink_filter, "out")
+                                ? avfilter_graph_alloc_filter(graph.get(), sink_filter, "out")
                                 : nullptr;
     if (!source || !sink) {
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
     int rc = avfilter_init_str(source, args);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "abuffersrc 初始化失败: %s (%s)", args,
                       ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
     rc = avfilter_init_dict(sink, nullptr);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "abuffersink 初始化失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
@@ -531,7 +495,6 @@ int32_t AudioFilterNode::configure(const KopawFrame* frame) {
     if (!outputs || !inputs) {
         avfilter_inout_free(&outputs);
         avfilter_inout_free(&inputs);
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
     outputs->name = av_strdup("in");
@@ -543,7 +506,6 @@ int32_t AudioFilterNode::configure(const KopawFrame* frame) {
     if (!outputs->name || !inputs->name) {
         avfilter_inout_free(&outputs);
         avfilter_inout_free(&inputs);
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
@@ -552,24 +514,22 @@ int32_t AudioFilterNode::configure(const KopawFrame* frame) {
     // KOPAW output contract.
     const std::string full_desc =
         graph_desc_ + ",aformat=sample_fmts=flt:sample_rates=48000:channel_layouts=stereo";
-    rc = avfilter_graph_parse_ptr(graph, full_desc.c_str(), &inputs, &outputs, nullptr);
+    rc = avfilter_graph_parse_ptr(graph.get(), full_desc.c_str(), &inputs, &outputs, nullptr);
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "音频滤镜图解析失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
-    rc = avfilter_graph_config(graph, nullptr);
+    rc = avfilter_graph_config(graph.get(), nullptr);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "音频滤镜图 config 失败: %s", ffmpeg_error(rc).c_str());
-        avfilter_graph_free(&graph);
         return KOPAW_E_GENERIC;
     }
 
-    fg_ = graph;
     src_ = source;
     sink_ = sink;
+    fg_ = std::move(graph);  // 所有权移交成员，graph 变量之后不再可用
     configured_ = true;
     flushed_ = false;
     KOP_LOG_INFO(kTag, "音频滤镜图已生效: %s", graph_desc_.c_str());
@@ -580,12 +540,12 @@ int32_t AudioFilterNode::drain_sink(int64_t default_pts) {
     if (!sink_ || !out_frm_) return KOPAW_E_INVALID;
 
     while (true) {
-        av_frame_unref(out_frm_);
-        const int rc = av_buffersink_get_frame(sink_, out_frm_);
+        out_frm_.unref();
+        const int rc = av_buffersink_get_frame(sink_, out_frm_.get());
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return KOPAW_OK;
         if (rc < 0) {
             KOP_LOG_ERROR(kTag, "音频 buffersink 取帧失败: %s", ffmpeg_error(rc).c_str());
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
 
@@ -594,7 +554,7 @@ int32_t AudioFilterNode::drain_sink(int64_t default_pts) {
         if (out_frm_->format != AV_SAMPLE_FMT_FLT || !out_frm_->data[0] ||
             channels <= 0 || sample_rate <= 0 || out_frm_->nb_samples <= 0) {
             KOP_LOG_ERROR(kTag, "音频 buffersink 输出帧格式无效");
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
         const size_t sample_count = static_cast<size_t>(out_frm_->nb_samples);
@@ -602,14 +562,14 @@ int32_t AudioFilterNode::drain_sink(int64_t default_pts) {
         if (channel_count > std::numeric_limits<size_t>::max() / sizeof(float) ||
             sample_count > std::numeric_limits<size_t>::max() /
                                 (channel_count * sizeof(float))) {
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
         const size_t bytes = sample_count * channel_count * sizeof(float);
         if (out_frm_->linesize[0] < 0 ||
             static_cast<size_t>(out_frm_->linesize[0]) < bytes) {
             KOP_LOG_ERROR(kTag, "音频 buffersink 输出 buffer 大小无效");
-            av_frame_unref(out_frm_);
+            out_frm_.unref();
             return KOPAW_E_GENERIC;
         }
 
@@ -620,7 +580,7 @@ int32_t AudioFilterNode::drain_sink(int64_t default_pts) {
         output->frame.format.audio.sample_rate = static_cast<uint32_t>(sample_rate);
         output->frame.format.audio.channels = static_cast<uint32_t>(channels);
         output->frame.size = bytes;
-        av_frame_unref(out_frm_);
+        out_frm_.unref();
 
         const int32_t emit_rc = kopaw_graph_emit(g_, out_, output->ptr());
         if (emit_rc != KOPAW_OK) return emit_rc;
@@ -661,7 +621,7 @@ int32_t AudioFilterNode::send_impl(KopawFrame* frame) {
         if (rc != KOPAW_OK) return rc;
     }
 
-    av_frame_unref(in_frm_);
+    in_frm_.unref();
     in_frm_->format = AV_SAMPLE_FMT_FLT;
     in_frm_->sample_rate = static_cast<int>(frame->format.audio.sample_rate);
     in_frm_->nb_samples = static_cast<int>(
@@ -671,26 +631,26 @@ int32_t AudioFilterNode::send_impl(KopawFrame* frame) {
                               static_cast<int>(frame->format.audio.channels));
     in_frm_->pts = frame->pts;
     const uint8_t* input = cpu_data(frame);
-    if (!input || av_frame_get_buffer(in_frm_, 0) < 0 || !in_frm_->data[0] ||
+    if (!input || av_frame_get_buffer(in_frm_.get(), 0) < 0 || !in_frm_->data[0] ||
         in_frm_->linesize[0] <= 0) {
-        av_frame_unref(in_frm_);
+        in_frm_.unref();
         return KOPAW_E_GENERIC;
     }
     const size_t input_bytes = static_cast<size_t>(frame->size);
     if (static_cast<size_t>(in_frm_->linesize[0]) < input_bytes) {
-        av_frame_unref(in_frm_);
+        in_frm_.unref();
         return KOPAW_E_GENERIC;
     }
     memcpy(in_frm_->data[0], input, input_bytes);
 
-    const int rc = av_buffersrc_add_frame_flags(src_, in_frm_, AV_BUFFERSRC_FLAG_KEEP_REF);
+    const int rc = av_buffersrc_add_frame_flags(src_, in_frm_.get(), AV_BUFFERSRC_FLAG_KEEP_REF);
     if (rc < 0) {
-        av_frame_unref(in_frm_);
+        in_frm_.unref();
         KOP_LOG_WARN(kTag, "音频 buffersrc 推帧失败: %s", ffmpeg_error(rc).c_str());
         return rc == AVERROR_EOF ? KOPAW_E_EOS : KOPAW_E_GENERIC;
     }
     const int64_t default_pts = frame->pts;
-    av_frame_unref(in_frm_);
+    in_frm_.unref();
     frame->release(frame);
 
     const int32_t drain_rc = drain_sink(default_pts);

@@ -2,12 +2,9 @@
 #pragma once
 #include <string>
 
-// FFmpeg 8 起公共头不再自带 extern "C" 保护，C++ 使用方必须自行包裹。
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/avutil.h>
-#include <libswresample/swresample.h>
-}
+#include "ffmpeg.hpp"          // 统一 libav* 入口（extern "C" 只在那里包裹一次）
+#include "ffmpeg_compat.hpp"   // 声道布局跨版本抽象
+#include "ffmpeg_raii.hpp"     // AVCodecContext/AVPacket/AVFrame/Swr 生命周期
 
 #include "kopaw_abi.h"
 
@@ -16,7 +13,8 @@ namespace kopaw {
 class AudioDecoderNode {
 public:
     AudioDecoderNode() = default;
-    ~AudioDecoderNode();
+    // 全部 FFmpeg 资源由 RAII 句柄持有，默认析构即可正确释放。
+    ~AudioDecoderNode() = default;
 
     // out_rate/out_ch 固定 MVP 输出规格：f32 交错
     bool open(AVCodecParameters* params, std::string* error);
@@ -32,14 +30,14 @@ private:
     int32_t emit_resampled(AVFrame* frame);
     void flush_and_finish();
 
-    AVCodecContext* ctx_ = nullptr;
-    SwrContext* swr_ = nullptr;
+    AvCodecContext ctx_;
+    AvSwr swr_;
     int out_rate_ = 48000;
-    AVChannelLayout out_layout_{};
+    compat::ChannelLayout out_layout_{};
     int out_channels_ = 2;
 
-    AVPacket* pkt_ = nullptr;
-    AVFrame* frm_ = nullptr;
+    AvPacket pkt_;
+    AvFrame frm_;
 
     KopawGraph* g_ = nullptr;
     KopawOutput out_{};

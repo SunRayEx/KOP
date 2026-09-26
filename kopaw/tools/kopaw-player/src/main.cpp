@@ -34,6 +34,7 @@
 #include "kop/log.h"
 #include "kop/time.h"
 #include "kopaw_abi.h"
+#include "render/hdr_mode.hpp"
 #include "render/render_backend.hpp"
 #include "plugin_loader.hpp"
 #include "render/render_node.hpp"
@@ -72,6 +73,7 @@ void usage() {
             "  --plugin PATH   加载 .so 插件\n"
             "  --use NODE      将插件节点插入视频链\n"
             "  --zero-copy M   硬解表面原生 DMA-BUF 直通渲染（on|off|auto，默认 auto）\n"
+            "  --hdr auto|on|off   交换链 HDR10 输出（默认 auto：内容为 PQ/HLG 且表面支持时启用）\n"
             "  --kopms-bus NAME     视频零拷贝提交到 KOPMS-S 合成器（P3-M3）\n"
             "  --kopms-window ID    目标 CONTROL 窗口（默认 1，自动创建并 attach）\n");
 }
@@ -104,7 +106,8 @@ int main(int argc, char** argv) {
     std::string use_node;
     std::string video_filter_desc;
     std::string audio_filter_desc;
-    std::string zero_copy_mode = "auto";  // on|off|auto
+    std::string zero_copy_mode = "auto";
+    std::string hdr_mode_str = "auto";  // on|off|auto
     std::vector<std::pair<std::string, std::string>> input_opts;
 #if KOPAW_HAVE_KOPMS_SINK
     std::string kopms_bus;
@@ -124,6 +127,7 @@ int main(int argc, char** argv) {
         else if (a == "--timeout-ms") timeout_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--buffer-ms") buffer_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--zero-copy") zero_copy_mode = next();
+        else if (a == "--hdr") hdr_mode_str = next();
         else if (a == "--plugin") plugin_paths.push_back(next());
         else if (a == "--use") use_node = next();
         else if (a == "--filter") {
@@ -262,6 +266,8 @@ int main(int argc, char** argv) {
                     exit_code = 2;
                     break;
                 }
+                backend->set_hdr_mode(kopaw::parse_hdr_mode(hdr_mode_str, &err));
+                if (!err.empty()) KOP_LOG_WARN(kTag, "%s", err.c_str());
             }
         }
         if (use_audio) {

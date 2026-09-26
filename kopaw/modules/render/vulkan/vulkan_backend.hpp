@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../render_backend.hpp"
+#include "vk_hdr.hpp"
 #include "vk_ycbcr.hpp"
 
 #define GLFW_INCLUDE_VULKAN
@@ -31,6 +32,7 @@ public:
         return dmabuf_format_mask() != kNativeDmabufFormatNone;
     }
     uint32_t dmabuf_format_mask() const override;
+    void set_hdr_mode(HdrMode mode) override;
 
 private:
     static constexpr int kMaxFrames = 2;
@@ -99,11 +101,18 @@ private:
     bool ext_drm_modifier_ = false;
     bool ext_dmabuf_ = false;
     bool ext_foreign_queue_ = false;
+    bool ext_swapchain_colorspace_ = false;  // 枚举带色彩空间的表面格式（HDR10 协商）
     bool ycbcr_enabled_ = false;
     PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties_ = nullptr;
 
     VkSwapchainKHR sc_ = VK_NULL_HANDLE;
     VkFormat sc_fmt_ = VK_FORMAT_B8G8R8A8_UNORM;
+    VkColorSpaceKHR sc_color_space_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    bool hdr_output_ = false;          // 当前交换链是否为 HDR10（PQ/Rec.2020）
+    bool surface_hdr_capable_ = false; // 表面是否存在 HDR10 对
+    bool hdr_mode_known_ = false;      // 首帧后已按内容协商过交换链模式
+    bool content_hdr_ = false;         // 首帧内容是否为 PQ/HLG
+    HdrMode hdr_mode_ = HdrMode::Auto;
     VkExtent2D ext_{};
     std::vector<VkImage> sc_imgs_;
     std::vector<VkImageView> sc_views_;

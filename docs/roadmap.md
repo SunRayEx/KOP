@@ -124,5 +124,10 @@
 - [x] 色彩管线：range/matrix/transfer/primaries/HDR 元数据已纳入帧与 BUS 契约，
   渲染侧按声明的传递函数走 EOTF → HDR 色调映射 → sRGB OETF；PQ/HLG 以内容
   声明峰值（MaxCLL/mastering）为锚映射到 SDR 目标（kopms-vk-nv12-scene 四探针
-  覆盖 BT.709 与 PQ 两条路径）。剩余：HDR swapchain / 显示能力协商
+  覆盖 BT.709 与 PQ 两条路径）
+- [x] HDR10 交换链与显示能力协商（kopaw-vk-hdr-test 38 项断言 + 播放器 Wayland/MX450
+  实测）：表面有 A2B10G10R10+ST.2084 对时，`--hdr auto`（默认）在内容为 PQ/HLG 时
+  首帧后升级交换链，`--hdr on` 强制 HDR10，表面不支持或 `--hdr off` 回退 SDR；
+  HDR10 输出统一到绝对亮度 cd/m² 后过原色矩阵（BT.709/Display-P3→Rec.2020，
+  从色度坐标推导验证）再 ST.2084 PQ 编码，应用侧不做色调映射
 - [ ] KOPMS DRM 直出的合成结果 page-flip 真机验证（vkms / logind 环境）

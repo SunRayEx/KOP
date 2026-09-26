@@ -48,9 +48,49 @@
 ```bash
 scripts/check-deps.sh                  # 依赖体检
 cmake --preset relwithdebinfo && cmake --build --preset relwithdebinfo
+ctest --test-dir build/relwithdebinfo  # 全量回归（27 项）
 cargo test                             # kopaw-core 单元测试（在 kopaw/core 下）
 ./build/relwithdebinfo/kopaw/kopaw-player test_media.mkv
 ```
+
+### FFmpeg 封装层（`kopaw/modules/ffmpeg/`）
+
+KOPAW 的所有 libav* 调用都经由四个头文件收口，保证“一套包含入口 + 一套错误映射
++ 一套 RAII + 一套版本垫片”：
+
+| 文件 | 职责 |
+|---|---|
+| `ffmpeg.hpp` | 唯一的 umbrella 包含文件：所有 libav* 头在**一个** `extern "C"` 块里（FFmpeg 8 头不再自带保护），并声明 `__STDC_CONSTANT_MACROS` 等宏 |
+| `ffmpeg_error.hpp` | `av_error_string()` / `av_status()` / `av_is_retry()`：把 FFmpeg 返回码统一映射到 `KOPAW_E_*`（EAGAIN/EOF 一眼可辨） |
+| `ffmpeg_raii.hpp` | `AvPtr<T, Deleter>` + `AvFrame`/`AvPacket`/`AvCodecContext`/`AvFormatContext`/`AvFilterGraph`/`AvBufferRef`/`AvSws`/`AvSwr`/`AvAudioFifo`/`AvDictionary`：替换全部手工 free/unref |
+| `ffmpeg_compat.hpp` | 版本垫片：声道布局 API（libavutil ≥57.28 新旧写法）与编解码器能力查询（FFmpeg 8 `avcodec_get_supported_config` vs 已弃用的 `AVCodec::pix_fmts` 等） |
+
+模块内**不再直接 `#include <libav*/...>`**，也不再手写 `extern "C"`；新增出口的
+“漏释放”被 RAII 从结构上消除。`AvFormatContext` 等所有权经 `avformat_open_input`
+这类“接管又可能归还”的 API 时，用 `release()` / `reset()` 显式交出/取回裸指针。
+
+### 模糊测试（`fuzz/`，`KOP_BUILD_FUZZERS=ON`）
+
+纯解析器是“把不可信字节变成内存访问”的地方，也是唯一值得长年模糊的层。当前三个靶：
+
+| 靶 | 被测代码 |
+|---|---|
+| `kopnet-rtp-fuzz` | RTP/RTCP/STUN 头部解析（`parse_rtp`/`parse_rtcp`/`parse_stun`/`classify_media_packet`） |
+| `kopnet-tunnel-fuzz` | 隧道线协议（`decode_tunnel_header`/`decode_control`） |
+| `kopnet-frame-envelope-fuzz` | 帧信封反序列化（`deserialize_frame`：平面计数/stride/载荷偏移全部来自 wire） |
+
+harness 只实现 `LLVMFuzzerTestOneInput`，运行引擎由构建系统自动选择：
+clang 可用时是**真 libFuzzer**（`-fsanitize=fuzzer,address,undefined`），否则回退到
+**standalone 驱动**（`fuzz_driver.cpp`：xorshift 变异 + ASan 死亡回调落盘 `crash-*.bin`）。
+
+```bash
+scripts/run-fuzzers.sh                       # 本地复现 CI 冲烟（默认 20 万次/靶）
+scripts/run-fuzzers.sh 2000000               # 加深预算
+KOP_FUZZ_ENGINE=standalone scripts/run-fuzzers.sh   # 无 libFuzzer 时
+```
+
+种子语料由各 harness 的 `kop_fuzz_make_seeds()` 提供“结构上有效”的报文——
+纯随机字节只会反复命中“过短/魔数错误”的早返回，进不了解析器内部路径。
 
 ## 关键约定（跨模块红线）
 

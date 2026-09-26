@@ -3,6 +3,30 @@ cmake_minimum_required(VERSION 3.24)
 # CMake 4.x 兼容：允许较老第三方项目（portaudio/glslang）的最低版本声明
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
+# 模糊测试靶（默认关）：开启后额外构建解析器模糊靶并接入 ctest。
+# 需 address+undefined sanitizer 支持；libFuzzer 可用时自动切换到 libFuzzer。
+option(KOP_BUILD_FUZZERS "构建模糊测试靶并接入 ctest" OFF)
+
+# sanitizer 需要编译器身份配合，必须在 project() 之前选定：CMake 会在
+# project() 里锁定编译器，之后的 check_cxx_compiler_flag/try_compile 都
+# 只认已锁定那一个。libFuzzer 与 ASan 在 gcc 上的可用性取决于发行版
+# 是否随附 libasan/libubsan 运行时，clang 通常一套配齐。
+if(KOP_BUILD_FUZZERS AND NOT CMAKE_CXX_COMPILER)
+    find_program(KOP_FUZZ_CXX
+        NAMES clang++ clang++-22 clang++-20 clang++-18 clang++-15 clang++-14)
+    find_program(KOP_FUZZ_CC NAMES clang clang-22 clang-20 clang-18 clang-15 clang-14)
+    if(KOP_FUZZ_CXX)
+        set(CMAKE_CXX_COMPILER "${KOP_FUZZ_CXX}")
+        if(KOP_FUZZ_CC)
+            set(CMAKE_C_COMPILER "${KOP_FUZZ_CC}")
+        endif()
+        message(STATUS "KOP_BUILD_FUZZERS: 使用 ${KOP_FUZZ_CXX} 构建模糊靶")
+    else()
+        message(WARNING "KOP_BUILD_FUZZERS=ON 但未找到 clang++，"
+                       "将退回默认编译器；若缺少 sanitizer 运行时，fuzz/ 处会报错")
+    endif()
+endif()
+
 project(kop VERSION 0.1.0 LANGUAGES C CXX
     DESCRIPTION "KOPAW media pipeline + KOPMS Wayland compositor"
     HOMEPAGE_URL "https://example.invalid/kop")
@@ -90,6 +114,11 @@ add_subdirectory(kopaw)
 add_subdirectory(kopnet)
 
 add_subdirectory(kopms)
+
+# 模糊测试靶：仅 KOP_BUILD_FUZZERS=ON 时参与构建（默认 OFF）
+if(KOP_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()
 
 # KOP_AppSDK_Interface + 用户级测试应用（KOPAW_Test / KOPMS_Test）
 add_subdirectory(sdk)

@@ -11,10 +11,9 @@
 #pragma once
 #include <string>
 
+#include "ffmpeg.hpp"  // libav* 统一入口
 extern "C" {
-#include <libavutil/avutil.h>
-#include <libavutil/frame.h>
-#include <va/va.h>
+#include <va/va.h>     // libva 是独立 C 库，不属 FFmpeg 封装层
 }
 
 #include "../frame.hpp"

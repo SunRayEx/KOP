@@ -7,14 +7,10 @@
 #include <atomic>
 #include <string>
 
-// FFmpeg 8 起公共头不再自带 extern "C" 保护，C++ 使用方必须自行包裹。
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/avutil.h>
-#include <libavutil/hwcontext.h>
-#include <libswscale/swscale.h>
-}
+// FFmpeg 统一入口（libav* 只经此头引用，extern "C" 在那里包裹一次）。
+#include "ffmpeg.hpp"
 
+#include "../frame.hpp"  // OwnedFrame（try_export_native 的返回类型）
 #include "kopaw_abi.h"
 #include "hwaccel.hpp"
 #include "native_dmabuf.hpp"
@@ -64,12 +60,12 @@ private:
     OwnedFrame* try_export_native(AVFrame* raw);  // P2：原生导出（可空）
     void flush_and_finish();
 
-    AVCodecContext* ctx_ = nullptr;
-    SwsContext* sws_ = nullptr;
+    AvCodecContext ctx_;
+    AvSws sws_;
     int sws_src_w_ = 0, sws_src_h_ = 0;
     int sws_src_fmt_ = -1;
-    AVPacket* pkt_ = nullptr;
-    AVFrame* frm_ = nullptr;
+    AvPacket pkt_;
+    AvFrame frm_;
 
     // 硬解状态
     HwAccelConfig hw_;
