@@ -41,8 +41,8 @@ jobs:
             libswscale-dev libswresample-dev libavfilter-dev \
             libvulkan-dev libgl-dev glslang-tools \
             libwayland-dev libxkbcommon-dev \
-            libxrandr-dev libxinerama-dev \
-            libxi-dev libxcursor-dev \
+            libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libxext-dev \
             libasound2-dev \
             ${{ matrix.compiler == 'clang' && 'clang' || '' }}
 

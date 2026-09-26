@@ -26,12 +26,12 @@ for lib in vulkan wayland-client xkbcommon egl; do
         || echo "  - $lib 缺失（仅影响对应后端）"
 done
 
-# GLFW（KOPMS 的 nested M1 输出）在 X11 后端下强制要求这两个头文件，
-# 缺失时配置直接报 "RandR headers not found"。
+# GLFW（KOPMS 的 nested M1 输出）在 X11 后端下逐项检查这些扩展头文件，
+# 缺任一个都在配置期直接 FATAL_ERROR。
 echo "== GLFW 的 X11 依赖 =="
-for lib in xrandr xinerama; do
+for lib in xrandr xinerama xcursor xi xext; do
     v=$(pkg-config --modversion "$lib" 2>/dev/null) && ok "$lib" "$v" \
-        || bad "$lib" "GLFW 需要（Debian: libxrandr-dev libxinerama-dev）"
+        || bad "$lib" "GLFW 需要（对应 Debian: libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev）"
 done
 
 echo "== 音频 (pkg-config) =="
