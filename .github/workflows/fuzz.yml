@@ -29,12 +29,12 @@ jobs:
           sudo apt-get update
           # clang 提供 libFuzzer + 完整 sanitizer 运行时；GCC 的 libasan 在
           # 部分发行版是独立包，统一用 clang 避免“运行时缺失”的坑。
+          # KOPMS 的 GLFW 无条件参与配置，即便关掉两个渲染后端也需这些头。
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config clang \
             nasm yasm \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswscale-dev libswresample-dev libavfilter-dev \
-            # KOPMS 的 GLFW 无条件参与配置，即便关掉两个渲染后端也需这些头
             libxrandr-dev libxinerama-dev \
             libwayland-dev libxkbcommon-dev
 
