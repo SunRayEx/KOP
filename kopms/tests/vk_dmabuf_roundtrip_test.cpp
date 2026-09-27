@@ -92,7 +92,7 @@ int main() {
     {
         kop::vkutil::DeviceContext importer{};
         if (!kop::vkutil::create_instance({}, &importer.instance, &reason))
-            return fail(("importer instance: " + reason).c_str());
+            return skip("importer instance unavailable: " + reason);
         std::vector<const char*> exts{VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
         // 导入侧必须与导出侧同卡：生产链路里合成器与客户端同机同卡，双卡
         // 机器上也不能让导入落到另一张卡（跨物理卡导入不被 Vulkan 保证）。

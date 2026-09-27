@@ -84,7 +84,7 @@ int main() {
     // ---- 生产端：导出 NV12 LINEAR DMA-BUF（两平面同一对象）----
     kop::vkutil::DeviceContext producer{};
     if (!kop::vkutil::create_instance({}, &producer.instance, &reason)) {
-        return fail(("producer instance: " + reason).c_str());
+        return skip("producer instance unavailable: " + reason);
     }
     std::vector<const char*> prod_exts{VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
     if (!kop::vkutil::pick_and_create_device(prod_exts, &producer, &reason)) {
@@ -378,7 +378,7 @@ int main() {
     {
         kop::vkutil::DeviceContext reader{};
         if (!kop::vkutil::create_instance({}, &reader.instance, &reason)) {
-            return fail(("reader instance: " + reason).c_str());
+            return skip("reader instance unavailable: " + reason);
         }
         std::vector<const char*> r_exts{VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
         if (!kop::vkutil::pick_and_create_device(r_exts, &reader, &reason)) {

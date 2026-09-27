@@ -233,8 +233,9 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
         return KOPAW_E_GENERIC;
     }
 
-    // FFmpeg 8 uses the plural string option. Set it before sink init.
-    rc = av_opt_set(sink, "pixel_formats", "rgba", AV_OPT_SEARCH_CHILDREN);
+    // buffersink 的输出像素格式选项名随版本变化（见 ffmpeg_compat.hpp），
+    // 在 sink 初始化之前设定。
+    rc = kopaw::compat::sink_set_pixel_formats(sink, "rgba");
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "设置视频输出格式失败: %s", ffmpeg_error(rc).c_str());
         return KOPAW_E_GENERIC;
