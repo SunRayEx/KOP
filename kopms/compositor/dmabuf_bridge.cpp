@@ -56,6 +56,7 @@ const struct wl_buffer_interface dmabuf_buffer_impl = {
 };
 
 // linux_buffer_params 用户数据：add 阶段收集的平面（未创建前归 params 持有）。
+#ifdef KOPMS_HAVE_LINUX_DMABUF
 struct BufferParams {
     DmabufBufferView view;
     bool used = false;  // create 只允许一次
@@ -215,6 +216,8 @@ void dmabuf_bind(wl_client* client, void*, uint32_t version, uint32_t id) {
     KOP_LOG_DEBUG(kTag, "zwp_linux_dmabuf_v1 bind v%u", bound);
 }
 
+#endif  // KOPMS_HAVE_LINUX_DMABUF
+
 // ---------------------------------------------------------------------------
 // explicit synchronization（unstable v1）
 // ---------------------------------------------------------------------------
@@ -225,10 +228,10 @@ struct SurfaceSync {
     wl_resource* release = nullptr;  // 最近一次 get_release 的对象
 };
 
+#ifdef KOPMS_HAVE_EXPLICIT_SYNC
 void sync_destroy_req(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
-
 void sync_set_acquire_fence(wl_client*, wl_resource* resource, int32_t fd) {
     auto* sync = static_cast<SurfaceSync*>(wl_resource_get_user_data(resource));
     if (!sync) {
@@ -290,6 +293,8 @@ void expsync_bind(wl_client* client, void* data, uint32_t version, uint32_t id) 
     wl_resource_set_implementation(resource, &expsync_impl, data, nullptr);
     KOP_LOG_DEBUG(kTag, "zwp_linux_explicit_synchronization_v1 bind");
 }
+
+#endif  // KOPMS_HAVE_EXPLICIT_SYNC
 
 }  // namespace
 
@@ -372,11 +377,13 @@ void DmabufBridge::fire_release(wl_resource* surface_resource, int release_fence
     }
     wl_resource* release = it->second->release;
     it->second->release = nullptr;
+#ifdef KOPMS_HAVE_EXPLICIT_SYNC
     if (release_fence_fd >= 0) {
         zwp_linux_buffer_release_v1_send_fenced_release(release, release_fence_fd);
     } else {
         zwp_linux_buffer_release_v1_send_immediate_release(release);
     }
+#endif
     wl_resource_destroy(release);
 }
 

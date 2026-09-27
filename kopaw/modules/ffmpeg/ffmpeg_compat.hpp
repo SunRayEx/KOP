@@ -178,18 +178,5 @@ inline const ChannelLayout* codec_channel_layouts(const AVCodec*) { return nullp
 
 #endif
 
-// ---------------------------------------------------------------------------
-// buffersink 输出像素格式选项：FFmpeg 8（libavfilter >= 10）把字符串列表
-// 选项 pix_fmts 改名为 pixel_formats，老版本（Ubuntu 22.04/24.04 的
-// 4.4/6.1）只有旧名。按优先级尝试，兼容两个窗口。
-// ---------------------------------------------------------------------------
-inline int sink_set_pixel_formats(AVFilterContext* sink, const char* list) {
-    int rc = av_opt_set(sink, "pixel_formats", list, AV_OPT_SEARCH_CHILDREN);
-    if (rc == AVERROR_OPTION_NOT_FOUND) {
-        rc = av_opt_set(sink, "pix_fmts", list, AV_OPT_SEARCH_CHILDREN);
-    }
-    return rc;
-}
-
 }  // namespace compat
 }  // namespace kopaw

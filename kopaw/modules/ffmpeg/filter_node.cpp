@@ -233,13 +233,10 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
         return KOPAW_E_GENERIC;
     }
 
-    // buffersink 的输出像素格式选项名随版本变化（见 ffmpeg_compat.hpp），
-    // 在 sink 初始化之前设定。
-    rc = kopaw::compat::sink_set_pixel_formats(sink, "rgba");
-    if (rc < 0) {
-        KOP_LOG_ERROR(kTag, "设置视频输出格式失败: %s", ffmpeg_error(rc).c_str());
-        return KOPAW_E_GENERIC;
-    }
+    // KOPAW 视频输出契约固定为 rgba。lavfi 的 buffersink 像素格式选项名随
+    // 版本变化（pix_fmts / pixel_formats，且旧版 av_opt_set 不接受列表值），
+    // 改为在图内追加 format 滤镜约束输出——与音频路径追加 aformat 同一做法，
+    // 跨版本无差异（full_desc 在下面 parse 处拼接）。
     rc = avfilter_init_dict(sink, nullptr);
     if (rc < 0) {
         KOP_LOG_ERROR(kTag, "buffersink 初始化失败: %s", ffmpeg_error(rc).c_str());
@@ -265,7 +262,9 @@ int32_t VideoFilterNode::configure(const KopawFrame* frame) {
         return KOPAW_E_GENERIC;
     }
 
-    rc = avfilter_graph_parse_ptr(graph.get(), graph_desc_.c_str(), &inputs, &outputs, nullptr);
+    const std::string full_desc =
+        graph_desc_.empty() ? std::string("format=rgba") : graph_desc_ + ",format=rgba";
+    rc = avfilter_graph_parse_ptr(graph.get(), full_desc.c_str(), &inputs, &outputs, nullptr);
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
     if (rc < 0) {
