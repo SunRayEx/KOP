@@ -549,7 +549,9 @@ int32_t AudioFilterNode::drain_sink(int64_t default_pts) {
             return KOPAW_E_GENERIC;
         }
 
-        const int channels = out_frm_->ch_layout.nb_channels;
+        kopaw::compat::ChannelLayout out_layout;
+        kopaw::compat::frame_get_channel_layout(out_frm_.get(), &out_layout);
+        const int channels = out_layout.nb_channels;
         const int sample_rate = out_frm_->sample_rate;
         if (out_frm_->format != AV_SAMPLE_FMT_FLT || !out_frm_->data[0] ||
             channels <= 0 || sample_rate <= 0 || out_frm_->nb_samples <= 0) {
@@ -627,8 +629,10 @@ int32_t AudioFilterNode::send_impl(KopawFrame* frame) {
     in_frm_->nb_samples = static_cast<int>(
         frame->size /
         (static_cast<size_t>(frame->format.audio.channels) * sizeof(float)));
-    av_channel_layout_default(&in_frm_->ch_layout,
+    kopaw::compat::ChannelLayout in_layout;
+    kopaw::compat::channel_layout_default(&in_layout,
                               static_cast<int>(frame->format.audio.channels));
+    kopaw::compat::frame_set_channel_layout(in_frm_.get(), &in_layout);
     in_frm_->pts = frame->pts;
     const uint8_t* input = cpu_data(frame);
     if (!input || av_frame_get_buffer(in_frm_.get(), 0) < 0 || !in_frm_->data[0] ||
