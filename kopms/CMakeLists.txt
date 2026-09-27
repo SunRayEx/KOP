@@ -27,14 +27,10 @@ add_custom_command(
 
 # P3-M4：linux-dmabuf（格式/modifier 协商）与 explicit synchronization。
 # 系统 wayland-protocols 缺失时跳过（nested 协议验证路径仍可用）。
+# 需要 stable/linux-dmabuf（wayland-protocols >= 1.26；Ubuntu 24.04 有，
+# 22.04 的 1.25 只有 unstable v3 且不含 modifier feedback，不纳入）。
 set(KOPMS_DMABUF_XML
     /usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml)
-if(NOT EXISTS ${KOPMS_DMABUF_XML})
-    # 旧版 wayland-protocols（Ubuntu 22.04 的 1.25）只有 unstable 目录；
-    # 两者定义同一套 zwp_linux_dmabuf_v1 接口，生成的符号名一致。
-    set(KOPMS_DMABUF_XML
-        /usr/share/wayland-protocols/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml)
-endif()
 set(KOPMS_EXPSYNC_XML
     /usr/share/wayland-protocols/unstable/linux-explicit-synchronization/linux-explicit-synchronization-unstable-v1.xml)
 if(EXISTS ${KOPMS_DMABUF_XML})

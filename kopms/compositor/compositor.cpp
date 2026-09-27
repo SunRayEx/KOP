@@ -26,6 +26,14 @@
 #include "wayland-server-protocol.h"
 #include "xdg-shell-server-protocol.h"
 
+// xdg_surface_error::invalid_serial 于 xdg-shell v6 引入；Ubuntu 22.04 的
+// wayland-protocols 1.25 只有 v5，生成的头缺该枚举。枚举值在协议中稳定为 4
+// （role=0 / not_constructed=1 / already_constructed=2 /
+// unconfigured_buffer=3），老版头无该值时补定义。
+#ifndef XDG_SURFACE_ERROR_INVALID_SERIAL
+#define XDG_SURFACE_ERROR_INVALID_SERIAL 4
+#endif
+
 #include "drm_kms.hpp"
 #include "drm_hotplug.hpp"
 #include "drm_output.hpp"
