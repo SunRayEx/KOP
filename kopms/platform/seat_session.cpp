@@ -305,31 +305,30 @@ bool SeatSession::start(StateCallback callback, std::string* error) {
         return false;
     }
 
+    // Explicit unmanaged mode is also a request not to contact logind. This
+    // matters in an isolated TTY: a broken or unreachable logind/dbus must
+    // not hold direct DRM startup until the outer smoke timeout expires.
+    if (impl_->allow_unmanaged) {
+        impl_->backend = SeatSessionBackend::Unmanaged;
+        impl_->notify(SeatSessionState::Active, "explicit unmanaged DRM session");
+        return true;
+    }
+
 #ifdef KOPMS_HAVE_SYSTEMD
     std::string logind_error;
     if (start_logind(impl_.get(), &logind_error)) {
         impl_->notify(SeatSessionState::Active, "systemd-logind session active");
         return true;
     }
-    if (!impl_->allow_unmanaged) {
-        impl_->notify(SeatSessionState::Failed, logind_error);
-        set_error(error, logind_error);
-        return false;
-    }
-    KOP_LOG_WARN("kopms-seat", "logind 不可用，使用显式 unmanaged DRM：%s",
-                 logind_error.c_str());
+    impl_->notify(SeatSessionState::Failed, logind_error);
+    set_error(error, logind_error);
+    return false;
 #else
-    if (!impl_->allow_unmanaged) {
-        const std::string message = "未编译 systemd-logind，direct DRM 需要显式 unmanaged 许可";
-        impl_->notify(SeatSessionState::Failed, message);
-        set_error(error, message);
-        return false;
-    }
+    const std::string message = "未编译 systemd-logind，direct DRM 需要显式 unmanaged 许可";
+    impl_->notify(SeatSessionState::Failed, message);
+    set_error(error, message);
+    return false;
 #endif
-
-    impl_->backend = SeatSessionBackend::Unmanaged;
-    impl_->notify(SeatSessionState::Active, "explicit unmanaged DRM session");
-    return true;
 }
 
 bool SeatSession::dispatch(std::string* error) {
