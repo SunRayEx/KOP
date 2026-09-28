@@ -18,7 +18,6 @@ std::vector<uint8_t> make_header_seed() {
     h.version = KOPNET_TUNNEL_VERSION;
     h.flags = KOPNET_TUNNEL_FLAG_NONE;
     h.channel_id = 1;
-    h.reserved = 0;
     h.sequence = 42;
     h.payload_len = 16;
     h.fd_count = 0;
