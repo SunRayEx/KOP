@@ -423,32 +423,39 @@ bool SeatSession::acquire_device(const std::string& path, int* fd, std::string* 
             impl_->bus, "org.freedesktop.login1", impl_->session_path.c_str(),
             "org.freedesktop.login1.Session", "TakeDevice", &bus_error, &reply,
             "uu", lease.major, lease.minor);
-        if (result < 0) {
-            set_error(error, "logind TakeDevice 失败: " + bus_error_text(bus_error));
+        if (result >= 0) {
+            int returned_fd = -1;
+            int inactive = 0;
+            if (sd_bus_message_read(reply, "hb", &returned_fd, &inactive) < 0 ||
+                inactive != 0 || duplicate_fd(returned_fd, &lease.fd, error) < 0) {
+                if (error && error->empty()) {
+                    set_error(error, inactive != 0 ? "logind DRM device 当前 inactive"
+                                                   : "logind TakeDevice 返回无效 fd");
+                }
+                sd_bus_error_free(&bus_error);
+                sd_bus_message_unref(reply);
+                return false;
+            }
             sd_bus_error_free(&bus_error);
             sd_bus_message_unref(reply);
-            return false;
-        }
-        int returned_fd = -1;
-        int inactive = 0;
-        if (sd_bus_message_read(reply, "hb", &returned_fd, &inactive) < 0 ||
-            inactive != 0) {
-            set_error(error, inactive != 0 ? "logind DRM device 当前 inactive"
-                                           : "logind TakeDevice 返回无效 fd");
+        } else {
+            const std::string logind_error =
+                "logind TakeDevice 失败: " + bus_error_text(bus_error);
             sd_bus_error_free(&bus_error);
             sd_bus_message_unref(reply);
-            return false;
+            if (!impl_->allow_unmanaged) {
+                set_error(error, logind_error);
+                return false;
+            }
+            // A process can have an active logind session while another
+            // session controls the seat. Explicit unmanaged mode must also
+            // fall back here, not only when start_logind() fails.
+            KOP_LOG_WARN("kopms-seat", "%s；回退 unmanaged DRM", logind_error.c_str());
+            impl_->backend = SeatSessionBackend::Unmanaged;
         }
-        if (duplicate_fd(returned_fd, &lease.fd, error) < 0) {
-            sd_bus_error_free(&bus_error);
-            sd_bus_message_unref(reply);
-            return false;
-        }
-        sd_bus_error_free(&bus_error);
-        sd_bus_message_unref(reply);
-    } else
+    }
 #endif
-    {
+    if (impl_->backend == SeatSessionBackend::Unmanaged) {
         lease.fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
         if (lease.fd < 0) {
             set_errno_error(error, "open unmanaged DRM device failed: ");
