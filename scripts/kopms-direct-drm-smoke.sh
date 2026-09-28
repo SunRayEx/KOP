@@ -18,6 +18,7 @@ COMPOSITOR="$BUILD_DIR/kopms/kopms-compositor"
 RUNTIME_DIR=${KOPMS_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/kopms-drm-runtime.XXXXXX")}
 RUNTIME_OWNED=0
 if [[ -z "${KOPMS_RUNTIME_DIR:-}" ]]; then RUNTIME_OWNED=1; fi
+mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 [[ -d "$RUNTIME_DIR" && -w "$RUNTIME_DIR" ]] || {
     echo "XDG_RUNTIME_DIR is not writable: $RUNTIME_DIR" >&2
