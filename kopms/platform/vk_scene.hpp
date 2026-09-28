@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "kopaw_abi.h"
+#include "display_config.hpp"
 
 struct GLFWwindow;
 
@@ -73,7 +74,9 @@ public:
         bool windowed = false;  // GLFW Vulkan 窗口呈现；否则离屏（fence 节拍）
         uint32_t width = 1280;
         uint32_t height = 720;
+        float scale = 1.0f;     // logical → output pixel scale
         int fence_timeout_ms = 100;  // acquire fence 有界等待
+        DisplayConfig display{};     // output color/HDR/resolution contract
     };
 
     VulkanScene();

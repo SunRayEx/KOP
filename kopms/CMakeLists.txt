@@ -104,6 +104,7 @@ target_include_directories(kopms-wire PUBLIC
     ${CMAKE_SOURCE_DIR}/kopaw/abi/include)
 
 add_library(kopms-platform STATIC
+    platform/display_config.cpp
     platform/drm_kms.cpp
     platform/drm_buffer.cpp
     platform/drm_hotplug.cpp

@@ -171,6 +171,30 @@ struct VulkanScene::Impl {
     VkPipeline pipeline_yuv[kYuvFormatCount][kYuvChromaVariantCount]{};
     bool ycbcr_ok = false;
     bool hdr_sdr_warning_logged = false;
+
+    int output_color_primaries() const {
+        switch (options.display.color_space) {
+            case DisplayColorSpace::DCI_P3:
+            case DisplayColorSpace::WGC:
+            case DisplayColorSpace::DISPLAY_P3:
+                return KOPAW_COLOR_PRIMARIES_P3;
+            case DisplayColorSpace::REC2020:
+            case DisplayColorSpace::ACES:
+                return KOPAW_COLOR_PRIMARIES_BT2020;
+            case DisplayColorSpace::SRGB:
+            case DisplayColorSpace::REC709:
+            case DisplayColorSpace::NTSC:
+            default:
+                return KOPAW_COLOR_PRIMARIES_BT709;
+        }
+    }
+
+    int output_mode() const {
+        return options.display.hdr == HdrMode::HDR10 || options.display.hdr == HdrMode::Auto
+                   ? kop::kColorOutHdr10
+                   : kop::kColorOutSdr;
+    }
+
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
@@ -814,6 +838,13 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
     s.owner = this;
     s.options = options;
     s.windowed = options.windowed;
+    if (!validate_display_config(s.options.display, error)) return true;
+    s.options.width = s.options.display.width;
+    s.options.height = s.options.display.height;
+    KOP_LOG_INFO(kTag, "display config %ux%u scale=%.2f colorspace=%s hdr=%s",
+                 s.options.width, s.options.height, s.options.display.scale,
+                 display_color_space_name(s.options.display.color_space),
+                 hdr_mode_name(s.options.display.hdr));
 
     std::vector<const char*> instance_exts;
     std::vector<const char*> device_exts;
@@ -1446,7 +1477,10 @@ bool VulkanScene::render(const std::vector<LayoutItem>& layout_items,
                 static_cast<int32_t>(item.color.matrix),
                 static_cast<int32_t>(item.color.range),
                 static_cast<int32_t>(item.color.transfer),
-                kop::declared_peak_luminance(item.color)};
+                kop::declared_peak_luminance(item.color),
+                s.output_mode(),
+                s.output_color_primaries(),
+                s.options.display.sdr_white_nits};
             vkCmdPushConstants(s.cmd, s.pipeline_layout_yuv[fi][variant],
                                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
         } else {
@@ -1463,7 +1497,10 @@ bool VulkanScene::render(const std::vector<LayoutItem>& layout_items,
                     : KOPAW_COLOR_TRANSFER_UNKNOWN,
                 item.has_color_metadata
                     ? kop::declared_peak_luminance(item.color)
-                    : 1000.0f};
+                    : 1000.0f,
+                s.output_mode(),
+                s.output_color_primaries(),
+                s.options.display.sdr_white_nits};
             vkCmdPushConstants(s.cmd, s.pipeline_layout,
                                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
         }

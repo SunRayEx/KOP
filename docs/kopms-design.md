@@ -87,6 +87,35 @@ HELLO 能力协商和 `SCM_RIGHTS` 传输，但控制 payload 不携带 FD，媒
 在服务端读取 `SCM_RIGHTS` 后由本地 DMA-BUF FD 物化。客户端的数字 FD 不能跨进程复用，
 服务端只在保持对应 FD 生命周期期间暴露该句柄。
 
+### KOPMS 显示输出配置接口
+
+KOPMS 提供 `kopms::DisplayConfig`（`platform/display_config.hpp`）作为输出配置
+边界，统一描述高分辨率、窗口缩放、HDR 和输出色域：
+
+- `width` / `height`：输出像素分辨率；
+- `scale`：逻辑窗口到输出像素的缩放因子，范围为 `(0, 8]`；
+- `hdr`：`off`、`auto`、`hdr10`、`hlg`；
+- `color_space`：`srgb`、`dci-p3`、`wgc`、`rec.709`、`rec.2020`、`ntsc`、
+  `display-p3`、`aces`；
+- `sdr_white_nits` / `peak_nits`：SDR 参考白和输出峰值亮度。
+
+compositor 命令行和环境变量入口：
+
+```text
+--resolution 3840x2160
+--scale 2.0
+--colorspace display-p3
+--hdr auto
+KOPMS_COLORSPACE=rec.2020 KOPMS_HDR=hdr10
+```
+
+Vulkan 合成器将输入帧的 transfer/primaries 转换到配置的输出模式；SDR 输出使用
+sRGB OETF，HDR10/auto 使用 PQ 输出路径，HLG 当前作为配置能力标识并在 HDR 输出
+backend 中保留。DCI-P3、WGC、NTSC 和 ACES 的名称与能力可被配置和协商，其中
+当前 Vulkan shader 使用最接近的标准原色矩阵（P3 或 Rec.2020）作为落地映射，
+不会宣称显示器 EDID 已支持这些色域。真实 HDR swapchain metadata、DRM connector
+HDR blob 和 EDID 能力探测仍需在对应 KMS backend 中补齐。
+
 ### 帧色彩契约（KOPAW ABI 5.3 / BUS minor 1.2）
 
 `KopawFrame`、`KopmsFrameDescriptor` 和 BUS `FRAME_SUBMIT` 使用同一份

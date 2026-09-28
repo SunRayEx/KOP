@@ -119,6 +119,9 @@
       扩展为 16bit；SDK 已将 KOPNET 定义为网络传输管线入口，支持主/备用 URI、
       自动故障转移、按 kind 的 Stream/Datagram 通道和发送/接收字节统计；剩余
       RTC/RDP 适配器需 DTLS-SRTP/ICE 栈，离线环境不可引入
+- [x] KOPMS 显示输出配置接口：支持高分辨率、缩放、HDR 模式及 sRGB、DCI-P3、
+      WGC、Rec.709、Rec.2020、NTSC、Display-P3、ACES 色域名称和输出映射配置；
+      真实 EDID/HDR metadata/DRM connector blob 能力探测仍待 KMS backend
 - [ ] 硬解零拷贝跨后端：CUVID（CUDA）原生导出需 EGL/DMA-BUF 互操作；
   NV12/P010 之外的原生表面格式按需扩展导出器
 - [x] 播放器本地 Vulkan 导入失败时动态回退 CPU 路径：RenderNode 丢弃失败的

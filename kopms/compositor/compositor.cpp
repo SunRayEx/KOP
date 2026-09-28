@@ -68,6 +68,7 @@ struct RuntimeOptions {
     bool allow_unmanaged_drm = false;
     bool watch_drm = false;
     bool scene_window = false;  // Vulkan 场景用独立 GLFW 窗口呈现（默认离屏）
+    kopms::DisplayConfig display{};
     kopms::GpuMode gpu_mode = kopms::GpuMode::Single;
     std::string gpu_mode_diagnostic;
 };
@@ -100,6 +101,10 @@ void print_usage(const char* program) {
                  "  --watch-drm             监听 DRM udev 热插拔并尝试恢复\n"
                  "  --bus-socket NAME       KOPMS-S BUS socket（默认 <wayland>.bus）\n"
                  "  --scene-window          Vulkan 场景经独立窗口呈现（默认离屏）\n"
+                 "  --resolution WxH        场景输出分辨率\n"
+                 "  --scale FACTOR          窗口/场景缩放因子\n"
+                 "  --colorspace NAME       srgb/dci-p3/wgc/rec.709/rec.2020/ntsc/display-p3/aces\n"
+                 "  --hdr MODE              off/auto/hdr10/hlg\n"
                  "  KOPMS_GPU_MODE=SINGLE|HYBRID  媒体句柄模式（默认 SINGLE）\n",
                  program ? program : "kopms-compositor");
 }
@@ -121,6 +126,12 @@ bool parse_options(int argc, char** argv, RuntimeOptions* options) {
     options->allow_unmanaged_drm = env_flag("KOPMS_ALLOW_UNMANAGED_DRM");
     options->watch_drm = options->direct_drm || env_flag("KOPMS_DRM_HOTPLUG");
     options->gpu_mode = kopms::gpu_mode_from_environment(&options->gpu_mode_diagnostic);
+    options->display.width = 1280;
+    options->display.height = 720;
+    if (const char* v = std::getenv("KOPMS_COLORSPACE"))
+        kopms::parse_display_color_space(v, &options->display.color_space);
+    if (const char* v = std::getenv("KOPMS_HDR"))
+        kopms::parse_hdr_mode(v, &options->display.hdr);
 
     int positional = 0;
     for (int i = 1; i < argc; ++i) {
@@ -149,6 +160,24 @@ bool parse_options(int argc, char** argv, RuntimeOptions* options) {
             }
         } else if (std::strcmp(arg, "--scene-window") == 0) {
             options->scene_window = true;
+        } else if (std::strcmp(arg, "--resolution") == 0 ||
+                   std::strcmp(arg, "--scale") == 0 ||
+                   std::strcmp(arg, "--colorspace") == 0 ||
+                   std::strcmp(arg, "--hdr") == 0) {
+            if (i + 1 >= argc) return false;
+            const char* value = argv[++i];
+            if (std::strcmp(arg, "--resolution") == 0) {
+                unsigned w = 0, h = 0;
+                if (std::sscanf(value, "%ux%u", &w, &h) != 2 || w == 0 || h == 0) return false;
+                options->display.width = w;
+                options->display.height = h;
+            } else if (std::strcmp(arg, "--scale") == 0) {
+                options->display.scale = std::strtof(value, nullptr);
+            } else if (std::strcmp(arg, "--colorspace") == 0) {
+                if (!kopms::parse_display_color_space(value, &options->display.color_space)) return false;
+            } else if (!kopms::parse_hdr_mode(value, &options->display.hdr)) {
+                return false;
+            }
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
             return false;
         } else if (arg[0] == '-') {
@@ -187,6 +216,10 @@ struct Surface {
     uint32_t configure_serial = 0;
     bool configured = false;
     bool destroyed = false;
+    int32_t buffer_scale = 1;
+    int32_t buffer_transform = WL_OUTPUT_TRANSFORM_NORMAL;
+    uint32_t logical_w = 0;
+    uint32_t logical_h = 0;
     // M4：surface 在 Vulkan 场景中的窗口 id（首个 dmabuf commit 时分配）
     uint64_t scene_window_id = 0;
     // 输入聚焦：最近一次带 buffer 的 commit 序号（主 surface 优先）
@@ -199,6 +232,7 @@ struct ClientInfo {
 };
 
 wl_display* g_display = nullptr;
+kopms::DisplayConfig g_display_config{};
 NestedOutput* g_output = nullptr;
 std::list<std::unique_ptr<Surface>> g_surfaces;
 std::list<std::unique_ptr<ClientInfo>> g_clients;
@@ -465,6 +499,8 @@ void present_pending_buffer(Surface* surface) {
     const int32_t width = wl_shm_buffer_get_width(shm);
     const int32_t height = wl_shm_buffer_get_height(shm);
     const int32_t stride = wl_shm_buffer_get_stride(shm);
+    surface->logical_w = static_cast<uint32_t>(width / surface->buffer_scale);
+    surface->logical_h = static_cast<uint32_t>(height / surface->buffer_scale);
     const uint32_t format = wl_shm_buffer_get_format(shm);
     if (width <= 0 || height <= 0 || stride < width * 4 ||
         (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888)) {
@@ -500,8 +536,27 @@ void surface_attach(wl_client*, wl_resource* resource, wl_resource* buffer, int3
 void surface_damage(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
 void surface_set_opaque_region(wl_client*, wl_resource*, wl_resource*) {}
 void surface_set_input_region(wl_client*, wl_resource*, wl_resource*) {}
-void surface_set_buffer_transform(wl_client*, wl_resource*, int32_t) {}
-void surface_set_buffer_scale(wl_client*, wl_resource*, int32_t) {}
+void surface_set_buffer_transform(wl_client* client, wl_resource* resource,
+                                  int32_t transform) {
+    Surface* surface = surface_from(resource);
+    if (!surface || transform < WL_OUTPUT_TRANSFORM_NORMAL ||
+        transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
+        wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
+                               "invalid buffer transform");
+        return;
+    }
+    surface->buffer_transform = transform;
+    (void)client;
+}
+void surface_set_buffer_scale(wl_client*, wl_resource* resource, int32_t scale) {
+    Surface* surface = surface_from(resource);
+    if (!surface || scale <= 0) {
+        wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
+                               "buffer scale must be positive");
+        return;
+    }
+    surface->buffer_scale = scale;
+}
 void surface_damage_buffer(wl_client*, wl_resource*, int32_t, int32_t, int32_t,
                            int32_t) {}
 
@@ -882,9 +937,11 @@ void output_bind(wl_client* client, void*, uint32_t version, uint32_t id) {
     if (!resource) return;
     wl_output_send_geometry(resource, 0, 0, 300, 190, WL_OUTPUT_SUBPIXEL_UNKNOWN, "KOP",
                             "KOPMS-M1", WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED, 1280, 720,
-                        60000);
-    if (bound_version >= 2) wl_output_send_scale(resource, 1);
+    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
+                        static_cast<int32_t>(g_display_config.width),
+                        static_cast<int32_t>(g_display_config.height), 60000);
+    if (bound_version >= 2)
+        wl_output_send_scale(resource, std::max(1, static_cast<int>(g_display_config.scale)));
     if (bound_version >= WL_OUTPUT_DONE_SINCE_VERSION) wl_output_send_done(resource);
 }
 
@@ -1028,6 +1085,7 @@ int main(int argc, char** argv) {
         print_usage(argc > 0 ? argv[0] : nullptr);
         return 2;
     }
+    g_display_config = options.display;
     if (!options.gpu_mode_diagnostic.empty()) {
         KOP_LOG_WARN(kTag, "%s，回退到 SINGLE", options.gpu_mode_diagnostic.c_str());
     }
@@ -1307,16 +1365,18 @@ int main(int argc, char** argv) {
     }
     kopms::VulkanScene::Options scene_options{};
     scene_options.windowed = scene_window != nullptr;
-    scene_options.width = 1280;
-    scene_options.height = 720;
+    scene_options.width = options.display.width;
+    scene_options.height = options.display.height;
+    scene_options.scale = options.display.scale;
+    scene_options.display = options.display;
     std::string scene_error;
-    if (g_scene.init(scene_options, scene_window, &scene_error)) {
-        KOP_LOG_WARN(kTag, "Vulkan 场景未启用：%s；BUS/Wayland GPU 帧将被立即释放",
-                     scene_error.c_str());
-    } else {
+    if (!g_scene.init(scene_options, scene_window, &scene_error)) {
         g_scene.set_release_callback(on_scene_release);
         KOP_LOG_INFO(kTag, "Vulkan 场景合成已启用（%s）",
                      scene_options.windowed ? "windowed" : "offscreen");
+    } else {
+        KOP_LOG_WARN(kTag, "Vulkan 场景未启用：%s；BUS/Wayland GPU 帧将被立即释放",
+                     scene_error.c_str());
     }
 
     // P3-M4：linux-dmabuf / explicit-sync 全局（协议 XML 可用时）。
