@@ -22,6 +22,11 @@ CLIENT="$BUILD_DIR/kopms/kopms-test-client"
 
 [[ -x "$COMPOSITOR" ]] || { echo "missing $COMPOSITOR" >&2; exit 2; }
 [[ -x "$CLIENT" ]] || { echo "missing $CLIENT" >&2; exit 2; }
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" &&
+      "${KOPMS_ALLOW_HEADLESS:-0}" != 1 ]]; then
+    echo "nested smoke skipped: no DISPLAY/WAYLAND_DISPLAY (TTY/headless)"
+    exit 77
+fi
 
 args=("$SOCKET" "$SECONDS_RUN")
 if [[ -n "${KOPMS_DRM_DEVICE:-}" ]]; then args+=(--drm-device "$KOPMS_DRM_DEVICE"); fi

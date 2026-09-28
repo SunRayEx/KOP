@@ -12,6 +12,11 @@ LOG_DIR=${KOPAW_LOG_DIR:-$ROOT/build/kopaw-hw-smoke}
 mkdir -p "$LOG_DIR"
 
 [[ -x "$PLAYER" ]] || { echo "missing $PLAYER" >&2; exit 2; }
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" &&
+      "${KOPAW_ALLOW_HEADLESS:-0}" != 1 ]]; then
+    echo "KOPAW smoke skipped: no DISPLAY/WAYLAND_DISPLAY (TTY/headless)"
+    exit 77
+fi
 [[ -n "$MEDIA" && -f "$MEDIA" ]] || {
     echo "usage: $0 input.mkv" >&2
     exit 2
