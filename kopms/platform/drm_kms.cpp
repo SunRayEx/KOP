@@ -807,6 +807,27 @@ bool DrmKmsSession::page_flip(const DrmKmsSnapshot& snapshot, uint32_t framebuff
 #endif
 }
 
+bool DrmKmsSession::dispatch_page_flip_events(std::string* error) {
+    if (fd_ < 0) {
+        if (error) *error = "DRM session 尚未打开";
+        return false;
+    }
+    if (!page_flip_pending_) return true;
+#ifndef KOPMS_HAVE_LIBDRM
+    if (error) *error = "libdrm 不可用，page-flip event 未启用";
+    return false;
+#else
+    drmEventContext context{};
+    context.version = DRM_EVENT_CONTEXT_VERSION;
+    context.page_flip_handler = &DrmKmsSession::page_flip_event;
+    if (drmHandleEvent(fd_, &context) < 0) {
+        set_error(error, "处理 page-flip event 失败: ");
+        return false;
+    }
+    return !page_flip_pending_;
+#endif
+}
+
 bool DrmKmsSession::wait_for_page_flip(int timeout_ms, std::string* error) {
     if (fd_ < 0) {
         if (error) *error = "DRM session 尚未打开";
@@ -837,13 +858,7 @@ bool DrmKmsSession::wait_for_page_flip(int timeout_ms, std::string* error) {
         if (error) *error = "DRM page-flip event fd 状态无效";
         return false;
     }
-    drmEventContext context{};
-    context.version = DRM_EVENT_CONTEXT_VERSION;
-    context.page_flip_handler = &DrmKmsSession::page_flip_event;
-    if (drmHandleEvent(fd_, &context) < 0) {
-        set_error(error, "处理 page-flip event 失败: ");
-        return false;
-    }
+    if (!dispatch_page_flip_events(error)) return false;
     if (page_flip_pending_) {
         if (error) *error = "DRM 未返回 page-flip event";
         return false;

@@ -159,6 +159,8 @@ public:
     bool page_flip(const DrmKmsSnapshot& snapshot, uint32_t framebuffer_id,
                    std::function<void()> completed, std::string* error);
     bool wait_for_page_flip(int timeout_ms, std::string* error);
+    // Dispatch a pending page-flip event from the compositor event loop.
+    bool dispatch_page_flip_events(std::string* error);
     void close();
 
     int fd() const noexcept { return fd_; }

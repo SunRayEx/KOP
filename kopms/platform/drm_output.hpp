@@ -61,6 +61,9 @@ public:
 
     DrmOutputState state() const noexcept;
     bool active() const noexcept;
+    bool page_flip_pending() const noexcept;
+    int fd() const noexcept;
+    bool dispatch_page_flip_events(std::string* error);
     const DrmKmsSnapshot* snapshot() const noexcept;
     const std::string& device() const noexcept;
 

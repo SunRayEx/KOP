@@ -130,4 +130,6 @@
   首帧后升级交换链，`--hdr on` 强制 HDR10，表面不支持或 `--hdr off` 回退 SDR；
   HDR10 输出统一到绝对亮度 cd/m² 后过原色矩阵（BT.709/Display-P3→Rec.2020，
   从色度坐标推导验证）再 ST.2084 PQ 编码，应用侧不做色调映射
-- [ ] KOPMS DRM 直出的合成结果 page-flip 真机验证（vkms / logind 环境）
+- [ ] KOPMS DRM 直出的合成结果 page-flip 真机验证（vkms / logind 环境）；
+  已完成 DRM fd 接入 Wayland event loop、pending framebuffer 生命周期隔离，
+  待在真实 KMS 环境验证 format/modifier/stride 与 page-flip event。

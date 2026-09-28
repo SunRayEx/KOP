@@ -150,8 +150,11 @@ struct DrmDirectOutput::Impl {
     DrmKmsSession drm;
     DrmKmsSnapshot snapshot;
     std::unique_ptr<DumbBuffer> bootstrap_buffer;
-    // M3：上一帧合成结果的 framebuffer（新 flip 提交前释放）
+    // 当前扫描出的 framebuffer 与已提交但尚未收到 event 的 framebuffer
+    // 必须分开持有。page-flip 超时并不代表 KMS 已停止引用 pending_fb。
     DrmImportedBuffer presented_fb;
+    DrmImportedBuffer pending_fb;
+    DrmDirectOutput::FlipDoneCallback pending_completed;
 
     void notify(DrmOutputState next, const std::string& reason) {
         state = next;
@@ -165,6 +168,8 @@ struct DrmDirectOutput::Impl {
                 KOP_LOG_WARN("kopms-drm", "关闭 atomic 输出失败：%s", error.c_str());
             }
         }
+        pending_completed = {};
+        pending_fb.reset();
         presented_fb.reset();
         bootstrap_buffer.reset();
         drm.close();
@@ -357,24 +362,35 @@ bool DrmDirectOutput::present_dmabuf(const DrmDmabufImportRequest& request,
             return false;
         }
     }
-    // 上一帧 FB 在新 flip 提交前释放：此刻显示的是它，AddFB2/flip 之后才
-    // 离屏。page-flip 事件返回时 completed 触发，场景才释放源帧。
+    if (impl_->pending_fb.valid()) {
+        set_error(error, "已有 DMA-BUF page-flip 尚未完成");
+        return false;
+    }
+    // 当前扫描的 FB 不能在新 flip 完成前释放。pending_fb 由 DRM event
+    // 回调转移为 presented_fb；超时也必须继续保留，不能误认为已完成。
     DrmImportedBuffer framebuffer;
     if (!import_dmabuf_frame(impl_->drm.fd(), request, impl_->snapshot, &framebuffer,
                              0, error)) {
         return false;
     }
-    if (!impl_->drm.page_flip(impl_->snapshot, framebuffer.framebuffer_id,
-                              std::move(completed), error)) {
+    impl_->pending_fb = std::move(framebuffer);
+    impl_->pending_completed = std::move(completed);
+    auto* impl = impl_.get();
+    auto on_complete = [impl] {
+        impl->presented_fb.reset();
+        impl->presented_fb = std::move(impl->pending_fb);
+        auto callback = std::move(impl->pending_completed);
+        impl->pending_completed = {};
+        if (callback) callback();
+    };
+    if (!impl_->drm.page_flip(impl_->snapshot, impl_->pending_fb.framebuffer_id,
+                              std::move(on_complete), error)) {
+        impl_->pending_completed = {};
+        impl_->pending_fb.reset();
         return false;
     }
-    if (!impl_->drm.wait_for_page_flip(200, error)) {
-        // flip 未确认：保守保留 FB，等待恢复路径清理。
-        KOP_LOG_WARN("kopms-drm", "page-flip 完成等待失败：%s", error->c_str());
-        impl_->presented_fb = std::move(framebuffer);
-        return false;
-    }
-    impl_->presented_fb = std::move(framebuffer);
+    // page-flip event 由 compositor 的 Wayland event loop 异步分派；这里不能
+    // 阻塞等待，否则会暂停 Wayland client、seat 和 hotplug 事件处理。
     return true;
 }
 
@@ -384,6 +400,19 @@ DrmOutputState DrmDirectOutput::state() const noexcept {
 
 bool DrmDirectOutput::active() const noexcept {
     return state() == DrmOutputState::Active;
+}
+
+bool DrmDirectOutput::page_flip_pending() const noexcept {
+    return impl_ && impl_->pending_fb.valid();
+}
+
+int DrmDirectOutput::fd() const noexcept {
+    return impl_ ? impl_->drm.fd() : -1;
+}
+
+bool DrmDirectOutput::dispatch_page_flip_events(std::string* error) {
+    if (!impl_ || !impl_->pending_fb.valid()) return true;
+    return impl_->drm.dispatch_page_flip_events(error);
 }
 
 const DrmKmsSnapshot* DrmDirectOutput::snapshot() const noexcept {

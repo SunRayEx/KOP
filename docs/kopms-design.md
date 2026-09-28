@@ -128,6 +128,8 @@ primary plane 元数据，并用兼容性算法选出一个 connected output。M
 模式在授权 fd 上创建黑色 dumb bootstrap buffer，完成 atomic `TEST_ONLY` 后执行初始
 modeset；M3 之后合成结果另经 `DrmDirectOutput::present_dmabuf()` 走
 AddFB2 + atomic page-flip，flip 完成事件到达后场景才释放参与合成的帧。
+当前 compositor 将 DRM fd 纳入 Wayland event loop；当前扫描帧与 pending 帧
+分离，page-flip event 到达后才转移 framebuffer 并释放场景帧。
 
 与 KOPAW 的协同点（也是混编架构的收益）：
 

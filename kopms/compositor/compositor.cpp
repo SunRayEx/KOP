@@ -955,6 +955,7 @@ std::vector<kopms::VulkanScene::LayoutItem> compute_scene_layout(uint32_t out_w,
 }
 
 void present_scene_to_drm(kopms::DrmDirectOutput& output) {
+    if (output.page_flip_pending()) return;
     int fd = -1;
     uint32_t stride = 0;
     uint32_t width = 0;
@@ -980,8 +981,24 @@ void present_scene_to_drm(kopms::DrmDirectOutput& output) {
     ::close(fd);
     if (!flipped) {
         KOP_LOG_WARN(kTag, "DRM page-flip 呈现失败：%s", error.c_str());
-        g_scene.complete_direct_present();
+        // commit 成功但 event 超时仍保留 pending framebuffer；完成回调
+        // 将在 event 到达后释放场景帧，不能在此重复完成。
+        if (!output.page_flip_pending()) g_scene.complete_direct_present();
     }
+}
+
+struct DrmDispatchContext {
+    kopms::DrmDirectOutput* output = nullptr;
+};
+
+int dispatch_drm_events(int, uint32_t, void* data) {
+    auto* context = static_cast<DrmDispatchContext*>(data);
+    if (!context || !context->output) return 0;
+    std::string error;
+    if (!context->output->dispatch_page_flip_events(&error)) {
+        KOP_LOG_WARN(kTag, "DRM page-flip event 处理失败：%s", error.c_str());
+    }
+    return 0;
 }
 
 struct HotplugDispatchContext {
@@ -1236,6 +1253,19 @@ int main(int argc, char** argv) {
                                            static_cast<uint32_t>(interval));
     }
 
+    DrmDispatchContext drm_context{&direct_output};
+    wl_event_source* drm_source = nullptr;
+    if (direct_output.active() && direct_output.snapshot()) {
+        drm_source = wl_event_loop_add_fd(
+            loop, direct_output.fd(), WL_EVENT_READABLE, dispatch_drm_events,
+            &drm_context);
+        if (!drm_source) {
+            KOP_LOG_WARN(kTag, "DRM page-flip fd 无法加入 Wayland event loop");
+        } else {
+            KOP_LOG_INFO(kTag, "DRM page-flip event 已接入 Wayland event loop");
+        }
+    }
+
     kopms::DrmHotplugMonitor hotplug;
     HotplugDispatchContext hotplug_context{&hotplug};
     wl_event_source* hotplug_source = nullptr;
@@ -1388,6 +1418,7 @@ int main(int argc, char** argv) {
     std::string bus_error;
     if (!bus_server.start(&bus_error)) {
         KOP_LOG_ERROR(kTag, "KOPMS-S BUS2LAYER 启动失败：%s", bus_error.c_str());
+        if (drm_source) wl_event_source_remove(drm_source);
         if (hotplug_source) wl_event_source_remove(hotplug_source);
         hotplug.stop();
         direct_output.stop();
@@ -1443,6 +1474,7 @@ int main(int argc, char** argv) {
     KOP_LOG_INFO(kTag, "正常退出");
     g_bus_server = nullptr;
     bus_server.stop();
+    if (drm_source) wl_event_source_remove(drm_source);
     if (hotplug_source) wl_event_source_remove(hotplug_source);
     hotplug.stop();
     direct_output.stop();
