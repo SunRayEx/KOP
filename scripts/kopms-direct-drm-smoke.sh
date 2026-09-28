@@ -35,6 +35,7 @@ trap cleanup_runtime EXIT INT TERM
 [[ -x "$COMPOSITOR" ]] || { echo "missing $COMPOSITOR" >&2; exit 2; }
 [[ -e "$DEVICE" ]] || { echo "missing DRM device $DEVICE" >&2; exit 2; }
 
+# 全量测试脚本通过 KOP_RUN_DRM=1 明确授权；保留单独脚本的安全保护。
 if [[ "${KOPMS_CONFIRM_DRM:-}" != "YES" ]]; then
     cat >&2 <<EOF
 This test will acquire $DEVICE and perform a real DRM modeset/page-flip.

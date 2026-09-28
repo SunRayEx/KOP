@@ -10,6 +10,14 @@ SECONDS_RUN=${KOPMS_SECONDS:-8}
 LOG_DIR=${KOPMS_LOG_DIR:-$ROOT/build/kopms-smoke}
 mkdir -p "$LOG_DIR"
 COMPOSITOR="$BUILD_DIR/kopms/kopms-compositor"
+
+# 不信任 TTY/root 继承的 /run/user/0；nested Wayland 也使用独立 runtime。
+RUNTIME_DIR=${KOPMS_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/kopms-runtime.XXXXXX")}
+RUNTIME_OWNED=0
+[[ -n "${KOPMS_RUNTIME_DIR:-}" ]] || RUNTIME_OWNED=1
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+trap 'if [[ "$RUNTIME_OWNED" == 1 ]]; then rm -rf "$RUNTIME_DIR"; fi' EXIT INT TERM
 CLIENT="$BUILD_DIR/kopms/kopms-test-client"
 
 [[ -x "$COMPOSITOR" ]] || { echo "missing $COMPOSITOR" >&2; exit 2; }
@@ -28,6 +36,8 @@ if [[ "${KOPMS_SCENE_WINDOW:-0}" == 1 ]]; then args+=(--scene-window); fi
 cleanup() { [[ -n "${pid:-}" ]] && kill "$pid" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
+export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+unset WAYLAND_DISPLAY WAYLAND_SOCKET
 "$COMPOSITOR" "${args[@]}" >"$LOG_DIR/compositor.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 100); do
