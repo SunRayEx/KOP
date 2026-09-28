@@ -297,6 +297,9 @@ SeatSession::~SeatSession() {
 }
 
 bool SeatSession::start(StateCallback callback, std::string* error) {
+    KOP_LOG_INFO("kopms-seat", "SeatSession::start begin seat=%s unmanaged=%s",
+                 impl_ && !impl_->seat.empty() ? impl_->seat.c_str() : "",
+                 impl_ && impl_->allow_unmanaged ? "yes" : "no");
     stop();
     impl_->callback = std::move(callback);
     if (impl_->seat.empty()) {
@@ -311,6 +314,7 @@ bool SeatSession::start(StateCallback callback, std::string* error) {
     if (impl_->allow_unmanaged) {
         impl_->backend = SeatSessionBackend::Unmanaged;
         impl_->notify(SeatSessionState::Active, "explicit unmanaged DRM session");
+        KOP_LOG_INFO("kopms-seat", "SeatSession::start unmanaged active");
         return true;
     }
 
@@ -409,6 +413,8 @@ bool SeatSession::acquire_device(const std::string& path, int* fd, std::string* 
         return false;
     }
 
+    KOP_LOG_INFO("kopms-seat", "acquire DRM device path=%s backend=%s",
+                 path.c_str(), seat_session_backend_name(impl_->backend));
     Impl::DeviceLease lease;
     lease.path = path;
     lease.major = major(device_stat.st_rdev);
@@ -455,6 +461,7 @@ bool SeatSession::acquire_device(const std::string& path, int* fd, std::string* 
     }
 #endif
     if (impl_->backend == SeatSessionBackend::Unmanaged) {
+        KOP_LOG_INFO("kopms-seat", "opening unmanaged DRM device path=%s", path.c_str());
         lease.fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
         if (lease.fd < 0) {
             set_errno_error(error, "open unmanaged DRM device failed: ");
