@@ -12,6 +12,22 @@ LOG_DIR=${KOPMS_LOG_DIR:-$ROOT/build/kopms-drm-smoke}
 mkdir -p "$LOG_DIR"
 COMPOSITOR="$BUILD_DIR/kopms/kopms-compositor"
 
+# Wayland 的 socket lockfile 位于 XDG_RUNTIME_DIR。TTY/root 环境经常没有
+# 可写的 /run/user/0，或残留了桌面用户创建的同名 lock；使用一次性私有目录
+# 避免把 DRM 测试和桌面 runtime 混在一起。
+RUNTIME_DIR=${KOPMS_RUNTIME_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/kopms-drm-runtime.XXXXXX")}
+RUNTIME_OWNED=0
+if [[ -z "${KOPMS_RUNTIME_DIR:-}" ]]; then RUNTIME_OWNED=1; fi
+chmod 700 "$RUNTIME_DIR"
+[[ -d "$RUNTIME_DIR" && -w "$RUNTIME_DIR" ]] || {
+    echo "XDG_RUNTIME_DIR is not writable: $RUNTIME_DIR" >&2
+    exit 2
+}
+cleanup_runtime() {
+    if [[ "$RUNTIME_OWNED" == 1 ]]; then rm -rf "$RUNTIME_DIR"; fi
+}
+trap cleanup_runtime EXIT INT TERM
+
 [[ -x "$COMPOSITOR" ]] || { echo "missing $COMPOSITOR" >&2; exit 2; }
 [[ -e "$DEVICE" ]] || { echo "missing DRM device $DEVICE" >&2; exit 2; }
 
@@ -33,6 +49,7 @@ args=("$SOCKET" "$SECONDS_RUN" --direct-drm --drm-device "$DEVICE" --watch-drm)
 
 set +e
 timeout --signal=TERM --kill-after=5 "$((SECONDS_RUN + 8))" \
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY= \
     "$COMPOSITOR" "${args[@]}" >"$LOG_DIR/compositor.log" 2>&1
 status=$?
 set -e
