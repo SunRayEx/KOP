@@ -1215,9 +1215,13 @@ int main(int argc, char** argv) {
 
     kopms::SeatSession seat_session(options.seat, options.allow_unmanaged_drm);
     bool direct_requested = options.direct_drm;
+    KOP_LOG_INFO(kTag, "DRM direct requested=%s device=%s allow_unmanaged=%s",
+                 direct_requested ? "yes" : "no", options.drm_device.c_str(),
+                 options.allow_unmanaged_drm ? "yes" : "no");
     bool seat_session_started = false;
     if (direct_requested) {
         std::string seat_error;
+        KOP_LOG_INFO(kTag, "starting DRM seat session (seat=%s)", options.seat.c_str());
         const bool seat_started = seat_session.start(
             [&](kopms::SeatSessionState state, const std::string& reason) {
                 // The first Active notification is emitted by SeatSession
@@ -1235,6 +1239,8 @@ int main(int argc, char** argv) {
         } else {
             seat_session_started = true;
             std::string output_error;
+            KOP_LOG_INFO(kTag, "starting direct DRM output on %s",
+                         options.drm_device.c_str());
             if (!direct_output.start(&seat_session, options.drm_device,
                                      direct_state_changed, &output_error)) {
                 KOP_LOG_WARN(kTag, "DRM 物理直出启动失败：%s；回退 nested",

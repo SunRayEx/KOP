@@ -71,6 +71,7 @@ timeout --signal=TERM --kill-after=5 "$((SECONDS_RUN + 8))" \
 status=$?
 set -e
 cat "$LOG_DIR/compositor.log"
+echo "DRM direct compositor exit status=$status" >&2
 
 if grep -qE 'DRM master 失败: Device or resource busy|取得 DRM master 失败: Device or resource busy' "$LOG_DIR/compositor.log"; then
     echo "DRM device is busy; current holders:" >&2
@@ -95,6 +96,8 @@ elif grep -qE 'page-flip|atomic modeset active|DRM 直出|DRM 输出' "$LOG_DIR/
     echo "DRM direct smoke completed; inspect $LOG_DIR/compositor.log"
 else
     echo "DRM direct smoke did not show expected KMS markers" >&2
+    echo "Last compositor log lines:" >&2
+    tail -80 "$LOG_DIR/compositor.log" >&2 || true
     exit 1
 fi
 # timeout(124/143) is expected when the compositor is intentionally time-bounded.
