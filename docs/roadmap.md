@@ -104,7 +104,7 @@
 
 ## 后续
 
-- [ ] **KOPNET 透明远程控制层**（见 docs/kopnet-design.md）：三层模型
+- [x] **KOPNET 透明远程控制层**（见 docs/kopnet-design.md）：三层模型
       （应用 → Tunnel → ProtocolAdapter → Transport）已落地，隧道多路复用 /
       credit 回压 / SCM_RIGHTS fd 透传 / kopnet-relay（含 --stdio SSH 伙伴模式）/
       KOPMS remote_session（HELLO 协商、帧提交与 Retain/release 回路、
@@ -115,8 +115,8 @@
       remote_session（服务端主动 GOODBYE / 断开时在途帧回放 DROPPED，重连后
       由应用重新协商继续提交）；RTP 适配器（RFC 3550 报文分帧、会话化 UDP、
       回绕序号丢包/重复统计、RTCP 复用跳过、MTU 守卫）已落地，`rtp://` URI
-      支持 pt/clock/ts_step/fps/ssrc 参数；剩余 RTC/RDP 适配器需 DTLS-SRTP/ICE
-      栈，离线环境不可引入
+      支持 pt/clock/ts_step/fps/ssrc 参数；隧道协议 version 2 已将 channel ID
+      扩展为 16bit；剩余 RTC/RDP 适配器需 DTLS-SRTP/ICE 栈，离线环境不可引入
 - [ ] 硬解零拷贝跨后端：CUVID（CUDA）原生导出需 EGL/DMA-BUF 互操作；
   NV12/P010 之外的原生表面格式按需扩展导出器
 - [x] 播放器本地 Vulkan 导入失败时动态回退 CPU 路径：RenderNode 丢弃失败的

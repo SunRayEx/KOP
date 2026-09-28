@@ -15,7 +15,7 @@
 ├──────────────────────────────────────────────────────────┤
 │  Tunnel（kopnet/tunnel）                                   │
 │  · 逻辑 Channel 多路复用（kind 区分流，id 奇偶分配）        │
-│  · 20B 定长帧头 + payload（流式精确读取状态机）             │
+│  · 20B 定长帧头（version 2，16bit channel_id）+ payload       │
 │  · 控制消息：HELLO / OPEN / OPEN_ACK / CLOSE / CREDIT      │
 │  · credit 有界队列回压（端到端可阻塞）                     │
 │  · SCM_RIGHTS fd 透传（对齐 BUS2LAYER 语义）               │
@@ -85,11 +85,16 @@ KOPNET 范围）；不支持 fd 透传（UDP 无 SCM_RIGHTS 语义）；不做 S
 
 ### 帧（小端）
 
+固定 20 字节帧头，当前为协议 version 2。`channel_id` 使用 16bit，避免
+双向多路复用达到 256 个本地通道后被静默截断。
+
 ```
-magic(4) "KPNT" | version(2) | flags(2) | channel_id(4)
-payload_len(4)  | reserved(4)
+magic(4) "KPNT" | version(1) | flags(1) | channel_id(2)
+sequence(4)      | payload_len(4) | fd_count(4)
 payload（payload_len 字节）
 ```
+
+version 1 不兼容：它将 channel id 编码为 8bit；实现拒绝非当前版本帧。
 
 - 流式传输上，一帧可能跨多次 `read`；状态机按 `payload_len` 精确读取到帧边界
   才投递，**fd 归属因此永远明确**（SCM_RIGHTS 只能随某一次 recvmsg 到达，
