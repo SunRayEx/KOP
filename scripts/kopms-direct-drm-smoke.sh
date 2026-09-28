@@ -63,6 +63,18 @@ status=$?
 set -e
 cat "$LOG_DIR/compositor.log"
 
+if grep -qE 'DRM master 失败: Device or resource busy|取得 DRM master 失败: Device or resource busy' "$LOG_DIR/compositor.log"; then
+    echo "DRM device is busy; current holders:" >&2
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -v "$DEVICE" 2>&1 || true
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof "$DEVICE" 2>&1 || true
+    else
+        echo "install util-linux (fuser) or lsof for holder diagnostics" >&2
+    fi
+    echo "Stop the active display compositor/session before retrying; do not force-kill it from this script." >&2
+fi
+
 if grep -qE 'page-flip|atomic modeset active|DRM 直出|DRM 输出' "$LOG_DIR/compositor.log"; then
     echo "DRM direct smoke completed; inspect $LOG_DIR/compositor.log"
 else
