@@ -52,6 +52,15 @@ args=("$SOCKET" "$SECONDS_RUN" --direct-drm --drm-device "$DEVICE" --watch-drm)
 [[ -n "${KOPMS_COLORSPACE:-}" ]] && args+=(--colorspace "$KOPMS_COLORSPACE")
 [[ -n "${KOPMS_HDR:-}" ]] && args+=(--hdr "$KOPMS_HDR")
 
+# 混合显卡机器上，direct DRM 的 scanout GPU 必须尽量与 Vulkan
+# render GPU 一致。该变量传给 KOPMS VulkanScene，用于选择同卡设备。
+if [[ -n "${KOPMS_VULKAN_DEVICE_NAME:-}" ]]; then
+    export KOPMS_VULKAN_DEVICE_NAME
+    echo "Vulkan device preference=$KOPMS_VULKAN_DEVICE_NAME"
+fi
+
+# 可选的真实 page-flip 成功判定；默认仍保留旧 smoke 的能力探测语义。
+REQUIRE_FLIP=${KOPMS_REQUIRE_PAGE_FLIP:-0}
 echo "DRM device=$DEVICE socket=$SOCKET runtime=$RUNTIME_DIR"
 # export 在 timeout/env 的两层进程中都明确生效，避免 TTY 的 /run/user/0 泄漏。
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
@@ -75,7 +84,14 @@ if grep -qE 'DRM master 失败: Device or resource busy|取得 DRM master 失败
     echo "Stop the active display compositor/session before retrying; do not force-kill it from this script." >&2
 fi
 
-if grep -qE 'page-flip|atomic modeset active|DRM 直出|DRM 输出' "$LOG_DIR/compositor.log"; then
+if [[ "$REQUIRE_FLIP" == 1 ]]; then
+    if grep -qE 'page-flip event received|DRM page-flip completed|page-flip 完成' "$LOG_DIR/compositor.log"; then
+        echo "DRM direct smoke page-flip succeeded; inspect $LOG_DIR/compositor.log"
+    else
+        echo "DRM direct smoke did not receive a page-flip event" >&2
+        exit 1
+    fi
+elif grep -qE 'page-flip|atomic modeset active|DRM 直出|DRM 输出' "$LOG_DIR/compositor.log"; then
     echo "DRM direct smoke completed; inspect $LOG_DIR/compositor.log"
 else
     echo "DRM direct smoke did not show expected KMS markers" >&2

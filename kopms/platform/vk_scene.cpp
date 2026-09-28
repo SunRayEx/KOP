@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <utility>
@@ -876,10 +877,15 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
     // （仅 LINEAR modifier 可导入，KOPAW 直通帧将按格式拒收并回退）。
     std::vector<const char*> full_exts = device_exts;
     full_exts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
-    if (!vkutil::pick_and_create_device(full_exts, &s.ctx, error)) {
+    const char* preferred_device = std::getenv("KOPMS_VULKAN_DEVICE_NAME");
+    const std::string preferred_name = preferred_device ? preferred_device : "";
+    if (!preferred_name.empty()) {
+        KOP_LOG_INFO(kTag, "Vulkan GPU preference=%s", preferred_name.c_str());
+    }
+    if (!vkutil::pick_and_create_device(full_exts, &s.ctx, error, preferred_name)) {
         KOP_LOG_WARN(kTag, "DRM modifier 导入不可用，降级无 modifier 设备（%s）",
                      error ? error->c_str() : "");
-        if (!vkutil::pick_and_create_device(device_exts, &s.ctx, error)) return true;
+        if (!vkutil::pick_and_create_device(device_exts, &s.ctx, error, preferred_name)) return true;
     }
     s.queue = s.ctx.graphics_queue;
 

@@ -878,6 +878,7 @@ void DrmKmsSession::page_flip_event(int fd, unsigned int frame, unsigned int sec
     session->page_flip_pending_ = false;
     std::function<void()> handler = std::move(session->page_flip_handler_);
     session->page_flip_handler_ = {};
+    KOP_LOG_INFO("kopms-drm", "DRM page-flip event received frame=%u", frame);
     if (handler) handler();
 }
 
