@@ -20,6 +20,9 @@ RUNTIME_OWNED=0
 if [[ -z "${KOPMS_RUNTIME_DIR:-}" ]]; then RUNTIME_OWNED=1; fi
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
+# 同一 socket 名可能被上一次异常退出留下；只清理本次私有 runtime 中的文件。
+rm -f "$RUNTIME_DIR/$SOCKET" "$RUNTIME_DIR/$SOCKET.lock" \
+      "$RUNTIME_DIR/$SOCKET.bus" "$RUNTIME_DIR/$SOCKET.bus.lock"
 [[ -d "$RUNTIME_DIR" && -w "$RUNTIME_DIR" ]] || {
     echo "XDG_RUNTIME_DIR is not writable: $RUNTIME_DIR" >&2
     exit 2
@@ -48,9 +51,12 @@ args=("$SOCKET" "$SECONDS_RUN" --direct-drm --drm-device "$DEVICE" --watch-drm)
 [[ -n "${KOPMS_COLORSPACE:-}" ]] && args+=(--colorspace "$KOPMS_COLORSPACE")
 [[ -n "${KOPMS_HDR:-}" ]] && args+=(--hdr "$KOPMS_HDR")
 
+echo "DRM device=$DEVICE socket=$SOCKET runtime=$RUNTIME_DIR"
+# export 在 timeout/env 的两层进程中都明确生效，避免 TTY 的 /run/user/0 泄漏。
+export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+unset WAYLAND_DISPLAY WAYLAND_SOCKET
 set +e
 timeout --signal=TERM --kill-after=5 "$((SECONDS_RUN + 8))" \
-    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY= \
     "$COMPOSITOR" "${args[@]}" >"$LOG_DIR/compositor.log" 2>&1
 status=$?
 set -e
