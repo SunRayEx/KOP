@@ -420,7 +420,8 @@ struct TunnelSession::Impl {
             if (!decode_tunnel_header(rx_.data(), rx_.size(), &rx_hdr_) ||
                 rx_hdr_.magic != KOPNET_TUNNEL_MAGIC ||
                 rx_hdr_.version != KOPNET_TUNNEL_VERSION ||
-                rx_hdr_.payload_len > opts_.max_frame) {
+                rx_hdr_.payload_len > opts_.max_frame ||
+                rx_hdr_.channel_id == UINT16_MAX) {
                 last_error_ = "隧道帧头非法";
                 log(last_error_);
                 return ReadResult::Error;
@@ -457,7 +458,7 @@ struct TunnelSession::Impl {
                 h.magic = KOPNET_TUNNEL_MAGIC;
                 h.version = KOPNET_TUNNEL_VERSION;
                 h.flags = KOPNET_TUNNEL_FLAG_NONE;
-                h.channel_id = static_cast<uint8_t>(ch->id);
+                h.channel_id = static_cast<uint16_t>(ch->id);
                 h.sequence = ch->next_send_seq++;
                 h.payload_len = static_cast<uint32_t>(pkt.data.size());
                 h.fd_count = static_cast<uint32_t>(pkt.fds.size());

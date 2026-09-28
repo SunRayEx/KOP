@@ -7,8 +7,7 @@
 //   0     4     magic = 'KPNT' (0x4B504E54)
 //   4     1     version
 //   5     1     flags      (bit1 = control)
-//   6     1     channel_id (0 = 控制通道)
-//   7     1     reserved
+//   6     2     channel_id (0 = 控制通道)
 //   8     4     sequence   （每通道单调；数据帧携带，控制帧为 0）
 //   12    4     payload_len
 //   16    4     fd_count   （仅信息量；fd 由 stream 传输经 SCM_RIGHTS 随行）
@@ -33,7 +32,9 @@ namespace kopnet {
 
 #define KOPNET_TUNNEL_MAGIC UINT32_C(0x4B504E54)
 #define KOPNET_TUNNEL_HEADER_SIZE 20
-#define KOPNET_TUNNEL_VERSION 1
+// Version 2 widens the fixed-header channel id to uint16_t. Version 1 could
+// silently truncate locally allocated ids above 255.
+#define KOPNET_TUNNEL_VERSION 2
 // 通道标识字符串上限（如 "media" / "control" / "input"）
 #define KOPNET_TUNNEL_KIND_MAX 16
 
@@ -103,8 +104,7 @@ struct TunnelHeader {
     uint32_t magic = 0;
     uint8_t version = 0;
     uint8_t flags = 0;
-    uint8_t channel_id = 0;
-    uint8_t reserved = 0;
+    uint16_t channel_id = 0;
     uint32_t sequence = 0;
     uint32_t payload_len = 0;
     uint32_t fd_count = 0;

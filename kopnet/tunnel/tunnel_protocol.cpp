@@ -10,8 +10,8 @@ void encode_tunnel_header(const TunnelHeader& h, uint8_t* out) {
     for (int i = 0; i < 4; ++i) out[i] = static_cast<uint8_t>((magic >> (8 * i)) & 0xff);
     out[4] = h.version;
     out[5] = h.flags;
-    out[6] = h.channel_id;
-    out[7] = h.reserved;
+    out[6] = static_cast<uint8_t>(h.channel_id & 0xff);
+    out[7] = static_cast<uint8_t>((h.channel_id >> 8) & 0xff);
     uint32_t seq = h.sequence;
     for (int i = 0; i < 4; ++i)
         out[8 + i] = static_cast<uint8_t>((seq >> (8 * i)) & 0xff);
@@ -30,8 +30,8 @@ bool decode_tunnel_header(const uint8_t* data, size_t size, TunnelHeader* h) {
     h->magic = magic;
     h->version = data[4];
     h->flags = data[5];
-    h->channel_id = data[6];
-    h->reserved = data[7];
+    h->channel_id = static_cast<uint16_t>(data[6]) |
+                    (static_cast<uint16_t>(data[7]) << 8);
     uint32_t seq = 0;
     for (int i = 0; i < 4; ++i) seq |= static_cast<uint32_t>(data[8 + i]) << (8 * i);
     h->sequence = seq;
