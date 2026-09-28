@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "kopnet/adapters.hpp"
+#include "../tunnel/tunnel_protocol.hpp"
 
 namespace {
 
@@ -40,6 +41,38 @@ std::unique_ptr<TunnelSession> make_peer(kopnet::Transport* raw, bool dialer) {
     CHECK(session != nullptr, error.c_str());
     CHECK(session->start(&error), error.c_str());
     return session;
+}
+
+void test_tunnel_header_v2() {
+    kopnet::TunnelHeader header;
+    header.magic = KOPNET_TUNNEL_MAGIC;
+    header.version = KOPNET_TUNNEL_VERSION;
+    header.flags = KOPNET_TUNNEL_FLAG_NONE;
+    header.channel_id = 0x1234;
+    header.sequence = 0x01020304;
+    header.payload_len = 4096;
+    header.fd_count = 2;
+
+    uint8_t wire[KOPNET_TUNNEL_HEADER_SIZE] = {};
+    kopnet::encode_tunnel_header(header, wire);
+    CHECK(wire[6] == 0x34 && wire[7] == 0x12,
+          "16-bit channel id 未按小端编码");
+
+    kopnet::TunnelHeader decoded;
+    CHECK(kopnet::decode_tunnel_header(wire, sizeof(wire), &decoded),
+          "帧头解码失败");
+    CHECK(decoded.magic == header.magic && decoded.version == header.version,
+          "帧头版本或 magic 不一致");
+    CHECK(decoded.channel_id == header.channel_id,
+          "16-bit channel id 解码不一致");
+    CHECK(decoded.sequence == header.sequence &&
+              decoded.payload_len == header.payload_len &&
+              decoded.fd_count == header.fd_count,
+          "帧头数值字段解码不一致");
+
+    CHECK(!kopnet::decode_tunnel_header(wire, KOPNET_TUNNEL_HEADER_SIZE - 1,
+                                        &decoded),
+          "截断帧头不应解码成功");
 }
 
 void test_basic_multiplex() {
@@ -356,6 +389,7 @@ void test_mode_mismatch() {
 }  // namespace
 
 int main() {
+    test_tunnel_header_v2();
     test_basic_multiplex();
     test_fd_passing();
     test_credit_backpressure();
