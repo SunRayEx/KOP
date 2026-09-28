@@ -116,7 +116,9 @@
       由应用重新协商继续提交）；RTP 适配器（RFC 3550 报文分帧、会话化 UDP、
       回绕序号丢包/重复统计、RTCP 复用跳过、MTU 守卫）已落地，`rtp://` URI
       支持 pt/clock/ts_step/fps/ssrc 参数；隧道协议 version 2 已将 channel ID
-      扩展为 16bit；剩余 RTC/RDP 适配器需 DTLS-SRTP/ICE 栈，离线环境不可引入
+      扩展为 16bit；SDK 已将 KOPNET 定义为网络传输管线入口，支持主/备用 URI、
+      自动故障转移、按 kind 的 Stream/Datagram 通道和发送/接收字节统计；剩余
+      RTC/RDP 适配器需 DTLS-SRTP/ICE 栈，离线环境不可引入
 - [ ] 硬解零拷贝跨后端：CUVID（CUDA）原生导出需 EGL/DMA-BUF 互操作；
   NV12/P010 之外的原生表面格式按需扩展导出器
 - [x] 播放器本地 Vulkan 导入失败时动态回退 CPU 路径：RenderNode 丢弃失败的

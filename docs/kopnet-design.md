@@ -288,6 +288,25 @@ env RUSTUP_TOOLCHAIN=nightly cmake --build --preset relwithdebinfo --target kopn
 ctest -R kopnet                 # 在 build/relwithdebinfo 下
 ```
 
+## SDK 传输管线入口
+
+KOPNET 后续开发统一以“网络传输管线”为主路径：应用通过 `kop::sdk::NetTunnel`
+进入 URI 驱动的 Transport → Tunnel → logical Channel 管线，不在应用层直接依赖
+socket、RTP framing 或重连实现。推荐约定如下：
+
+- 控制、配置、文件和可靠事件使用 `ordered=true` 的 Stream channel；
+- 实时媒体、遥测和可丢弃事件使用 `ordered=false` 的 Datagram channel；
+- 需要 FD/DMA-BUF 透传时使用 net nodes，SDK facade 只搬字节；
+- 主端点不可用时在 `fallback_endpoints` 提供备用 URI，拨号端由
+  `ResilientSession` 自动故障转移；
+- 生产应用使用 `wait_connected()` 作为首连屏障，以 `on_state` 驱动业务状态机，
+  以 `stats()`/`stats_json()` 记录帧数和字节数；
+- send 回压超时通过 `send_timeout_ms` 显式配置，禁止在回调线程内调用 `close()`。
+
+该 facade 是接下来网络输入、远程 KOPMS 控制和跨进程媒体管线的稳定 SDK 边界。
+RTC/RDP 仍保持未实现状态，待外部 DTLS-SRTP/ICE 栈可用后再增加 adapter，不能在
+SDK 层伪造可靠性或加密能力。
+
 ## 后续
 
 - [x] `kopnet/remote/remote_session.{hpp,cpp}`：KOPMS 远程会话（HELLO 协商、

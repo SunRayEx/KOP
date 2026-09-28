@@ -36,7 +36,9 @@ namespace kop {
 namespace sdk {
 
 struct NetTunnelOptions {
-    std::string uri;  // tcp:// udp:// unix:// ssh:// rtp:// relay:// …
+    std::string uri;  // 主端点：tcp:// udp:// unix:// ssh:// rtp:// relay:// …
+    // 拨号端故障转移端点，按优先级排列；服务端忽略该字段。
+    std::vector<std::string> fallback_endpoints;
 
     // true = 在 uri 上监听（Serve 角色）；false = 拨号（Connect 角色）。
     bool serve = false;
@@ -57,11 +59,14 @@ struct NetTunnelOptions {
     uint32_t reconnect_base_ms = 500;   // 首次重连延迟（后续指数退避）
     uint32_t reconnect_max_ms = 5000;   // 退避上限
     int handshake_ms = 5000;            // HELLO 握手超时
+    int send_timeout_ms = 2000;          // 单次 send 的回压等待上限
 };
 
 struct NetTunnelStats {
     uint64_t frames_sent = 0;
     uint64_t frames_received = 0;
+    uint64_t bytes_sent = 0;
+    uint64_t bytes_received = 0;
     size_t channels = 0;
     bool connected = false;
 };

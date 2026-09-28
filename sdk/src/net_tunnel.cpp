@@ -55,6 +55,8 @@ struct NetTunnel::Impl {
     std::map<std::string, uint32_t> kinds;  // kind -> 通道号
     std::atomic<uint64_t> frames_sent{0};
     std::atomic<uint64_t> frames_received{0};
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_received{0};
 
     void log(const std::string& msg) const {
         if (options.on_log) {
@@ -67,6 +69,7 @@ struct NetTunnel::Impl {
     // 工作线程上投递数据回调
     void dispatch(const std::string& kind, const uint8_t* data, size_t len) {
         frames_received.fetch_add(1, std::memory_order_relaxed);
+        bytes_received.fetch_add(len, std::memory_order_relaxed);
         if (options.on_data) options.on_data(kind, data, len);
     }
 
@@ -102,7 +105,9 @@ bool NetTunnel::start_dialer(std::string* error) {
 
     if (impl.options.auto_reconnect) {
         kopnet::ResilientSession::Options ropts;
-        ropts.endpoints = {impl.options.uri};
+        ropts.endpoints.push_back(impl.options.uri);
+        ropts.endpoints.insert(ropts.endpoints.end(), impl.options.fallback_endpoints.begin(),
+                               impl.options.fallback_endpoints.end());
         ropts.base_delay_ms = impl.options.reconnect_base_ms;
         ropts.max_delay_ms = impl.options.reconnect_max_ms;
         ropts.connect_timeout_ms = handshake;
@@ -287,7 +292,9 @@ bool NetTunnel::send(uint32_t channel, const void* data, size_t len,
         return false;
     }
     const auto* ptr = static_cast<const uint8_t*>(data);
-    constexpr int kSendTimeoutMs = 2000;
+    const int kSendTimeoutMs = impl.options.send_timeout_ms > 0
+                                   ? impl.options.send_timeout_ms
+                                   : 2000;
     kopnet::SendStatus st = kopnet::SendStatus::Error;
 
     if (impl.resilient) {
@@ -315,6 +322,7 @@ bool NetTunnel::send(uint32_t channel, const void* data, size_t len,
         return false;
     }
     impl.frames_sent.fetch_add(1, std::memory_order_relaxed);
+    impl.bytes_sent.fetch_add(len, std::memory_order_relaxed);
     return true;
 }
 
@@ -400,6 +408,8 @@ NetTunnelStats NetTunnel::stats() const {
     NetTunnelStats s;
     s.frames_sent = impl_->frames_sent.load(std::memory_order_relaxed);
     s.frames_received = impl_->frames_received.load(std::memory_order_relaxed);
+    s.bytes_sent = impl_->bytes_sent.load(std::memory_order_relaxed);
+    s.bytes_received = impl_->bytes_received.load(std::memory_order_relaxed);
     s.connected = connected();
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
@@ -413,7 +423,9 @@ std::string NetTunnel::stats_json() const {
     std::ostringstream os;
     os << "{\"connected\":" << (s.connected ? "true" : "false") << ",\"channels\":"
        << s.channels << ",\"frames_sent\":" << s.frames_sent
-       << ",\"frames_received\":" << s.frames_received << "}";
+       << ",\"frames_received\":" << s.frames_received
+       << ",\"bytes_sent\":" << s.bytes_sent
+       << ",\"bytes_received\":" << s.bytes_received << "}";
     return os.str();
 }
 
