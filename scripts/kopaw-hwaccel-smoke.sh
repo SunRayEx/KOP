@@ -29,6 +29,7 @@ for mode in none vaapi cuda auto; do
     set +e
     timeout --signal=TERM --kill-after=5 "$((DURATION + 15))" \
         env KOPAW_HWACCEL="$mode" \
+        KOPAW_VK_DEVICE="${KOPAW_VK_DEVICE:-}" \
         "$PLAYER" "$MEDIA" --duration "$DURATION" >"$log" 2>&1
     status=$?
     set -e

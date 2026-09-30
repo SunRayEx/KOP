@@ -1172,6 +1172,9 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
         }
         if (!describe_ycbcr_frame(frame, &config, &err) ||
             !(yuv = ensure_yuv_pipeline(config, w, h, &err))) {
+            // A modifier or YCbCr capability mismatch is a per-frame import
+            // failure, not a lost Vulkan device. RenderNode can then disable
+            // native decoder output and continue with CPU frames.
             KOP_LOG_ERROR(kTag, "%s", err.c_str());
             return false;
         }
@@ -1189,8 +1192,9 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
 
     if (native_yuv) {
         if (!import_yuv(cur_tex_, frame, *yuv, &err)) {
+            // Import rejection is recoverable: the decoder fallback callback
+            // will switch subsequent frames to system memory.
             KOP_LOG_ERROR(kTag, "%s", err.c_str());
-            device_lost_ = true;
             return false;
         }
     } else {

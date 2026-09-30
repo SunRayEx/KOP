@@ -98,11 +98,19 @@ int32_t RenderNode::run_impl() {
         }
         backend_->poll_events();
         const bool external = f->memory_type == KOPAW_MEMORY_DMABUF;
+        // The decoder may already have queued a few native frames when the
+        // first import fails. Do not retry those stale DMA-BUF frames after
+        // switching the producer to CPU output.
+        if (external && dmabuf_disabled_) {
+            f->release(f);
+            continue;
+        }
         bool ok = backend_->draw(f);
         f->release(f);
         if (!ok) {
             if (external && !dmabuf_fallback_used_ && dmabuf_fallback_) {
                 dmabuf_fallback_used_ = true;
+                dmabuf_disabled_ = true;
                 KOP_LOG_WARN(kTag,
                              "DMA-BUF 导入失败，关闭解码器原生输出并回退 CPU 路径");
                 dmabuf_fallback_();

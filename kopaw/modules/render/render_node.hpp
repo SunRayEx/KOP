@@ -42,7 +42,11 @@ private:
     std::atomic<bool> close_requested_{false};
     std::function<void()> dmabuf_fallback_;
     std::function<void(uint32_t)> dmabuf_capability_callback_;
+    // Once native import fails, decoder output is switched asynchronously. Keep
+    // discarding already queued DMA-BUF frames until the CPU path catches up;
+    // a second stale external frame must not terminate the render node.
     bool dmabuf_fallback_used_ = false;
+    bool dmabuf_disabled_ = false;
 };
 
 }  // namespace kopaw
