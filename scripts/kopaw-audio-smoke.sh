@@ -9,12 +9,16 @@ PLAYER="$BUILD_DIR/kopaw/kopaw-player"
 DURATION=${KOPAW_AUDIO_DURATION:-5}
 BACKEND=${KOPAW_AUDIO_BACKEND:-auto}
 DEVICE=${KOPAW_AUDIO_DEVICE:-}
+LIST_DEVICES=${KOPAW_AUDIO_LIST_DEVICES:-0}
 REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
 REQUIRE_BALANCED=${KOPAW_AUDIO_REQUIRE_BALANCED:-0}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
 [[ -x "$PLAYER" ]] || { echo "missing $PLAYER" >&2; exit 2; }
+if [[ "$LIST_DEVICES" == 1 ]]; then
+    exec "$PLAYER" --list-audio-devices
+fi
 if (($# == 0)); then
     echo "usage: $0 audio-file [...]" >&2
     exit 2

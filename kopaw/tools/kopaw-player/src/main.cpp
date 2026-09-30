@@ -230,6 +230,12 @@ int main(int argc, char** argv) {
     }
 
     // ---- 全局子系统 ----
+    if (!audio_backend.empty() && audio_backend != "auto" &&
+        audio_backend != "alsa" && audio_backend != "null") {
+        KOP_LOG_ERROR(kTag, "不支持的 --audio-backend: %s（可选 auto|alsa|null）",
+                      audio_backend.c_str());
+        return 2;
+    }
     if (!audio_backend.empty()) setenv("KOPAW_AUDIO_BACKEND", audio_backend.c_str(), 1);
     if (!audio_device.empty()) setenv("KOPAW_AUDIO_DEVICE", audio_device.c_str(), 1);
     bool pa_inited = false, glfw_inited = false;
