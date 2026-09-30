@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <sys/stat.h>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -105,14 +106,28 @@ int main(int argc, char** argv) {
         const char* runtime = std::getenv("XDG_RUNTIME_DIR");
         const char* wayland = std::getenv("WAYLAND_DISPLAY");
         const char* pulse = std::getenv("PULSE_SERVER");
+        auto socket_exists = [runtime](const char* suffix) {
+            if (!runtime || !runtime[0]) return false;
+            std::string path = std::string(runtime) + "/" + suffix;
+            struct stat st{};
+            return stat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode);
+        };
         std::printf("runtime_dir=%s\n", runtime ? runtime : "");
         std::printf("wayland_display=%s\n", wayland ? wayland : "");
         std::printf("pulse_server=%s\n", pulse ? pulse : "");
+        std::printf("pipewire_socket=%s\n", socket_exists("pipewire-0") ? "yes" : "no");
+        std::printf("pulse_socket=%s\n", socket_exists("pulse/native") ? "yes" : "no");
         if (Pa_Initialize() != paNoError) {
             KOP_LOG_ERROR(kTag, "PortAudio 初始化失败");
             return 1;
         }
         const PaDeviceIndex device = Pa_GetDefaultOutputDevice();
+        const int host_count = Pa_GetHostApiCount();
+        std::printf("host_api_count=%d\n", host_count);
+        for (int i = 0; i < host_count; ++i) {
+            const PaHostApiInfo* host = Pa_GetHostApiInfo(i);
+            if (host) std::printf("host_api[%d]=%s\n", i, host->name);
+        }
         const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
         const PaHostApiInfo* api = info ? Pa_GetHostApiInfo(info->hostApi) : nullptr;
         std::printf("default_device=%d\n", static_cast<int>(device));
