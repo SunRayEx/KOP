@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <sys/stat.h>
 
 #include "../frame.hpp"
@@ -79,7 +80,8 @@ bool AudioSinkNode::open(std::string* error) {
         const int count = Pa_GetDeviceCount();
         for (int i = 0; i < count; ++i) {
             const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
-            if (info && std::strstr(info->name, requested)) {
+            if (info && info->maxOutputChannels >= channels_ &&
+                ::strcasestr(info->name, requested)) {
                 device = i;
                 break;
             }
@@ -103,8 +105,11 @@ bool AudioSinkNode::open(std::string* error) {
         }
     }
     const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
-    if (!info) {
-        *error = "PortAudio 没有可用的默认输出设备";
+    if (!info || info->maxOutputChannels < channels_) {
+        *error = "PortAudio 没有满足声道数要求的输出设备";
+        if (device != paNoDevice) {
+            KOP_LOG_WARN(kTag, "默认设备不可用：需要 %d 声道", channels_);
+        }
         return false;
     }
     const PaHostApiInfo* api = Pa_GetHostApiInfo(info->hostApi);
