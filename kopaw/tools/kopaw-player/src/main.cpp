@@ -67,7 +67,6 @@ void usage() {
             "  --no-audio  禁用音频\n"
             "  --no-video  禁用视频\n"
             "  --duration SEC  最长播放媒体秒数后退出\n"
-            "  KOPAW_AUDIO_DEVICE=NAME  选择音频输出设备（默认优先 pipewire/pulse）\n"
             "  --filter SPEC   滤镜链；video:... 或 audio:...，可重复\n"
             "  --timeout-ms N  网络输入单次 I/O 超时（默认 15000，0 = 不设上限）\n"
             "  --buffer-ms N   网络抖动缓冲（默认 250）\n"
