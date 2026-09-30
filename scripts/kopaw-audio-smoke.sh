@@ -43,7 +43,8 @@ for media in "$@"; do
     if [[ "$status" != 0 && "$status" != 124 && "$status" != 143 ]]; then
         echo "RESULT status=$status classification=process-failure log=$log" >&2
         fail=1
-    elif grep -aEq '音频输出设备:|音频输出后端: null' "$log" && grep -aFq 'state":"2"' "$log"; then
+    elif grep -aEq '音频输出设备:|音频输出后端: null' "$log" &&
+         { grep -aFq 'state":"2"' "$log" || grep -aFq '播放完成' "$log"; }; then
         if [[ "$dropped" != 0 && "$REQUIRE_NO_DROP" == 1 ]]; then
             echo "RESULT status=$status classification=audio-dropped dropped=$dropped log=$log" >&2
             fail=1
