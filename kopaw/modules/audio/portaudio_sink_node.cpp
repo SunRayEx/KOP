@@ -56,6 +56,12 @@ AudioSinkNode::~AudioSinkNode() {
 }
 
 bool AudioSinkNode::open(std::string* error) {
+    const char* backend = std::getenv("KOPAW_AUDIO_BACKEND");
+    if (backend && std::strcmp(backend, "null") == 0) {
+        null_backend_ = true;
+        KOP_LOG_INFO(kTag, "音频输出后端: null（仅消费数据，不连接音频设备）");
+        return true;
+    }
     const char* requested = std::getenv("KOPAW_AUDIO_DEVICE");
     PaDeviceIndex device = paNoDevice;
     if (requested && requested[0] != '\0') {
@@ -133,12 +139,20 @@ int32_t AudioSinkNode::send_impl(KopawFrame* f) {
     if (f->flags & KOPAW_FRAME_FLAG_EOS) {
         eos_.store(true, std::memory_order_release);
         f->release(f);
+        if (null_backend_ && node_id_ != 0) kopaw_node_sink_done(g_, node_id_);
         return KOPAW_OK;
     }
     const uint8_t* input = cpu_data(f);
     if (!input) return KOPAW_E_INVALID;
     const float* p = reinterpret_cast<const float*>(input);
     size_t left = f->size / sizeof(float);
+    if (null_backend_) {
+        const size_t frames = left / static_cast<size_t>(channels_);
+        const uint64_t consumed = consumed_frames_.fetch_add(frames) + frames;
+        kopaw_graph_clock_set(g_, static_cast<int64_t>(consumed * 1000000ULL / rate_));
+        f->release(f);
+        return KOPAW_OK;
+    }
     while (left > 0) {
         size_t n = ring_.write(p, left);
         p += n;

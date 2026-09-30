@@ -41,6 +41,7 @@ private:
     uint32_t node_id_ = 0;
 
     PaStream* stream_ = nullptr;
+    bool null_backend_ = false;
     kop::SpscRingF32 ring_;
     size_t prime_target_;      // 起播前预缓冲（浮点样本数）
     bool primed_ = false;

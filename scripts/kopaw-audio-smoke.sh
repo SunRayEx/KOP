@@ -39,9 +39,9 @@ for media in "$@"; do
     if [[ "$status" != 0 && "$status" != 124 && "$status" != 143 ]]; then
         echo "RESULT status=$status classification=process-failure log=$log" >&2
         fail=1
-    elif grep -q '音频输出设备:' "$log" && grep -q 'state":"2"' "$log"; then
+    elif grep -qE '音频输出设备:|音频输出后端: null' "$log" && grep -q 'state":"2"' "$log"; then
         echo "RESULT status=$status classification=audio-playback-complete log=$log"
-    elif grep -q '音频输出设备:' "$log"; then
+    elif grep -qE '音频输出设备:|音频输出后端: null' "$log"; then
         echo "RESULT status=$status classification=audio-output-opened log=$log"
         fail=1
     else

@@ -159,7 +159,9 @@ int main(int argc, char** argv) {
 
     // ---- 全局子系统 ----
     bool pa_inited = false, glfw_inited = false;
-    if (want_audio) {
+    const bool null_audio = std::getenv("KOPAW_AUDIO_BACKEND") &&
+                            std::strcmp(std::getenv("KOPAW_AUDIO_BACKEND"), "null") == 0;
+    if (want_audio && !null_audio) {
         if (Pa_Initialize() != paNoError) {
             KOP_LOG_ERROR(kTag, "PortAudio 初始化失败");
             return 1;
