@@ -8,6 +8,7 @@ BUILD_DIR=${KOP_BUILD_DIR:-$ROOT/build/relwithdebinfo}
 PLAYER="$BUILD_DIR/kopaw/kopaw-player"
 DURATION=${KOPAW_AUDIO_DURATION:-5}
 BACKEND=${KOPAW_AUDIO_BACKEND:-auto}
+DEVICE=${KOPAW_AUDIO_DEVICE:-}
 REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
 REQUIRE_BALANCED=${KOPAW_AUDIO_REQUIRE_BALANCED:-0}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
@@ -31,10 +32,14 @@ for media in "$@"; do
             -show_entries stream=codec_name,sample_rate,channels,channel_layout \
             -of default=noprint_wrappers=1 "$media" || true
     fi
+    player_args=("$PLAYER" "$media" --no-video --duration "$DURATION" \
+        --audio-backend "$BACKEND")
+    if [[ -n "$DEVICE" ]]; then
+        player_args+=(--audio-device "$DEVICE")
+    fi
     set +e
     timeout --signal=TERM --kill-after=5 "$((DURATION + 15))" \
-        env KOPAW_HWACCEL=none KOPAW_AUDIO_BACKEND="$BACKEND" \
-        "$PLAYER" "$media" --no-video --duration "$DURATION" >"$log" 2>&1
+        env KOPAW_HWACCEL=none "${player_args[@]}" >"$log" 2>&1
     status=$?
     set -e
     cat "$log"
