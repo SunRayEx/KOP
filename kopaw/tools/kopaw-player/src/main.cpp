@@ -2,6 +2,7 @@
 //
 // 用法：kopaw-player <file> [--backend vulkan|opengl] [--width W] [--height H]
 //                  [--no-audio] [--no-video] [--duration SEC]
+//                  [--audio-backend auto|alsa|null] [--audio-device name]
 //                  [--filter video:<chain>|audio:<chain>] [--plugin path --use node]
 //                  [--zero-copy on|off|auto] [--kopms-bus NAME] [--kopms-window ID]
 //
@@ -67,6 +68,8 @@ void usage() {
             "  --no-audio  禁用音频\n"
             "  --no-video  禁用视频\n"
             "  --duration SEC  最长播放媒体秒数后退出\n"
+            "  --audio-backend auto|alsa|null  音频输出模式\n"
+            "  --audio-device NAME  PortAudio 输出设备名（可选）\n"
             "  --filter SPEC   滤镜链；video:... 或 audio:...，可重复\n"
             "  --timeout-ms N  网络输入单次 I/O 超时（默认 15000，0 = 不设上限）\n"
             "  --buffer-ms N   网络抖动缓冲（默认 250）\n"
@@ -108,6 +111,8 @@ int main(int argc, char** argv) {
     std::string audio_filter_desc;
     std::string zero_copy_mode = "auto";
     std::string hdr_mode_str = "auto";  // on|off|auto
+    std::string audio_backend;
+    std::string audio_device;
     std::vector<std::pair<std::string, std::string>> input_opts;
 #if KOPAW_HAVE_KOPMS_SINK
     std::string kopms_bus;
@@ -124,6 +129,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-audio") want_audio = false;
         else if (a == "--no-video") want_video = false;
         else if (a == "--duration") duration = std::atof(next().c_str());
+        else if (a == "--audio-backend") audio_backend = next();
+        else if (a == "--audio-device") audio_device = next();
         else if (a == "--timeout-ms") timeout_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--buffer-ms") buffer_ms = static_cast<uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
         else if (a == "--zero-copy") zero_copy_mode = next();
@@ -158,6 +165,8 @@ int main(int argc, char** argv) {
     }
 
     // ---- 全局子系统 ----
+    if (!audio_backend.empty()) setenv("KOPAW_AUDIO_BACKEND", audio_backend.c_str(), 1);
+    if (!audio_device.empty()) setenv("KOPAW_AUDIO_DEVICE", audio_device.c_str(), 1);
     bool pa_inited = false, glfw_inited = false;
     const bool null_audio = std::getenv("KOPAW_AUDIO_BACKEND") &&
                             std::strcmp(std::getenv("KOPAW_AUDIO_BACKEND"), "null") == 0;
