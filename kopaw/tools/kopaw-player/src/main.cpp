@@ -17,6 +17,7 @@
 // destroy 回调负责；player 不再手动 delete。因此所有可能失败的 open/创建
 // 都放在入图之前完成。
 #include <atomic>
+#include <cstdio>
 #include <vector>
 #include <thread>
 #include <cstring>
@@ -116,7 +117,7 @@ int main(int argc, char** argv) {
             const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
             if (!info || info->maxOutputChannels <= 0) continue;
             const PaHostApiInfo* api = Pa_GetHostApiInfo(info->hostApi);
-            std::printf("%sindex=%d name=%s host=%s outputs=%d default=%s\\n",
+            std::printf("%sindex=%d name=%s host=%s outputs=%d default=%s\n",
                         i == default_device ? "* " : "  ", static_cast<int>(i),
                         info->name, api ? api->name : "unknown",
                         info->maxOutputChannels,
