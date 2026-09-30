@@ -72,6 +72,7 @@ void usage() {
             "  --audio-backend auto|alsa|null  音频输出模式\n"
             "  --audio-device NAME  PortAudio 输出设备名（可选）\n"
             "  --list-audio-devices  列出音频输出设备后退出\n"
+            "  --audio-info  输出音频服务和默认设备信息后退出\n"
             "  --filter SPEC   滤镜链；video:... 或 audio:...，可重复\n"
             "  --timeout-ms N  网络输入单次 I/O 超时（默认 15000，0 = 不设上限）\n"
             "  --buffer-ms N   网络抖动缓冲（默认 250）\n"
@@ -99,6 +100,27 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         usage();
         return 2;
+    }
+    if (std::strcmp(argv[1], "--audio-info") == 0) {
+        const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+        const char* wayland = std::getenv("WAYLAND_DISPLAY");
+        const char* pulse = std::getenv("PULSE_SERVER");
+        std::printf("runtime_dir=%s\n", runtime ? runtime : "");
+        std::printf("wayland_display=%s\n", wayland ? wayland : "");
+        std::printf("pulse_server=%s\n", pulse ? pulse : "");
+        if (Pa_Initialize() != paNoError) {
+            KOP_LOG_ERROR(kTag, "PortAudio 初始化失败");
+            return 1;
+        }
+        const PaDeviceIndex device = Pa_GetDefaultOutputDevice();
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
+        const PaHostApiInfo* api = info ? Pa_GetHostApiInfo(info->hostApi) : nullptr;
+        std::printf("default_device=%d\n", static_cast<int>(device));
+        std::printf("default_name=%s\n", info ? info->name : "");
+        std::printf("default_host=%s\n", api ? api->name : "");
+        std::printf("default_outputs=%d\n", info ? info->maxOutputChannels : 0);
+        Pa_Terminate();
+        return info ? 0 : 1;
     }
     if (std::strcmp(argv[1], "--list-audio-devices") == 0) {
         if (Pa_Initialize() != paNoError) {
