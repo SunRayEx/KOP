@@ -10,7 +10,8 @@ RATE="${4:-30}"
 
 VCODEC=mpeg4
 EXTRA_V=""
-if ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '[[:space:]]libx264([[:space:]]|$)'; then
+encoders=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+if grep -Eq '[[:space:]]libx264([[:space:]]|$)' <<<"$encoders"; then
     VCODEC=libx264
     EXTRA_V="-preset ultrafast -crf 28"
 fi
