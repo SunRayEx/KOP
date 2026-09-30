@@ -1,5 +1,6 @@
 #include "portaudio_sink_node.hpp"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "../frame.hpp"
@@ -41,21 +42,31 @@ AudioSinkNode::~AudioSinkNode() {
 bool AudioSinkNode::open(std::string* error) {
     const char* requested = std::getenv("KOPAW_AUDIO_DEVICE");
     PaDeviceIndex device = paNoDevice;
-    if (requested && requested[0] != '\0') {
-        const int count = Pa_GetDeviceCount();
+    const int count = Pa_GetDeviceCount();
+    auto find_device = [count](const char* needle) {
         for (int i = 0; i < count; ++i) {
             const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
-            if (info && std::strstr(info->name, requested)) {
-                device = i;
-                break;
+            if (info && info->maxOutputChannels > 0 &&
+                std::strstr(info->name, needle)) {
+                return static_cast<PaDeviceIndex>(i);
             }
         }
+        return paNoDevice;
+    };
+    if (requested && requested[0] != '\0') {
+        device = find_device(requested);
         if (device == paNoDevice) {
             *error = std::string("找不到 PortAudio 输出设备: ") + requested;
             return false;
         }
     } else {
-        device = Pa_GetDefaultOutputDevice();
+        // Fedora desktops commonly expose PipeWire through ALSA PCM names.
+        // Prefer those names to avoid the default ALSA definition probing a
+        // long list of unavailable surround/HDMI PCMs. Fall back to the
+        // PortAudio default on systems without PipeWire compatibility names.
+        device = find_device("pipewire");
+        if (device == paNoDevice) device = find_device("pulse");
+        if (device == paNoDevice) device = Pa_GetDefaultOutputDevice();
     }
     const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
     if (!info) {
