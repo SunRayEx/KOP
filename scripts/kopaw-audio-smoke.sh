@@ -7,6 +7,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD_DIR=${KOP_BUILD_DIR:-$ROOT/build/relwithdebinfo}
 PLAYER="$BUILD_DIR/kopaw/kopaw-player"
 DURATION=${KOPAW_AUDIO_DURATION:-5}
+BACKEND=${KOPAW_AUDIO_BACKEND:-auto}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
@@ -30,7 +31,7 @@ for media in "$@"; do
     fi
     set +e
     timeout --signal=TERM --kill-after=5 "$((DURATION + 15))" \
-        env KOPAW_HWACCEL=none \
+        env KOPAW_HWACCEL=none KOPAW_AUDIO_BACKEND="$BACKEND" \
         "$PLAYER" "$media" --no-video --duration "$DURATION" >"$log" 2>&1
     status=$?
     set -e

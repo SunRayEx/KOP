@@ -62,6 +62,17 @@ bool AudioSinkNode::open(std::string* error) {
         KOP_LOG_INFO(kTag, "音频输出后端: null（仅消费数据，不连接音频设备）");
         return true;
     }
+    if (backend && std::strcmp(backend, "auto") != 0 &&
+        std::strcmp(backend, "alsa") != 0) {
+        *error = std::string("不支持的 KOPAW_AUDIO_BACKEND: ") + backend +
+                 "（可选 auto|alsa|null）";
+        return false;
+    }
+    if (!backend || std::strcmp(backend, "auto") == 0) {
+        KOP_LOG_INFO(kTag, "音频输出后端: auto（检测服务后使用系统默认输出）");
+    } else {
+        KOP_LOG_INFO(kTag, "音频输出后端: alsa（通过 PortAudio ALSA host）");
+    }
     const char* requested = std::getenv("KOPAW_AUDIO_DEVICE");
     PaDeviceIndex device = paNoDevice;
     if (requested && requested[0] != '\0') {
