@@ -70,6 +70,7 @@ void usage() {
             "  --duration SEC  最长播放媒体秒数后退出\n"
             "  --audio-backend auto|alsa|null  音频输出模式\n"
             "  --audio-device NAME  PortAudio 输出设备名（可选）\n"
+            "  --list-audio-devices  列出音频输出设备后退出\n"
             "  --filter SPEC   滤镜链；video:... 或 audio:...，可重复\n"
             "  --timeout-ms N  网络输入单次 I/O 超时（默认 15000，0 = 不设上限）\n"
             "  --buffer-ms N   网络抖动缓冲（默认 250）\n"
@@ -97,6 +98,32 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         usage();
         return 2;
+    }
+    if (std::strcmp(argv[1], "--list-audio-devices") == 0) {
+        if (Pa_Initialize() != paNoError) {
+            KOP_LOG_ERROR(kTag, "PortAudio 初始化失败");
+            return 1;
+        }
+        const PaDeviceIndex count = Pa_GetDeviceCount();
+        const PaDeviceIndex default_device = Pa_GetDefaultOutputDevice();
+        if (count < 0) {
+            KOP_LOG_ERROR(kTag, "PortAudio 枚举设备失败: %s",
+                          Pa_GetErrorText(count));
+            Pa_Terminate();
+            return 1;
+        }
+        for (PaDeviceIndex i = 0; i < count; ++i) {
+            const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+            if (!info || info->maxOutputChannels <= 0) continue;
+            const PaHostApiInfo* api = Pa_GetHostApiInfo(info->hostApi);
+            std::printf("%sindex=%d name=%s host=%s outputs=%d default=%s\\n",
+                        i == default_device ? "* " : "  ", static_cast<int>(i),
+                        info->name, api ? api->name : "unknown",
+                        info->maxOutputChannels,
+                        i == default_device ? "yes" : "no");
+        }
+        Pa_Terminate();
+        return 0;
     }
     std::string file = argv[1];
     std::string backend_name = "vulkan";
