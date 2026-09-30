@@ -8,6 +8,7 @@ BUILD_DIR=${KOP_BUILD_DIR:-$ROOT/build/relwithdebinfo}
 PLAYER="$BUILD_DIR/kopaw/kopaw-player"
 DURATION=${KOPAW_AUDIO_DURATION:-5}
 BACKEND=${KOPAW_AUDIO_BACKEND:-auto}
+REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
@@ -36,13 +37,22 @@ for media in "$@"; do
     status=$?
     set -e
     cat "$log"
-    stats=$(grep -F '最终统计:' "$log" | tail -1 || true)
+    stats=$(grep -aF '最终统计:' "$log" | tail -1 || true)
+    dropped=$(printf '%s\n' "$stats" | sed -n 's/.*"dropped":\([0-9][0-9]*\).*/\1/p')
+    dropped=${dropped:-unknown}
     if [[ "$status" != 0 && "$status" != 124 && "$status" != 143 ]]; then
         echo "RESULT status=$status classification=process-failure log=$log" >&2
         fail=1
-    elif grep -qE '音频输出设备:|音频输出后端: null' "$log" && grep -q 'state":"2"' "$log"; then
-        echo "RESULT status=$status classification=audio-playback-complete log=$log"
-    elif grep -qE '音频输出设备:|音频输出后端: null' "$log"; then
+    elif grep -aEq '音频输出设备:|音频输出后端: null' "$log" && grep -aFq 'state":"2"' "$log"; then
+        if [[ "$dropped" != 0 && "$REQUIRE_NO_DROP" == 1 ]]; then
+            echo "RESULT status=$status classification=audio-dropped dropped=$dropped log=$log" >&2
+            fail=1
+        elif [[ "$dropped" != 0 ]]; then
+            echo "RESULT status=$status classification=audio-playback-complete-with-drops dropped=$dropped log=$log"
+        else
+            echo "RESULT status=$status classification=audio-playback-complete dropped=0 log=$log"
+        fi
+    elif grep -aEq '音频输出设备:|音频输出后端: null' "$log"; then
         echo "RESULT status=$status classification=audio-output-opened log=$log"
         fail=1
     else
