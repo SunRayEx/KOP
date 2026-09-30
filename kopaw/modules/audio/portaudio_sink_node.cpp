@@ -1,6 +1,8 @@
 #include "portaudio_sink_node.hpp"
 
+#include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>
 
 #include "../frame.hpp"
 #include "kop/log.h"
@@ -11,6 +13,21 @@ namespace kopaw {
 static const char* kTag = "asink";
 
 namespace {
+
+bool runtime_socket_exists(const char* runtime_dir, const char* name) {
+    if (!runtime_dir || !runtime_dir[0]) return false;
+    std::string path = std::string(runtime_dir) + "/" + name;
+    struct stat st{};
+    return stat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode);
+}
+
+bool pipewire_audio_detected() {
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (!runtime || !runtime[0]) return false;
+    return runtime_socket_exists(runtime, "pipewire-0") ||
+           runtime_socket_exists(runtime, "pulse/native");
+}
+
 KopawNodeVTable make_vtable() {
     KopawNodeVTable vt{};
     vt.struct_size = sizeof(vt);
@@ -55,7 +72,18 @@ bool AudioSinkNode::open(std::string* error) {
             return false;
         }
     } else {
+        // Do not force a PipeWire PCM or reorder PortAudio devices. Detect the
+        // desktop audio server, then take ownership of the system default
+        // output selected by WirePlumber/Pulse compatibility. This preserves
+        // the user's routing and also works on plain ALSA systems.
+        const bool pipewire = pipewire_audio_detected();
         device = Pa_GetDefaultOutputDevice();
+        if (pipewire) {
+            KOP_LOG_INFO(kTag,
+                         "检测到 PipeWire/Pulse 音频服务，接管系统默认输出（不覆盖路由）");
+        } else {
+            KOP_LOG_INFO(kTag, "未检测到 PipeWire/Pulse，使用 PortAudio 默认输出");
+        }
     }
     const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
     if (!info) {
