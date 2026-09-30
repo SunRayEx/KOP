@@ -13,6 +13,7 @@ LIST_DEVICES=${KOPAW_AUDIO_LIST_DEVICES:-0}
 INFO_ONLY=${KOPAW_AUDIO_INFO_ONLY:-0}
 REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
 REQUIRE_BALANCED=${KOPAW_AUDIO_REQUIRE_BALANCED:-0}
+REQUIRE_AUDIO_STREAM=${KOPAW_AUDIO_REQUIRE_STREAM:-1}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
@@ -41,9 +42,15 @@ for media in "$@"; do
         continue
     fi
     if command -v ffprobe >/dev/null 2>&1; then
-        ffprobe -v error -select_streams a:0 \
+        probe=$(ffprobe -v error -select_streams a:0 \
             -show_entries stream=codec_name,sample_rate,channels,channel_layout \
-            -of default=noprint_wrappers=1 "$media" || true
+            -of default=noprint_wrappers=1 "$media" 2>&1) || probe=""
+        if [[ -z "$probe" && "$REQUIRE_AUDIO_STREAM" == 1 ]]; then
+            echo "RESULT status=2 classification=no-audio-stream log=$log" >&2
+            fail=1
+            continue
+        fi
+        printf '%s\n' "$probe"
     fi
     player_args=("$PLAYER" "$media" --no-video --duration "$DURATION" \
         --audio-backend "$BACKEND")
