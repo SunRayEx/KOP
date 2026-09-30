@@ -63,7 +63,7 @@ bool hw_probe(AVCodecID codec_id, HwAccelConfig* out) {
     for (AVHWDeviceType t : order) {
         if (t == AV_HWDEVICE_TYPE_NONE) continue;
         if (try_device_type(codec_id, t, out)) {
-            KOP_LOG_INFO(kTag, "硬解就绪：%s（%s）", out->name.c_str(),
+            KOP_LOG_INFO(kTag, "硬解后端已初始化：%s（%s）", out->name.c_str(),
                          av_hwdevice_get_type_name(t));
             return true;
         }

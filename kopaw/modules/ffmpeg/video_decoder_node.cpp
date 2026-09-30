@@ -68,7 +68,7 @@ bool VideoDecoderNode::open(AVCodecParameters* params, std::string* error) {
     if (hw_probe(params->codec_id, &hw_)) {
         if (open_context(params, true, error)) {
             hw_active_ = true;
-            KOP_LOG_INFO(kTag, "视频硬解已启用：%s", hw_.name.c_str());
+            KOP_LOG_INFO(kTag, "视频硬解后端已初始化：%s", hw_.name.c_str());
             return true;
         }
         KOP_LOG_WARN(kTag, "硬解打开失败（%s），回退软解", error->c_str());
@@ -170,6 +170,12 @@ int32_t VideoDecoderNode::emit_converted(AVFrame* frame) {
 }
 
 int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
+    if (hw_active_ && raw->format == hw_.hw_pix_fmt &&
+        !hardware_frame_logged_) {
+        hardware_frame_logged_ = true;
+        KOP_LOG_INFO(kTag, "硬解实际生效：输出格式=%s",
+                     av_get_pix_fmt_name(static_cast<AVPixelFormat>(raw->format)));
+    }
     if (!hw_active_ || raw->format != hw_.hw_pix_fmt) {
         return emit_converted(raw);
     }

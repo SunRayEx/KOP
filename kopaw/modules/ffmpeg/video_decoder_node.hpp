@@ -70,6 +70,7 @@ private:
     // 硬解状态
     HwAccelConfig hw_;
     bool hw_active_ = false;
+    bool hardware_frame_logged_ = false;
 
     // P2 原生导出状态：惰性初始化；一次不可用后永久回退，避免每帧重试
     std::atomic<bool> native_output_{false};
