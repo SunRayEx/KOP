@@ -22,6 +22,8 @@ ffmpeg -y -hide_banner -loglevel warning \
     -f lavfi -i "sine=frequency=440:sample_rate=48000" \
     -t "$DUR" \
     -c:v "$VCODEC" $EXTRA_V \
+    -color_range tv -colorspace bt709 -color_trc bt709 \
+    -color_primaries bt709 \
     -c:a mp2 -b:a 192k \
     -pix_fmt yuv420p \
     "$OUT"
