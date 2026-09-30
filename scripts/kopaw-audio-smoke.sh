@@ -14,6 +14,7 @@ INFO_ONLY=${KOPAW_AUDIO_INFO_ONLY:-0}
 REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
 REQUIRE_BALANCED=${KOPAW_AUDIO_REQUIRE_BALANCED:-0}
 REQUIRE_AUDIO_STREAM=${KOPAW_AUDIO_REQUIRE_STREAM:-1}
+REQUIRE_MEDIA_COMPLETE=${KOPAW_AUDIO_REQUIRE_MEDIA_COMPLETE:-0}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
@@ -77,6 +78,13 @@ for media in "$@"; do
         fail=1
     elif grep -aEq '音频输出设备:|音频输出后端: null' "$log" &&
          { grep -aFq 'state":"2"' "$log" || grep -aFq '播放完成' "$log"; }; then
+        media_complete=0
+        grep -aFq '播放完成' "$log" && media_complete=1
+        if [[ "$REQUIRE_MEDIA_COMPLETE" == 1 && "$media_complete" != 1 ]]; then
+            echo "RESULT status=$status classification=duration-limited log=$log" >&2
+            fail=1
+            continue
+        fi
         if [[ "$balanced" != 1 && "$REQUIRE_BALANCED" == 1 ]]; then
             echo "RESULT status=$status classification=audio-unbalanced decoder=$decoder sink=$sink log=$log" >&2
             fail=1
@@ -84,9 +92,9 @@ for media in "$@"; do
             echo "RESULT status=$status classification=audio-dropped dropped=$dropped log=$log" >&2
             fail=1
         elif [[ "$dropped" != 0 ]]; then
-            echo "RESULT status=$status classification=audio-playback-complete-with-drops dropped=$dropped log=$log"
+            echo "RESULT status=$status classification=audio-playback-complete-with-drops dropped=$dropped media_complete=$media_complete log=$log"
         else
-            echo "RESULT status=$status classification=audio-playback-complete dropped=0 balanced=$balanced log=$log"
+            echo "RESULT status=$status classification=audio-playback-complete dropped=0 balanced=$balanced media_complete=$media_complete log=$log"
         fi
     elif grep -aEq '音频输出设备:|音频输出后端: null' "$log"; then
         echo "RESULT status=$status classification=audio-output-opened log=$log"
