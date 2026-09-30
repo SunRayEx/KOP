@@ -9,6 +9,7 @@ PLAYER="$BUILD_DIR/kopaw/kopaw-player"
 DURATION=${KOPAW_AUDIO_DURATION:-5}
 BACKEND=${KOPAW_AUDIO_BACKEND:-auto}
 REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
+REQUIRE_BALANCED=${KOPAW_AUDIO_REQUIRE_BALANCED:-0}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
@@ -40,18 +41,27 @@ for media in "$@"; do
     stats=$(grep -aF '最终统计:' "$log" | tail -1 || true)
     dropped=$(printf '%s\n' "$stats" | sed -n 's/.*"dropped":\([0-9][0-9]*\).*/\1/p')
     dropped=${dropped:-unknown}
+    decoder=$(printf '%s\n' "$stats" | sed -n 's/.*"name":"audio_decoder","delivered":\([0-9][0-9]*\).*/\1/p')
+    sink=$(printf '%s\n' "$stats" | sed -n 's/.*"name":"audio_sink","delivered":\([0-9][0-9]*\).*/\1/p')
+    balanced=unknown
+    if [[ "$decoder" =~ ^[0-9]+$ && "$sink" =~ ^[0-9]+$ ]]; then
+        [[ "$decoder" == "$sink" ]] && balanced=1 || balanced=0
+    fi
     if [[ "$status" != 0 && "$status" != 124 && "$status" != 143 ]]; then
         echo "RESULT status=$status classification=process-failure log=$log" >&2
         fail=1
     elif grep -aEq '音频输出设备:|音频输出后端: null' "$log" &&
          { grep -aFq 'state":"2"' "$log" || grep -aFq '播放完成' "$log"; }; then
-        if [[ "$dropped" != 0 && "$REQUIRE_NO_DROP" == 1 ]]; then
+        if [[ "$balanced" != 1 && "$REQUIRE_BALANCED" == 1 ]]; then
+            echo "RESULT status=$status classification=audio-unbalanced decoder=$decoder sink=$sink log=$log" >&2
+            fail=1
+        elif [[ "$dropped" != 0 && "$REQUIRE_NO_DROP" == 1 ]]; then
             echo "RESULT status=$status classification=audio-dropped dropped=$dropped log=$log" >&2
             fail=1
         elif [[ "$dropped" != 0 ]]; then
             echo "RESULT status=$status classification=audio-playback-complete-with-drops dropped=$dropped log=$log"
         else
-            echo "RESULT status=$status classification=audio-playback-complete dropped=0 log=$log"
+            echo "RESULT status=$status classification=audio-playback-complete dropped=0 balanced=$balanced log=$log"
         fi
     elif grep -aEq '音频输出设备:|音频输出后端: null' "$log"; then
         echo "RESULT status=$status classification=audio-output-opened log=$log"
