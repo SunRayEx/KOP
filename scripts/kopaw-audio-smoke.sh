@@ -15,6 +15,7 @@ REQUIRE_NO_DROP=${KOPAW_AUDIO_REQUIRE_NO_DROP:-0}
 REQUIRE_BALANCED=${KOPAW_AUDIO_REQUIRE_BALANCED:-0}
 REQUIRE_AUDIO_STREAM=${KOPAW_AUDIO_REQUIRE_STREAM:-1}
 REQUIRE_MEDIA_COMPLETE=${KOPAW_AUDIO_REQUIRE_MEDIA_COMPLETE:-0}
+REQUIRE_COUNTS=${KOPAW_AUDIO_REQUIRE_COUNTS:-1}
 LOG_DIR=${KOPAW_AUDIO_LOG_DIR:-$ROOT/build/kopaw-audio-smoke}
 mkdir -p "$LOG_DIR"
 
@@ -73,7 +74,10 @@ for media in "$@"; do
     if [[ "$decoder" =~ ^[0-9]+$ && "$sink" =~ ^[0-9]+$ ]]; then
         [[ "$decoder" == "$sink" ]] && balanced=1 || balanced=0
     fi
-    if [[ "$status" != 0 && "$status" != 124 && "$status" != 143 ]]; then
+    if [[ "$REQUIRE_COUNTS" == 1 && ( ! "$decoder" =~ ^[0-9]+$ || ! "$sink" =~ ^[0-9]+$ ) ]]; then
+        echo "RESULT status=$status classification=missing-audio-counts decoder=$decoder sink=$sink log=$log" >&2
+        fail=1
+    elif [[ "$status" != 0 && "$status" != 124 && "$status" != 143 ]]; then
         echo "RESULT status=$status classification=process-failure log=$log" >&2
         fail=1
     elif grep -aEq '音频输出设备:|音频输出后端: null' "$log" &&
