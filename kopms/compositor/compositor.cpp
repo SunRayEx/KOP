@@ -1013,6 +1013,14 @@ std::vector<kopms::VulkanScene::LayoutItem> compute_scene_layout(uint32_t out_w,
 
 void present_scene_to_drm(kopms::DrmDirectOutput& output) {
     if (output.page_flip_pending()) return;
+    // A KMS rejection (notably ENOSPC from an unsupported/scaled plane
+    // transaction) must not be retried on every 5 ms event-loop tick. Keep
+    // the scene release balanced, then back off until the runtime state or
+    // mode changes.
+    static auto retry_after = std::chrono::steady_clock::time_point{};
+    static unsigned failure_count = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < retry_after) return;
     int fd = -1;
     uint32_t stride = 0;
     uint32_t width = 0;
@@ -1033,11 +1041,20 @@ void present_scene_to_drm(kopms::DrmDirectOutput& output) {
     request.planes[0].fd = fd;
     request.planes[0].stride = stride;
     const bool flipped =
-        output.present_dmabuf(request, [] { g_scene.complete_direct_present(); },
-                              &error);
+        output.present_dmabuf(request, [] {
+            failure_count = 0;
+            retry_after = std::chrono::steady_clock::time_point{};
+            g_scene.complete_direct_present();
+        }, &error);
     ::close(fd);
     if (!flipped) {
-        KOP_LOG_WARN(kTag, "DRM page-flip 呈现失败：%s", error.c_str());
+        ++failure_count;
+        const unsigned backoff_ms =
+            std::min(1000u, 25u << std::min(failure_count - 1, 5u));
+        retry_after = std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(backoff_ms);
+        KOP_LOG_WARN(kTag, "DRM page-flip 呈现失败（重试退避 %ums）：%s",
+                     backoff_ms, error.c_str());
         // commit 成功但 event 超时仍保留 pending framebuffer；完成回调
         // 将在 event 到达后释放场景帧，不能在此重复完成。
         if (!output.page_flip_pending()) g_scene.complete_direct_present();
