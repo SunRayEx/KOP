@@ -39,8 +39,40 @@ AudioSinkNode::~AudioSinkNode() {
 }
 
 bool AudioSinkNode::open(std::string* error) {
-    PaError err = Pa_OpenDefaultStream(&stream_, 0, channels_, paFloat32, rate_,
-                                       paFramesPerBufferUnspecified, pa_callback, this);
+    const char* requested = std::getenv("KOPAW_AUDIO_DEVICE");
+    PaDeviceIndex device = paNoDevice;
+    if (requested && requested[0] != '\0') {
+        const int count = Pa_GetDeviceCount();
+        for (int i = 0; i < count; ++i) {
+            const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+            if (info && std::strstr(info->name, requested)) {
+                device = i;
+                break;
+            }
+        }
+        if (device == paNoDevice) {
+            *error = std::string("找不到 PortAudio 输出设备: ") + requested;
+            return false;
+        }
+    } else {
+        device = Pa_GetDefaultOutputDevice();
+    }
+    const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
+    if (!info) {
+        *error = "PortAudio 没有可用的默认输出设备";
+        return false;
+    }
+    const PaHostApiInfo* api = Pa_GetHostApiInfo(info->hostApi);
+    KOP_LOG_INFO(kTag, "音频输出设备: %s（host=%s）", info->name,
+                 api ? api->name : "unknown");
+    PaStreamParameters output{};
+    output.device = device;
+    output.channelCount = channels_;
+    output.sampleFormat = paFloat32;
+    output.suggestedLatency = info->defaultLowOutputLatency;
+    PaError err = Pa_OpenStream(&stream_, nullptr, &output, rate_,
+                                paFramesPerBufferUnspecified, paNoFlag,
+                                pa_callback, this);
     if (err != paNoError) {
         *error = std::string("PortAudio 打开输出流失败: ") + Pa_GetErrorText(err);
         return false;
