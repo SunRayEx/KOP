@@ -71,7 +71,26 @@ cmake --build --preset relwithdebinfo
 `--kopms-bus NAME`（视频零拷贝上屏）。
 环境变量：`KOP_LOG=debug|info|warn|error` · `KOPAW_HWACCEL=auto|none|vaapi|cuda` ·
 `KOPAW_ZERO_COPY=0`（强制关闭原生输出）· `KOPAW_STATS=1`（每 5s 性能基线）·
-`KOPAW_SCHED=pool`（工作窃取池调度）。
+`KOPAW_SCHED=pool`（工作窃取池调度）。音频可用 `--audio-backend auto|alsa|null`、
+`--audio-device NAME`；`auto` 保持 PortAudio/系统默认路由，不强制切换 PipeWire，
+`null` 仅消费帧且不会产生设备回调。
+
+音频设备和收尾 smoke：
+```bash
+./build/relwithdebinfo/kopaw/kopaw-player --audio-info
+./build/relwithdebinfo/kopaw/kopaw-player --list-audio-devices
+KOPAW_AUDIO_BACKEND=auto KOPAW_AUDIO_DURATION=0 \
+  KOPAW_AUDIO_REQUIRE_MEDIA_COMPLETE=1 \
+  KOPAW_AUDIO_REQUIRE_CALLBACK=1 \
+  KOPAW_AUDIO_REQUIRE_NO_XRUN=1 \
+  scripts/kopaw-audio-smoke.sh /path/to/audio.m4a
+```
+
+smoke 会校验音频流、decoder/sink 计数、EOS 完成和 PortAudio 统计；
+`KOPAW_AUDIO_REQUIRE_NO_DROP=1` 仅在禁用视频流也不应产生未连接流丢弃时使用。
+`null` 后端预期 `callbacks=0`；设置 `KOPAW_AUDIO_REQUIRE_CALLBACK=1` 会故意将其判为失败，
+以避免把无设备消费误当成真实播放。`underflow`、`overflow` 和软件环形缓冲
+`underrun` 默认只记录，设置 `KOPAW_AUDIO_REQUIRE_NO_XRUN=1` 才严格失败。
 
 ## 用户级测试与 SDK（KOP_AppSDK_Interface）
 
@@ -198,4 +217,5 @@ KOPAW/KOPMS 为可执行程序与动态节点组合，第三方插件通过稳�
   后续帧自动重新走 CPU 路径；
 - 帧与 BUS 契约携带完整色彩元数据（range/matrix/transfer/primaries/HDR），
   渲染侧按声明的传递函数走 EOTF → 色调映射 → sRGB，不从分辨率推断；
-  CUVID 原生导出、HDR swapchain、dmabuf v4 feedback 和真机 KMS 直出验证属后续。
+  KOPAW 与 KOPMS 窗口路径支持 HDR10 swapchain、动态 HDR metadata 和 SDR/WCG 回退；
+  CUVID 原生导出、dmabuf v4 feedback 和真机 KMS 直出验证仍属后续。

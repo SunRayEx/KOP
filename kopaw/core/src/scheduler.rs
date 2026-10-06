@@ -8,7 +8,7 @@
 use crossbeam_deque::{Injector, Stealer, Worker};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -16,24 +16,162 @@ pub type Job = Box<dyn FnOnce() + Send + 'static>;
 pub struct Scheduler {
     global: Injector<Job>,
     stop: Arc<AtomicBool>,
+    /// Serializes the admission check and the Injector push. Shutdown holds
+    /// this briefly while closing admission, so no job can be pushed after
+    /// workers have been told to drain and exit.
+    admission: Mutex<()>,
     handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Serialize shutdown itself. A worker may call shutdown from a job; the
+    /// current worker handle is then retained for a later external join.
+    shutdown_lock: Mutex<()>,
     stopped_flag: AtomicBool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    #[test]
+    fn shutdown_executes_every_accepted_job() {
+        let scheduler = Scheduler::new(2);
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut accepted = 0;
+        for _ in 0..64 {
+            let count = count.clone();
+            if scheduler.submit(Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            })) {
+                accepted += 1;
+            }
+        }
+        scheduler.shutdown();
+        assert_eq!(count.load(Ordering::SeqCst), accepted);
+        assert!(!scheduler.submit(Box::new(|| {})));
+    }
+
+    #[test]
+    fn worker_shutdown_does_not_join_itself() {
+        let scheduler = Scheduler::new(1);
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let scheduler2 = scheduler.clone();
+        assert!(scheduler.submit(Box::new(move || {
+            scheduler2.shutdown();
+            done2.store(true, Ordering::SeqCst);
+        })));
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done.load(Ordering::SeqCst));
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn zero_workers_are_normalized() {
+        let scheduler = Scheduler::new(0);
+        assert_eq!(scheduler.worker_count(), 1);
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        assert!(scheduler.submit(Box::new(move || {
+            done2.store(true, Ordering::SeqCst);
+        })));
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done.load(Ordering::SeqCst));
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn many_threads_can_shutdown_idempotently() {
+        let scheduler = Scheduler::new(4);
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let scheduler = scheduler.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    scheduler.shutdown();
+                });
+            }
+        });
+        assert_eq!(scheduler.worker_count(), 0);
+        assert!(!scheduler.submit(Box::new(|| {})));
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn worker_can_submit_before_shutdown() {
+        let scheduler = Scheduler::new(2);
+        let done = Arc::new(AtomicUsize::new(0));
+        let child_done = done.clone();
+        let scheduler2 = scheduler.clone();
+        assert!(scheduler.submit(Box::new(move || {
+            child_done.fetch_add(1, Ordering::SeqCst);
+            assert!(scheduler2.submit(Box::new(|| {})));
+        })));
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn shutdown_and_submit_have_single_admission_boundary() {
+        let scheduler = Scheduler::new(2);
+        let barrier = Arc::new(Barrier::new(2));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let s2 = scheduler.clone();
+        let b2 = barrier.clone();
+        let a2 = accepted.clone();
+        let submitter = thread::spawn(move || {
+            b2.wait();
+            for _ in 0..1000 {
+                if s2.submit(Box::new(|| {})) {
+                    a2.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        barrier.wait();
+        scheduler.shutdown();
+        submitter.join().unwrap();
+        assert!(!scheduler.submit(Box::new(|| {})));
+        let _ = accepted;
+    }
 }
 
 impl Scheduler {
     /// 启动 n 个工作者线程。
     pub fn new(n: usize) -> Arc<Self> {
+        // A zero-worker pool cannot make progress; retain the public API's
+        // usable invariant by creating one worker.
+        let n = n.max(1);
         let global = Injector::new();
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(n);
         // 每工作者一个本地队列（先建好再取 stealer，然后移动进线程）
-        let mut local_workers: Vec<Worker<Job>> = (0..n).map(|_| Worker::new_fifo()).collect();
+        let local_workers: Vec<Worker<Job>> = (0..n).map(|_| Worker::new_fifo()).collect();
         let stealers: Vec<Stealer<Job>> = local_workers.iter().map(|w| w.stealer()).collect();
 
         let sched = Arc::new(Scheduler {
             global,
             stop,
+            admission: Mutex::new(()),
             handles: Mutex::new(Vec::new()),
+            shutdown_lock: Mutex::new(()),
             stopped_flag: AtomicBool::new(false),
         });
 
@@ -53,24 +191,78 @@ impl Scheduler {
         sched
     }
 
-    pub fn submit(&self, job: Job) {
+    /// Submit a job if shutdown has not closed admission. The return value is
+    /// false when the caller owns a frame queued in a graph execution body
+    /// but no worker can accept another drain task; the graph then releases
+    /// that body explicitly instead of leaving a task stranded in Injector.
+    pub fn submit(&self, job: Job) -> bool {
+        let _admission = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped_flag.load(Ordering::Acquire) {
+            return false;
+        }
         self.global.push(job);
+        true
     }
 
-    /// 请求停止：工作者退出前排空全局队列，保证已提交任务执行完毕。
-    pub fn shutdown(&self) {
-        if self.stopped_flag.swap(true, Ordering::AcqRel) {
-            return;
+    /// Close job admission and request worker exit. Already admitted jobs are
+    /// still drained by workers before they return. This method deliberately
+    /// does not join, so a graph node can request shutdown from an event
+    /// callback without trying to join its own worker thread.
+    pub fn request_stop(&self) {
+        let _admission = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.stopped_flag.swap(true, Ordering::AcqRel) {
+            self.stop.store(true, Ordering::Release);
         }
-        self.stop.store(true, Ordering::Release);
-        let handles: Vec<_> = self
-            .handles
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .drain(..)
-            .collect();
+    }
+
+    /// Request stop and join all workers except the caller. If called by a
+    /// worker job, retain that worker's JoinHandle so a later external call
+    /// can join it after the job returns.
+    pub fn shutdown(&self) {
+        let current = thread::current().id();
+        let handles = {
+            let _shutdown = self.shutdown_lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.request_stop();
+
+            // A worker cannot join itself. Leave all handles in place; an
+            // external caller can join them after this callback returns.
+            let mut all = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+            if all.iter().any(|h| h.thread().id() == current) {
+                return;
+            }
+            all.drain(..).collect::<Vec<_>>()
+        };
+        // Do not hold shutdown_lock while joining. A job may call shutdown
+        // while another thread is waiting for that job to return.
         for h in handles {
             let _ = h.join();
+        }
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.handles.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn is_worker_thread(&self, id: ThreadId) -> bool {
+        self.handles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|h| h.thread().id() == id)
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        self.request_stop();
+        let current = thread::current().id();
+        let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        let remaining = handles.drain(..).collect::<Vec<_>>();
+        drop(handles);
+        for handle in remaining {
+            if handle.thread().id() != current {
+                let _ = handle.join();
+            }
         }
     }
 }

@@ -172,6 +172,13 @@ struct VulkanScene::Impl {
     VkPipeline pipeline_yuv[kYuvFormatCount][kYuvChromaVariantCount]{};
     bool ycbcr_ok = false;
     bool hdr_sdr_warning_logged = false;
+    bool ext_swapchain_colorspace = false;
+    bool ext_hdr_metadata = false;
+    bool surface_hdr_capable = false;
+    bool hdr_output = false;
+    PFN_vkSetHdrMetadataEXT set_hdr_metadata = nullptr;
+    bool hdr_metadata_valid = false;
+    VkHdrMetadataEXT hdr_metadata{};
 
     int output_color_primaries() const {
         switch (options.display.color_space) {
@@ -191,9 +198,33 @@ struct VulkanScene::Impl {
     }
 
     int output_mode() const {
-        return options.display.hdr == HdrMode::HDR10 || options.display.hdr == HdrMode::Auto
-                   ? kop::kColorOutHdr10
-                   : kop::kColorOutSdr;
+        return hdr_output ? kop::kColorOutHdr10 : kop::kColorOutSdr;
+    }
+
+    void update_hdr_metadata(const KopawColorMetadata& color) {
+        if (!hdr_output || !ext_hdr_metadata || !set_hdr_metadata ||
+            !(color.hdr.flags & KOPAW_HDR_FLAG_MASTERING_DISPLAY)) {
+            return;
+        }
+        VkHdrMetadataEXT metadata{};
+        metadata.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+        metadata.displayPrimaryRed = {color.hdr.display_primaries[0] / 100000.0f,
+                                      color.hdr.display_primaries[1] / 100000.0f};
+        metadata.displayPrimaryGreen = {color.hdr.display_primaries[2] / 100000.0f,
+                                        color.hdr.display_primaries[3] / 100000.0f};
+        metadata.displayPrimaryBlue = {color.hdr.display_primaries[4] / 100000.0f,
+                                       color.hdr.display_primaries[5] / 100000.0f};
+        metadata.whitePoint = {color.hdr.white_point[0] / 100000.0f,
+                               color.hdr.white_point[1] / 100000.0f};
+        metadata.maxLuminance = color.hdr.max_luminance / 1000.0f;
+        metadata.minLuminance = color.hdr.min_luminance / 1000.0f;
+        metadata.maxContentLightLevel = static_cast<float>(color.hdr.max_cll);
+        metadata.maxFrameAverageLightLevel = static_cast<float>(color.hdr.max_fall);
+        if (metadata.maxLuminance <= 0.0f) metadata.maxLuminance = options.display.peak_nits;
+        if (metadata.minLuminance < 0.0f) metadata.minLuminance = 0.0f;
+        set_hdr_metadata(ctx.device, 1, &swapchain, &metadata);
+        hdr_metadata = metadata;
+        hdr_metadata_valid = true;
     }
 
     VkDescriptorPool dpool = VK_NULL_HANDLE;
@@ -731,12 +762,30 @@ struct VulkanScene::Impl {
         std::vector<VkSurfaceFormatKHR> formats(n_fmt);
         vkGetPhysicalDeviceSurfaceFormatsKHR(ctx.physical, surface, &n_fmt,
                                              formats.data());
-        swap_format = formats[0].format;
+        surface_hdr_capable = false;
         for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
-                f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                swap_format = f.format;
+            if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                surface_hdr_capable = true;
                 break;
+            }
+        }
+        hdr_output = ext_swapchain_colorspace && surface_hdr_capable &&
+                     (options.display.hdr == HdrMode::HDR10 ||
+                      options.display.hdr == HdrMode::Auto);
+        swap_format = VK_FORMAT_B8G8R8A8_UNORM;
+        VkColorSpaceKHR swap_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        if (hdr_output) {
+            swap_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            swap_color_space = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        } else {
+            for (const auto& f : formats) {
+                if ((f.format == VK_FORMAT_B8G8R8A8_UNORM ||
+                     f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+                    f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                    swap_format = f.format;
+                    break;
+                }
             }
         }
         swap_extent = caps.currentExtent;
@@ -752,7 +801,8 @@ struct VulkanScene::Impl {
         sci.surface = surface;
         sci.minImageCount = image_count;
         sci.imageFormat = swap_format;
-        sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        sci.imageColorSpace = hdr_output ? VK_COLOR_SPACE_HDR10_ST2084_EXT
+                                          : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         sci.imageExtent = swap_extent;
         sci.imageArrayLayers = 1;
         sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -761,8 +811,17 @@ struct VulkanScene::Impl {
         sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
         sci.clipped = VK_TRUE;
-        if (vkfail(vkCreateSwapchainKHR(ctx.device, &sci, nullptr, &swapchain),
-                   "vkCreateSwapchainKHR", error)) {
+        VkResult swap_result = vkCreateSwapchainKHR(ctx.device, &sci, nullptr, &swapchain);
+        if (swap_result != VK_SUCCESS && hdr_output) {
+            KOP_LOG_WARN(kTag, "HDR10 swapchain 创建失败，回退 SDR");
+            hdr_output = false;
+            swap_format = VK_FORMAT_B8G8R8A8_UNORM;
+            sci.imageFormat = swap_format;
+            sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+            swap_result = vkCreateSwapchainKHR(ctx.device, &sci, nullptr, &swapchain);
+        }
+        if (swap_result != VK_SUCCESS) {
+            vkfail(swap_result, "vkCreateSwapchainKHR", error);
             return true;
         }
         uint32_t n = 0;
@@ -802,6 +861,9 @@ struct VulkanScene::Impl {
             vkfail(vkCreateSemaphore(ctx.device, &sem, nullptr, &present_sem),
                    "vkCreateSemaphore(present)", error)) {
             return true;
+        }
+        if (hdr_output && hdr_metadata_valid && set_hdr_metadata) {
+            set_hdr_metadata(ctx.device, 1, &swapchain, &hdr_metadata);
         }
         return false;
     }
@@ -849,6 +911,8 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
 
     std::vector<const char*> instance_exts;
     std::vector<const char*> device_exts;
+    std::vector<const char*> optional_device_exts;
+    std::vector<const char*> enabled_optional_exts;
 #ifdef KOPMS_SCENE_WINDOW
     if (s.windowed) {
         if (!window) {
@@ -863,6 +927,22 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
         }
         instance_exts.assign(exts, exts + n);
         device_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        uint32_t instance_extension_count = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &instance_extension_count,
+                                               nullptr);
+        std::vector<VkExtensionProperties> instance_extensions(
+            instance_extension_count);
+        vkEnumerateInstanceExtensionProperties(nullptr, &instance_extension_count,
+                                               instance_extensions.data());
+        for (const auto& ext : instance_extensions) {
+            if (std::strcmp(ext.extensionName,
+                            VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) {
+                instance_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                s.ext_swapchain_colorspace = true;
+                break;
+            }
+        }
+        optional_device_exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     }
 #else
     (void)window;
@@ -882,11 +962,24 @@ bool VulkanScene::init(const Options& options, GLFWwindow* window, std::string* 
     if (!preferred_name.empty()) {
         KOP_LOG_INFO(kTag, "Vulkan GPU preference=%s", preferred_name.c_str());
     }
-    if (!vkutil::pick_and_create_device(full_exts, &s.ctx, error, preferred_name)) {
+    if (!vkutil::pick_and_create_device(full_exts, optional_device_exts,
+                                        &enabled_optional_exts, &s.ctx, error,
+                                        preferred_name)) {
         KOP_LOG_WARN(kTag, "DRM modifier 导入不可用，降级无 modifier 设备（%s）",
                      error ? error->c_str() : "");
-        if (!vkutil::pick_and_create_device(device_exts, &s.ctx, error, preferred_name)) return true;
+        enabled_optional_exts.clear();
+        if (!vkutil::pick_and_create_device(device_exts, optional_device_exts,
+                                            &enabled_optional_exts, &s.ctx, error,
+                                            preferred_name)) return true;
     }
+    s.ext_hdr_metadata = std::find(
+        enabled_optional_exts.begin(), enabled_optional_exts.end(),
+        VK_EXT_HDR_METADATA_EXTENSION_NAME) != enabled_optional_exts.end();
+    s.set_hdr_metadata = s.ext_hdr_metadata
+                             ? reinterpret_cast<PFN_vkSetHdrMetadataEXT>(
+                                   vkGetDeviceProcAddr(
+                                       s.ctx.device, "vkSetHdrMetadataEXT"))
+                             : nullptr;
     s.queue = s.ctx.graphics_queue;
 
 #ifdef KOPMS_SCENE_WINDOW
@@ -1485,8 +1578,13 @@ bool VulkanScene::render(const std::vector<LayoutItem>& layout_items,
                 static_cast<int32_t>(item.color.transfer),
                 kop::declared_peak_luminance(item.color),
                 s.output_mode(),
-                s.output_color_primaries(),
+                item.has_color_metadata
+                    ? static_cast<int32_t>(item.color.primaries)
+                    : KOPAW_COLOR_PRIMARIES_UNKNOWN,
                 s.options.display.sdr_white_nits};
+            if (s.hdr_output && item.has_color_metadata) {
+                s.update_hdr_metadata(item.color);
+            }
             vkCmdPushConstants(s.cmd, s.pipeline_layout_yuv[fi][variant],
                                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
         } else {
@@ -1505,8 +1603,13 @@ bool VulkanScene::render(const std::vector<LayoutItem>& layout_items,
                     ? kop::declared_peak_luminance(item.color)
                     : 1000.0f,
                 s.output_mode(),
-                s.output_color_primaries(),
+                item.has_color_metadata
+                    ? static_cast<int32_t>(item.color.primaries)
+                    : KOPAW_COLOR_PRIMARIES_UNKNOWN,
                 s.options.display.sdr_white_nits};
+            if (s.hdr_output && item.has_color_metadata) {
+                s.update_hdr_metadata(item.color);
+            }
             vkCmdPushConstants(s.cmd, s.pipeline_layout,
                                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
         }

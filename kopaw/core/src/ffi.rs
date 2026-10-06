@@ -418,6 +418,9 @@ pub unsafe extern "C" fn kopaw_graph_add_node(
         copy_size,
     );
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return 0;
+    }
     match core.add_node(
         desc_name(&*desc),
         d.user_data,
@@ -444,6 +447,9 @@ pub unsafe extern "C" fn kopaw_graph_node_output(
         return invalid;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return invalid;
+    }
     match core.node_output(node, port) {
         Some(o) => o,
         None => invalid,
@@ -465,6 +471,9 @@ pub unsafe extern "C" fn kopaw_graph_connect(
         return KOPAW_E_INVALID;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_E_INVALID;
+    }
     core.connect(src, dst_node, dst_port, cap)
 }
 
@@ -474,6 +483,9 @@ pub unsafe extern "C" fn kopaw_graph_start(g: *mut KopawGraph) -> i32 {
         return KOPAW_E_INVALID;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_E_INVALID;
+    }
     core.start()
 }
 
@@ -485,6 +497,9 @@ pub unsafe extern "C" fn kopaw_graph_stop(g: *mut KopawGraph, timeout_ms: u32) -
     }
     let _ = timeout_ms; // MVP：节点必须响应停止标志，不做超时强杀
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_OK;
+    }
     core.stop()
 }
 
@@ -500,7 +515,9 @@ pub unsafe extern "C" fn kopaw_graph_set_event_cb(
         return;
     }
     let core = &*(g as *const crate::graph::GraphCore);
-    core.set_event_cb(cb, user);
+    if !core.is_destroyed() {
+        core.set_event_cb(cb, user);
+    }
 }
 
 #[no_mangle]
@@ -509,6 +526,9 @@ pub unsafe extern "C" fn kopaw_graph_state(g: *mut KopawGraph) -> i32 {
         return KOPAW_E_INVALID;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_STATE_ERROR;
+    }
     core.state()
 }
 
@@ -524,6 +544,10 @@ pub unsafe extern "C" fn kopaw_graph_emit(
         return KOPAW_E_INVALID;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        crate::queue::release_frame(frame);
+        return KOPAW_E_STOPPED;
+    }
     core.emit(out, frame)
 }
 
@@ -542,6 +566,9 @@ pub unsafe extern "C" fn kopaw_node_recv_port(
     }
     *out_frame = std::ptr::null_mut();
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_E_STOPPED;
+    }
     core.recv_port(node, port, &mut *out_frame, timeout_ms)
 }
 
@@ -565,6 +592,9 @@ pub unsafe extern "C" fn kopaw_graph_set_workers(g: *mut KopawGraph, workers: u3
         return 0;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return 0;
+    }
     core.set_workers(workers)
 }
 
@@ -575,7 +605,9 @@ pub unsafe extern "C" fn kopaw_graph_clock_set(g: *mut KopawGraph, media_us: i64
         return;
     }
     let core = &*(g as *const crate::graph::GraphCore);
-    core.clock.set(media_us);
+    if !core.is_destroyed() {
+        core.clock.set(media_us);
+    }
 }
 
 #[no_mangle]
@@ -584,6 +616,9 @@ pub unsafe extern "C" fn kopaw_graph_clock_get(g: *mut KopawGraph) -> i64 {
         return 0;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return 0;
+    }
     core.clock.now_us()
 }
 
@@ -594,6 +629,9 @@ pub unsafe extern "C" fn kopaw_graph_clock_active(g: *mut KopawGraph) -> i32 {
         return 0;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return 0;
+    }
     core.clock.active() as i32
 }
 
@@ -607,6 +645,9 @@ pub unsafe extern "C" fn kopaw_node_sink_done(g: *mut KopawGraph, node: u32) -> 
         return KOPAW_E_INVALID;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_E_STOPPED;
+    }
     core.sink_done(node)
 }
 
@@ -622,13 +663,96 @@ pub unsafe extern "C" fn kopaw_graph_stats_json(
         return -1;
     }
     let core = &*(g as *const crate::graph::GraphCore);
+    if core.is_destroyed() {
+        return KOPAW_E_STOPPED;
+    }
     let s = core.stats_json();
     let need = s.len() + 1;
     if buf.is_null() || (cap as usize) < need {
         return -(need as i32);
     }
-    std::ptr::copy_nonoverlapping(s.as_ptr(), buf as *mut u8, need);
+    // `s` owns exactly `s.len()` initialized bytes; copying `need` bytes
+    // would read one byte past the Rust string and could append garbage to the
+    // C++ log buffer. Write the terminator explicitly.
+    std::ptr::copy_nonoverlapping(s.as_ptr(), buf as *mut u8, s.len());
+    *(buf as *mut u8).add(s.len()) = 0;
     need as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::GraphCore;
+
+    #[test]
+    fn graph_stats_json_nul_terminates_without_overread() {
+        let core = GraphCore::new();
+        let graph = &core as *const GraphCore as *mut KopawGraph;
+        let missing = unsafe { kopaw_graph_stats_json(graph, std::ptr::null_mut(), 0) };
+        assert!(missing < 0);
+        let need = (-missing) as usize;
+        let expected = core.stats_json();
+        assert_eq!(need, expected.len() + 1);
+
+        let mut buf = vec![0xa5u8; need + 1];
+        let written =
+            unsafe { kopaw_graph_stats_json(graph, buf.as_mut_ptr() as *mut c_char, need as u32) };
+        assert_eq!(written as usize, need);
+        assert_eq!(&buf[..expected.len()], expected.as_bytes());
+        assert_eq!(buf[expected.len()], 0);
+        assert_eq!(buf[need], 0xa5);
+    }
+
+    #[test]
+    fn node_sink_done_ffi_is_idempotent_and_validates_node() {
+        let graph = unsafe { kopaw_graph_new() };
+        assert!(!graph.is_null());
+
+        let vtable = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: None,
+            destroy: None,
+            bind_output: None,
+            send_port: None,
+        };
+        let sink_desc = KopawNodeDesc {
+            struct_size: size_of::<KopawNodeDesc>() as u32,
+            name: std::ptr::null(),
+            user_data: std::ptr::null_mut(),
+            outputs: 0,
+            inputs: 0,
+            queue_capacity: 4,
+            is_sink: 1,
+            self_driven: 0,
+            vtable: &vtable,
+        };
+        let source_desc = KopawNodeDesc {
+            is_sink: 0,
+            ..sink_desc
+        };
+        let first = unsafe { kopaw_graph_add_node(graph, &sink_desc) };
+        let second = unsafe { kopaw_graph_add_node(graph, &sink_desc) };
+        let source = unsafe { kopaw_graph_add_node(graph, &source_desc) };
+        assert!(first != 0 && second != 0 && source != 0);
+
+        assert_eq!(unsafe { kopaw_node_sink_done(graph, 0) }, KOPAW_E_INVALID);
+        assert_eq!(
+            unsafe { kopaw_node_sink_done(graph, source) },
+            KOPAW_E_INVALID
+        );
+        assert_eq!(unsafe { kopaw_graph_start(graph) }, KOPAW_OK);
+        assert_eq!(unsafe { kopaw_node_sink_done(graph, first) }, KOPAW_OK);
+        assert_eq!(unsafe { kopaw_graph_state(graph) }, KOPAW_STATE_RUNNING);
+        assert_eq!(unsafe { kopaw_node_sink_done(graph, first) }, KOPAW_OK);
+        assert_eq!(unsafe { kopaw_graph_state(graph) }, KOPAW_STATE_RUNNING);
+        assert_eq!(unsafe { kopaw_node_sink_done(graph, second) }, KOPAW_OK);
+        assert_eq!(unsafe { kopaw_graph_state(graph) }, KOPAW_STATE_FINISHED);
+        assert_eq!(unsafe { kopaw_node_sink_done(graph, second) }, KOPAW_OK);
+        assert_eq!(unsafe { kopaw_graph_state(graph) }, KOPAW_STATE_FINISHED);
+        unsafe { kopaw_graph_free(graph) };
+    }
 }
 
 /// 打包 ABI 版本：高 16 位为主版本，低 16 位为次版本。

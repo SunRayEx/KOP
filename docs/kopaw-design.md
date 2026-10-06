@@ -171,8 +171,14 @@ test_media.mkv (mpeg4+mp2)
 - 解码输出在节点内完成标准化（sws→RGBA、swr→f32/48k/2ch），帧格式对下游统一；
 - 视频渲染：双缓冲乒乓纹理 + 动态渲染（Vulkan 1.3 dynamic rendering）+ FIFO 垂直同步；
   着色器仅做全屏采样；
-- 音频：SPSC 无锁环形缓冲（`kop/spsc_ring.h`），150ms 预缓冲后起播，
-  回调内零锁零分配；欠载计一次告警。
+- 音频：SPSC 无锁环形缓冲（`kop/spsc_ring.h`），PortAudio 后端默认使用系统
+  默认输出路由（检测 PipeWire/Pulse 仅用于诊断，不强制切换 PCM）；显式
+  `KOPAW_AUDIO_BACKEND=alsa` 限制到 PortAudio ALSA host，`null` 后端只消费帧并
+  推进时钟。真实后端在 150ms 预缓冲后起播，EOS 后若剩余样本不足预缓冲阈值则
+  直接排空，回调内零锁零分配。
+- PortAudio 汇总统计在节点析构时打印 `callbacks/frames/underflow/overflow/
+  underrun/consumed`；回调与软件环形缓冲欠载均用原子计数。`sink_done` 只在
+  `null` 后端消费完 EOS，或真实后端回调排空 ring 后记账，避免 FINISHED 截断尾部。
 
 ### Vulkan YCbCr 渲染
 
@@ -189,17 +195,18 @@ RGB identity 的 YCbCr 转换提取/上采样平面，再在 shader 中应用矩
 消费端按原样填充即可）：
 
 - `out_mode=0`（SDR，默认）：HDR 内容以声明峰值为锚色调映射到 sRGB 8-bit UNORM；
-  KOPMS 合成场景固定走该路径。
+  KOPMS 无 HDR10 surface 或 swapchain 创建失败时安全回退该路径。
 - `out_mode=1`（HDR10）：统一到绝对亮度 cd/m²（PQ 的 EOTF 输出已是绝对值，
   HLG 乘名义峰 1000，SDR 传递函数乘 BT.2408 参考白 203）→ 内容原色矩阵
   （BT.709 / Display-P3 → Rec.2020，矩阵值从色度坐标推导并与单元测试逐项比对）
   → ST.2084 PQ OETF，写入 A2B10G10R10 + HDR10_ST2084 交换链。HDR10 是绝对
   编码，应用侧不做色调映射，高光收敛交给显示器。
 
-显示能力协商见 `vk_hdr.hpp`：表面存在 A2B10G10R10+ST.2084 对即为 HDR10 可用。
-播放器 `--hdr auto`（默认）在首帧内容为 PQ/HLG 且表面可用时重建交换链升级为
-HDR10；`--hdr on` 强制 HDR10（SDR 内容按参考白抬升）；不可用时安全回退 SDR。
-协商逻辑是纯函数，`kopaw-vk-hdr-test` 用合成格式表覆盖全部分支，无需 GPU。
+显示能力协商见 `vk_hdr.hpp` 与 KOPMS `VulkanScene`：表面存在
+A2B10G10R10+ST.2084 对且 swapchain colorspace 扩展可用时，窗口路径可启用 HDR10；
+设备支持 `VK_EXT_hdr_metadata` 时通过 `vkGetDeviceProcAddr` 动态提交 mastering display、
+MaxCLL 和 MaxFALL。播放器 `--hdr auto`（默认）与 KOPMS HDR 配置在能力不足或 swapchain
+创建失败时安全回退 SDR。协商逻辑由 `kopaw-vk-hdr-test` 的纯函数测试覆盖，无需 GPU。
 
 - 设备显式启用 Vulkan 1.3 dynamic rendering 和可选的 sampler YCbCr
   conversion；DMA-BUF、DRM modifier、foreign queue 扩展缺失时仍可渲染 CPU RGBA。

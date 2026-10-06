@@ -121,7 +121,8 @@
       RTC/RDP 适配器需 DTLS-SRTP/ICE 栈，离线环境不可引入
 - [x] KOPMS 显示输出配置接口：支持高分辨率、缩放、HDR 模式及 sRGB、DCI-P3、
       WGC、Rec.709、Rec.2020、NTSC、Display-P3、ACES 色域名称和输出映射配置；
-      真实 EDID/HDR metadata/DRM connector blob 能力探测仍待 KMS backend
+      window/Vulkan 路径已完成 HDR10 swapchain、可选 HDR metadata 与 SDR 回退，真实
+      EDID/DRM connector blob 能力探测和物理 KMS 直出仍待 KMS backend
 - [ ] 硬解零拷贝跨后端：CUVID（CUDA）原生导出需 EGL/DMA-BUF 互操作；
   NV12/P010 之外的原生表面格式按需扩展导出器
 - [x] 播放器本地 Vulkan 导入失败时动态回退 CPU 路径：RenderNode 丢弃失败的
@@ -130,11 +131,11 @@
   渲染侧按声明的传递函数走 EOTF → HDR 色调映射 → sRGB OETF；PQ/HLG 以内容
   声明峰值（MaxCLL/mastering）为锚映射到 SDR 目标（kopms-vk-nv12-scene 四探针
   覆盖 BT.709 与 PQ 两条路径）
-- [x] HDR10 交换链与显示能力协商（kopaw-vk-hdr-test 38 项断言 + 播放器 Wayland/MX450
-  实测）：表面有 A2B10G10R10+ST.2084 对时，`--hdr auto`（默认）在内容为 PQ/HLG 时
-  首帧后升级交换链，`--hdr on` 强制 HDR10，表面不支持或 `--hdr off` 回退 SDR；
-  HDR10 输出统一到绝对亮度 cd/m² 后过原色矩阵（BT.709/Display-P3→Rec.2020，
-  从色度坐标推导验证）再 ST.2084 PQ 编码，应用侧不做色调映射
+- [x] HDR10 交换链与显示能力协商：KOPAW 与 KOPMS window Vulkan 路径在表面提供
+      A2B10G10R10+ST.2084 且 swapchain colorspace 扩展可用时启用 HDR10，设备支持时
+      动态提交 mastering/MaxCLL/MaxFALL metadata；不支持或创建失败时安全回退 SDR。
+      HDR10 输出统一到绝对亮度 cd/m² 后过原色矩阵（BT.709/Display-P3→Rec.2020，
+      从色度坐标推导验证）再 ST.2084 PQ 编码，应用侧不做色调映射
 - [ ] KOPMS DRM 直出的合成结果 page-flip 真机验证（vkms / logind 环境）；
   已完成 DRM fd 接入 Wayland event loop、pending framebuffer 生命周期隔离，
   待在真实 KMS 环境验证 format/modifier/stride 与 page-flip event。

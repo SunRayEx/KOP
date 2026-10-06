@@ -240,6 +240,10 @@ bool VulkanBackend::pick_physical_device(std::string* error) {
                        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) == 0) {
                 ext_drm_modifier_ = true;
             }
+            if (strcmp(e.extensionName,
+                       VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
+                ext_hdr_metadata_ = true;
+            }
         }
         ext_dmabuf_ = memory_fd && dma_buf;
     }
@@ -278,6 +282,9 @@ bool VulkanBackend::create_device(std::string* error) {
     if (ext_foreign_queue_) {
         dev_exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
     }
+    if (ext_hdr_metadata_) {
+        dev_exts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+    }
     VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
     ycbcr.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
@@ -303,11 +310,43 @@ bool VulkanBackend::create_device(std::string* error) {
 
     vkGetDeviceQueue(dev_, gq_family_, 0, &gq_);
     vkGetDeviceQueue(dev_, pq_family_, 0, &pq_);
+    set_hdr_metadata_ = reinterpret_cast<PFN_vkSetHdrMetadataEXT>(
+        vkGetDeviceProcAddr(dev_, "vkSetHdrMetadataEXT"));
     get_memory_fd_properties_ =
         reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
             vkGetDeviceProcAddr(dev_, "vkGetMemoryFdPropertiesKHR"));
     // fd 导入经 vkAllocateMemory + VkImportMemoryFdInfoKHR（无独立导入函数）
     return false;
+}
+
+void VulkanBackend::update_hdr_metadata(const KopawColorMetadata* color) {
+    if (!dev_ || !sc_ || !hdr_output_ || !ext_hdr_metadata_ ||
+        !set_hdr_metadata_ || !color ||
+        !(color->hdr.flags & KOPAW_HDR_FLAG_MASTERING_DISPLAY)) {
+        return;
+    }
+    VkHdrMetadataEXT metadata{};
+    metadata.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+    metadata.displayPrimaryRed = {
+        color->hdr.display_primaries[0] / 100000.0f,
+        color->hdr.display_primaries[1] / 100000.0f};
+    metadata.displayPrimaryGreen = {
+        color->hdr.display_primaries[2] / 100000.0f,
+        color->hdr.display_primaries[3] / 100000.0f};
+    metadata.displayPrimaryBlue = {
+        color->hdr.display_primaries[4] / 100000.0f,
+        color->hdr.display_primaries[5] / 100000.0f};
+    metadata.whitePoint = {color->hdr.white_point[0] / 100000.0f,
+                           color->hdr.white_point[1] / 100000.0f};
+    metadata.maxLuminance = color->hdr.max_luminance / 1000.0f;
+    metadata.minLuminance = color->hdr.min_luminance / 1000.0f;
+    metadata.maxContentLightLevel = static_cast<float>(color->hdr.max_cll);
+    metadata.maxFrameAverageLightLevel = static_cast<float>(color->hdr.max_fall);
+    if (metadata.maxLuminance <= 0.0f) metadata.maxLuminance = 1000.0f;
+    if (metadata.minLuminance < 0.0f) metadata.minLuminance = 0.0f;
+    set_hdr_metadata_(dev_, 1, &sc_, &metadata);
+    hdr_metadata_ = metadata;
+    hdr_metadata_valid_ = true;
 }
 
 uint32_t VulkanBackend::find_memory_type(uint32_t type_bits,
@@ -1137,6 +1176,9 @@ bool VulkanBackend::draw(const KopawFrame* frame) {
             }
         }
     }
+    if (hdr_output_ && has_color_meta && content_hdr_) {
+        update_hdr_metadata(&frame->color);
+    }
 
     // 窗口缩放：帧缓冲尺寸与交换链不一致时重建（含最小化恢复）
     {
@@ -1480,8 +1522,12 @@ void VulkanBackend::shutdown() {
     inst_ = VK_NULL_HANDLE;
     pd_ = VK_NULL_HANDLE;
     get_memory_fd_properties_ = nullptr;
+    set_hdr_metadata_ = nullptr;
     ycbcr_enabled_ = false;
     ext_dmabuf_ = ext_drm_modifier_ = ext_foreign_queue_ = false;
+    ext_hdr_metadata_ = false;
+    hdr_metadata_ = {};
+    hdr_metadata_valid_ = false;
     frame_idx_ = cur_tex_ = 0;
     device_lost_ = false;
     inited_ = false;

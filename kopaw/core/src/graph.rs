@@ -16,11 +16,63 @@ use crate::clock::MediaClock;
 use crate::ffi::{self, KopawEventFn, KopawEventType, KopawFrame, KopawNodeVTable, KopawOutput};
 use crate::queue::{release_frame, retain_frame, FrameQueue, RecvResult, SendResult};
 use crate::scheduler::Scheduler;
-use std::collections::{HashMap, VecDeque};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static EVENT_CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static STOP_CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static ENGINE_THREAD_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct EventCallbackGuard;
+impl EventCallbackGuard {
+    fn enter() -> Self {
+        EVENT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+impl Drop for EventCallbackGuard {
+    fn drop(&mut self) {
+        EVENT_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+struct StopCallbackGuard;
+impl StopCallbackGuard {
+    fn enter() -> Self {
+        STOP_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+impl Drop for StopCallbackGuard {
+    fn drop(&mut self) {
+        STOP_CALLBACK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+struct EngineThreadGuard;
+impl EngineThreadGuard {
+    fn enter() -> Self {
+        ENGINE_THREAD_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+impl Drop for EngineThreadGuard {
+    fn drop(&mut self) {
+        ENGINE_THREAD_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+pub(crate) fn in_reentrant_callback_or_engine_thread() -> bool {
+    EVENT_CALLBACK_DEPTH.with(|depth| depth.get() != 0)
+        || STOP_CALLBACK_DEPTH.with(|depth| depth.get() != 0)
+        || ENGINE_THREAD_DEPTH.with(|depth| depth.get() != 0)
+}
 
 /// 每节点统计（性能基线）
 #[derive(Default)]
@@ -39,6 +91,10 @@ pub(crate) struct GraphCore {
     pub(crate) clock: MediaClock,
     event: Mutex<EventSlot>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Serialize stop/teardown. In particular, only one caller may drain and
+    /// join the node threads while another caller is shutting down the worker
+    /// scheduler.
+    stop_lock: Mutex<()>,
     stop_hints_done: AtomicBool,
     /// 每节点统计（下标 = node_id - 1；仅在构建期追加）
     stats: Mutex<Vec<Arc<NodeStat>>>,
@@ -88,10 +144,13 @@ pub(crate) struct NodeExec {
     name: String,
     user: *mut c_void,
     vt: KopawNodeVTable,
-    is_sink: bool,
     stat: Arc<NodeStat>,
     mx: Mutex<VecDeque<*mut KopawFrame>>,
     cv: Condvar,
+    /// Serializes queue admission with the stop-time final drain. It is kept
+    /// separate from `mx`: a worker must be able to drain while a producer is
+    /// waiting for capacity, otherwise shutdown can deadlock.
+    submit_lock: Mutex<()>,
     cap: usize,
     /// 是否已有 drain 任务在执行（单节点串行化）
     has_worker: AtomicBool,
@@ -122,6 +181,8 @@ struct Inner {
     destroyed: bool,
     sink_total: usize,
     sink_done: usize,
+    /// 已完成记账的汇聚节点，避免重复 sink_done 提前结束图。
+    sink_done_nodes: HashSet<u32>,
 }
 
 unsafe impl Send for GraphCore {}
@@ -140,6 +201,7 @@ impl GraphCore {
                 destroyed: false,
                 sink_total: 0,
                 sink_done: 0,
+                sink_done_nodes: HashSet::new(),
             }),
             state: Arc::new(AtomicU8::new(ffi::KOPAW_STATE_IDLE as u8)),
             clock: MediaClock::default(),
@@ -148,6 +210,7 @@ impl GraphCore {
                 user: std::ptr::null_mut(),
             }),
             threads: Mutex::new(Vec::new()),
+            stop_lock: Mutex::new(()),
             stop_hints_done: AtomicBool::new(false),
             stats: Mutex::new(Vec::new()),
             emitted_total: AtomicU64::new(0),
@@ -283,15 +346,22 @@ impl GraphCore {
     }
 
     pub fn start(&self) -> i32 {
+        // A graph may only be started once. Keep this check before spawning
+        // threads so a repeated start cannot mutate the lifecycle state.
+        // Start and stop must not interleave. Without this guard a concurrent
+        // stop could observe an empty thread list, return, and then start could
+        // publish newly spawned threads after teardown had already completed.
+        let stop_guard = lock(&self.stop_lock);
         let jobs: Vec<NodeJob>;
         {
             let mut g = lock(&self.inner);
-            if g.started {
+            if g.started || self.state.load(Ordering::Acquire) != ffi::KOPAW_STATE_IDLE as u8 {
                 return ffi::KOPAW_E_INVALID;
             }
             g.started = true;
             g.sink_total = g.nodes.values().filter(|n| n.is_sink).count();
             g.sink_done = 0;
+            g.sink_done_nodes.clear();
             jobs = g
                 .nodes
                 .iter()
@@ -322,6 +392,8 @@ impl GraphCore {
             )
             .is_err()
         {
+            let mut g = lock(&self.inner);
+            g.started = false;
             return ffi::KOPAW_E_INVALID;
         }
 
@@ -332,6 +404,7 @@ impl GraphCore {
         }
 
         let mut handles = Vec::with_capacity(jobs.len());
+        let mut spawn_failed = false;
         for job in jobs {
             let this = GraphRef(self);
             let kind = match (job.in_queues.iter().flatten().count(), job.self_driven) {
@@ -354,10 +427,10 @@ impl GraphCore {
                         name: job.name.clone(),
                         user: job.user,
                         vt: job.vt,
-                        is_sink: job.is_sink,
                         stat: job.stat.clone(),
                         mx: Mutex::new(VecDeque::new()),
                         cv: Condvar::new(),
+                        submit_lock: Mutex::new(()),
                         cap,
                         has_worker: AtomicBool::new(false),
                         stopped: AtomicBool::new(false),
@@ -371,6 +444,9 @@ impl GraphCore {
                         .spawn(move || Self::reactive_loop(&this, &job, &q));
                     if let Ok(h) = h {
                         handles.push(h);
+                    } else {
+                        spawn_failed = true;
+                        break;
                     }
                 }
                 NodeKind::MultiReactive => {
@@ -381,6 +457,9 @@ impl GraphCore {
                         .spawn(move || Self::reactive_multi_loop(&this, &job));
                     if let Ok(h) = h {
                         handles.push(h);
+                    } else {
+                        spawn_failed = true;
+                        break;
                     }
                 }
                 _ => {
@@ -392,6 +471,7 @@ impl GraphCore {
                         .spawn(move || {
                             let job = &job2;
                             if let Some(run) = job.vt.run {
+                                let _engine = EngineThreadGuard::enter();
                                 let rc = unsafe { run(job.user) };
                                 if rc != ffi::KOPAW_OK {
                                     unsafe { this.report_error(&job.name, rc) };
@@ -400,11 +480,28 @@ impl GraphCore {
                         });
                     if let Ok(h) = h {
                         handles.push(h);
+                    } else {
+                        spawn_failed = true;
+                        break;
                     }
                 }
             }
         }
         lock(&self.threads).extend(handles);
+        if spawn_failed {
+            drop(stop_guard);
+            self.stop();
+            return ffi::KOPAW_E_GENERIC;
+        }
+        let interrupted = self.state.load(Ordering::Acquire) as i32 == ffi::KOPAW_STATE_STOPPING;
+        drop(stop_guard);
+        if interrupted {
+            // A concurrent stop can only set STOPPING while start owns the
+            // lifecycle lock. Finish that request after releasing the lock so
+            // no thread or pool task survives a start/stop race.
+            self.stop();
+            return ffi::KOPAW_E_STOPPED;
+        }
         ffi::KOPAW_OK
     }
 
@@ -418,7 +515,10 @@ impl GraphCore {
                     let had_eos = unsafe { (*f).flags & ffi::KOPAW_FRAME_FLAG_EOS != 0 };
                     let t0 = Instant::now();
                     let rc = match job.vt.send {
-                        Some(send) => unsafe { send(job.user, f) },
+                        Some(send) => {
+                            let _engine = EngineThreadGuard::enter();
+                            unsafe { send(job.user, f) }
+                        }
                         None => ffi::KOPAW_E_GENERIC,
                     };
                     let us = t0.elapsed().as_micros() as u64;
@@ -427,9 +527,10 @@ impl GraphCore {
                     job.stat.busy_max_us.fetch_max(us, Ordering::Relaxed);
                     if rc == ffi::KOPAW_OK {
                         if had_eos && job.is_sink {
-                            // P1 延迟记账：引擎不再自动计数；汇聚节点在真正
-                            // 完成（如音频环形缓冲排空）后经
-                            // kopaw_node_sink_done 自行记账。
+                            // EOS is consumed by this sink callback. The sink
+                            // may still call sink_done later for delayed
+                            // hardware drain, but the engine loop must stop
+                            // accepting frames immediately.
                             break;
                         }
                         // 非汇聚节点：EOS 由 C++ 侧经 emit 向下游转发
@@ -479,7 +580,10 @@ impl GraphCore {
                 RecvResult::Frame(f) => {
                     let had_eos = unsafe { (*f).flags & ffi::KOPAW_FRAME_FLAG_EOS != 0 };
                     let t0 = Instant::now();
-                    let rc = unsafe { send_port(job.user, f, p as u32) };
+                    let rc = {
+                        let _engine = EngineThreadGuard::enter();
+                        unsafe { send_port(job.user, f, p as u32) }
+                    };
                     let us = t0.elapsed().as_micros() as u64;
                     job.stat.delivered.fetch_add(1, Ordering::Relaxed);
                     job.stat.busy_us.fetch_add(us, Ordering::Relaxed);
@@ -499,28 +603,68 @@ impl GraphCore {
         }
     }
 
-    pub fn stop(&self) -> i32 {
+    fn request_stop_signal(&self) {
         // 1) 状态推进到 STOPPING（不回退既有终态）
-        let cur = self.state.load(Ordering::Acquire);
-        if (cur as i32) < ffi::KOPAW_STATE_STOPPING {
-            self.state
-                .store(ffi::KOPAW_STATE_STOPPING as u8, Ordering::Release);
+        let mut cur = self.state.load(Ordering::Acquire);
+        while (cur as i32) < ffi::KOPAW_STATE_STOPPING {
+            match self.state.compare_exchange_weak(
+                cur,
+                ffi::KOPAW_STATE_STOPPING as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
         }
         // 2) 唤醒池模式执行体（等待中的 push/drain 立即退出）
         for e in lock(&self.execs).iter() {
             e.stopped.store(true, Ordering::Release);
             e.cv.notify_all();
         }
-        // 3) 一次性发送节点级停止提示
+        if let Some(s) = lock(&self.sched).clone() {
+            s.request_stop();
+        }
+    }
+
+    pub fn stop(&self) -> i32 {
+        // A graph that has already been freed must not invoke stop callbacks
+        // or touch node users again. This also makes repeated FFI stop/free
+        // calls deterministic after teardown.
+        if lock(&self.inner).destroyed {
+            return ffi::KOPAW_OK;
+        }
+        // Stop is an idempotent public API, but the teardown itself is not
+        // safely parallel: one caller must not shut down the scheduler while
+        // another caller is still joining a node that can submit work. A
+        // callback or graph-owned worker cannot join itself, so it only
+        // publishes the stop signal; an external caller performs the join.
+        if in_reentrant_callback_or_engine_thread() {
+            self.request_stop_signal();
+            return ffi::KOPAW_OK;
+        }
+        let _stop_guard = lock(&self.stop_lock);
+
+        // 1/2) Publish STOPPING and wake pool execution bodies.
+        self.request_stop_signal();
+        // 3) 一次性发送节点级停止提示。不要在持有 inner 锁时调用节点
+        // 回调：PortAudio stop 可能等待回调线程，而回调线程的 sink_done
+        // 又需要获取同一把锁，持锁调用会形成死锁。
         if !self.stop_hints_done.swap(true, Ordering::AcqRel) {
-            let g = lock(&self.inner);
-            for n in g.nodes.values() {
-                if let Some(stop) = n.vt.stop {
-                    unsafe { stop(n.user) };
-                }
+            let hints: Vec<_> = {
+                let g = lock(&self.inner);
+                g.nodes
+                    .values()
+                    .filter_map(|n| n.vt.stop.map(|stop| (stop, n.user)))
+                    .collect()
+            };
+            for (stop, user) in hints {
+                let _callback = StopCallbackGuard::enter();
+                unsafe { stop(user) };
             }
         }
-        // 4) 等待全部线程退出（节点线程 + 调度器工作者）
+        // 4) 等待全部节点线程退出。Node and pool callbacks are marked
+        // above, so this path is only entered by an external teardown caller.
         let handles: Vec<_> = lock(&self.threads).drain(..).collect();
         for h in handles {
             let _ = h.join();
@@ -528,18 +672,29 @@ impl GraphCore {
         if let Some(s) = lock(&self.sched).take() {
             s.shutdown();
         }
-        // 5) 回收滞留帧（线程已全部退出，此处无竞争）
+        // A callback may have requested stop while a scheduler job was still
+        // running. The scheduler is now fully joined, so no graph-owned job
+        // can access node users after this point.
+        // 5) 回收滞留帧. Producers are serialized with this final drain by
+        // submit_lock; all node threads have either exited or observed the
+        // stopping state above.
         {
             let g = lock(&self.inner);
             for l in g.links.values() {
                 l.queue.drain_release();
             }
         }
-        for e in lock(&self.execs).iter() {
-            let mut st = lock(&e.mx);
-            for f in st.drain(..) {
+        let execs = lock(&self.execs).clone();
+        for e in execs {
+            let frames = {
+                let _submit = lock(&e.submit_lock);
+                let mut st = lock(&e.mx);
+                st.drain(..).collect::<Vec<_>>()
+            };
+            for f in frames {
                 unsafe { release_frame(f) };
             }
+            e.has_worker.store(false, Ordering::Release);
             e.cv.notify_all();
         }
         ffi::KOPAW_OK
@@ -548,21 +703,54 @@ impl GraphCore {
     /// free 路径：停止 → 回收 → 逐节点 destroy。
     pub fn shutdown(&self) {
         self.stop();
-        let mut g = lock(&self.inner);
-        if !g.destroyed {
-            g.destroyed = true;
-            for n in g.nodes.values() {
-                if let Some(destroy) = n.vt.destroy {
-                    unsafe { destroy(n.user) };
-                }
+        // Never call foreign destroy callbacks while holding inner: destroy
+        // implementations may inspect graph statistics or re-enter the FFI.
+        let destroys = {
+            let mut g = lock(&self.inner);
+            if g.destroyed {
+                Vec::new()
+            } else {
+                g.destroyed = true;
+                g.nodes
+                    .values()
+                    .filter_map(|n| n.vt.destroy.map(|destroy| (destroy, n.user)))
+                    .collect::<Vec<_>>()
             }
+        };
+        for (destroy, user) in destroys {
+            unsafe { destroy(user) };
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_count(&self) -> usize {
+        lock(&self.threads).len()
     }
 
     pub fn set_event_cb(&self, cb: Option<KopawEventFn>, user: *mut c_void) {
         let mut e = lock(&self.event);
         e.cb = cb;
         e.user = user;
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn reset_for_test(&self) -> i32 {
+        let _stop_guard = lock(&self.stop_lock);
+        let mut g = lock(&self.inner);
+        if g.started || !g.destroyed {
+            return ffi::KOPAW_E_INVALID;
+        }
+        g.destroyed = false;
+        g.started = false;
+        self.stop_hints_done.store(false, Ordering::Release);
+        self.state
+            .store(ffi::KOPAW_STATE_IDLE as u8, Ordering::Release);
+        ffi::KOPAW_OK
+    }
+
+    pub(crate) fn is_destroyed(&self) -> bool {
+        lock(&self.inner).destroyed
     }
 
     pub fn state(&self) -> i32 {
@@ -633,12 +821,17 @@ impl GraphCore {
 
     /// 池模式：向执行体推帧（有界 + 条件变量背压），并唤醒 drain 任务。
     fn exec_push(&self, exec: &Arc<NodeExec>, frame: *mut KopawFrame) -> i32 {
+        // Admission covers both queue insertion and drain-task submission. The
+        // final stop-time drain takes the same lock, so it cannot race a
+        // producer that has passed the state check but has not inserted yet.
+        let _submit = lock(&exec.submit_lock);
         let mut st = lock(&exec.mx);
         loop {
             if exec.stopped.load(Ordering::Acquire)
                 || (self.state.load(Ordering::Acquire) as i32) >= ffi::KOPAW_STATE_STOPPING
             {
                 exec.stopped.store(true, Ordering::Release);
+                drop(st);
                 unsafe { release_frame(frame) };
                 exec.cv.notify_all();
                 return ffi::KOPAW_E_STOPPED;
@@ -657,14 +850,27 @@ impl GraphCore {
         // 认领并提交 drain 任务
         if !exec.has_worker.swap(true, Ordering::AcqRel) {
             let sched = lock(&self.sched).clone();
-            if let Some(s) = sched {
+            let accepted = if let Some(s) = sched {
                 let this = GraphRef(self);
                 let e = exec.clone();
-                s.submit(Box::new(move || this.drain_job(&e)));
+                s.submit(Box::new(move || this.drain_job(&e)))
             } else {
-                // 无调度器（异常状态）：归还帧避免卡死
+                false
+            };
+            if !accepted {
+                // The frame is already owned by exec.mx. Close admission and
+                // release the whole body here; stop() will not double-release
+                // it because it takes submit_lock before draining.
+                exec.stopped.store(true, Ordering::Release);
                 exec.has_worker.store(false, Ordering::Release);
-                unsafe { release_frame(frame) };
+                let frames = {
+                    let mut st = lock(&exec.mx);
+                    st.drain(..).collect::<Vec<_>>()
+                };
+                exec.cv.notify_all();
+                for f in frames {
+                    unsafe { release_frame(f) };
+                }
                 return ffi::KOPAW_E_STOPPED;
             }
         }
@@ -708,11 +914,6 @@ impl GraphCore {
         }
     }
 
-    /// 兼容入口：单入边节点 = 端口 0。
-    pub fn recv(&self, node: u32, out_frame: &mut *mut KopawFrame, timeout_ms: u32) -> i32 {
-        self.recv_port(node, 0, out_frame, timeout_ms)
-    }
-
     /// 池模式 drain 任务：串行消费执行体待处理帧并调用节点 send。
     /// （由调度器工作者执行；has_worker 认领保证单节点严格串行。）
     fn drain_job(&self, exec: &Arc<NodeExec>) {
@@ -726,10 +927,12 @@ impl GraphCore {
                     unsafe { release_frame(f) };
                     continue;
                 }
-                let had_eos = unsafe { (*f).flags & ffi::KOPAW_FRAME_FLAG_EOS != 0 };
                 let t0 = Instant::now();
                 let rc = match exec.vt.send {
-                    Some(send) => unsafe { send(exec.user, f) },
+                    Some(send) => {
+                        let _engine = EngineThreadGuard::enter();
+                        unsafe { send(exec.user, f) }
+                    }
                     None => ffi::KOPAW_E_GENERIC,
                 };
                 let us = t0.elapsed().as_micros() as u64;
@@ -750,7 +953,7 @@ impl GraphCore {
                 }
             }
             // 队列已空：释放认领；锁内复查避免丢失唤醒
-            let mut st = lock(&exec.mx);
+            let st = lock(&exec.mx);
             if st.is_empty() {
                 exec.has_worker.store(false, Ordering::Release);
                 if st.is_empty() {
@@ -770,6 +973,7 @@ impl GraphCore {
 
     /// 汇聚节点完成记账（延迟记账协议；可从任一节点线程/PA 回调线程调用）。
     /// 全部汇聚节点完成 → 图自然结束（FINISHED，仅触发一次）。
+    #[cfg(test)]
     pub(crate) fn note_sink_input_done(&self) {
         let finished = {
             let mut g = lock(&self.inner);
@@ -778,11 +982,22 @@ impl GraphCore {
             }
             g.sink_done == g.sink_total && g.sink_total > 0
         };
+        self.publish_finished(finished);
+    }
+
+    fn publish_finished(&self, finished: bool) {
         if finished {
-            let cur = self.state.load(Ordering::Acquire);
-            if (cur as i32) == ffi::KOPAW_STATE_RUNNING {
-                self.state
-                    .store(ffi::KOPAW_STATE_FINISHED as u8, Ordering::Release);
+            let expected = ffi::KOPAW_STATE_RUNNING as u8;
+            if self
+                .state
+                .compare_exchange(
+                    expected,
+                    ffi::KOPAW_STATE_FINISHED as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
                 self.fire_event(
                     ffi::KOPAW_EVENT_FINISHED,
                     ffi::KOPAW_OK,
@@ -793,19 +1008,23 @@ impl GraphCore {
         }
     }
 
-    /// kopaw_node_sink_done：带节点校验的记账入口
+    /// kopaw_node_sink_done：带节点校验且可重复调用的记账入口。
     pub fn sink_done(&self, node: u32) -> i32 {
-        let is_sink = {
-            let g = lock(&self.inner);
+        let finished = {
+            let mut g = lock(&self.inner);
             match g.nodes.get(&node) {
-                Some(n) => n.is_sink,
-                None => return ffi::KOPAW_E_INVALID,
+                Some(n) if n.is_sink => {}
+                _ => return ffi::KOPAW_E_INVALID,
             }
+            if !g.sink_done_nodes.insert(node) {
+                return ffi::KOPAW_OK;
+            }
+            if g.sink_done < g.sink_total {
+                g.sink_done += 1;
+            }
+            g.sink_done == g.sink_total && g.sink_total > 0
         };
-        if !is_sink {
-            return ffi::KOPAW_E_INVALID;
-        }
-        self.note_sink_input_done();
+        self.publish_finished(finished);
         ffi::KOPAW_OK
     }
 
@@ -880,17 +1099,30 @@ impl GraphCore {
     }
 
     fn fire_event(&self, ev: KopawEventType, code: i32, msg: &'static [u8]) {
-        let e = lock(&self.event);
-        if let Some(cb) = e.cb {
-            unsafe { cb(e.user, ev, code, msg.as_ptr() as *const _) };
+        // Do not invoke foreign code while holding the event mutex. Event
+        // handlers are allowed to inspect/reconfigure the graph, and a
+        // handler calling set_event_cb() would otherwise deadlock.
+        let callback = {
+            let e = lock(&self.event);
+            e.cb.map(|cb| (cb, e.user))
+        };
+        if let Some((cb, user)) = callback {
+            let _callback = EventCallbackGuard::enter();
+            unsafe { cb(user, ev, code, msg.as_ptr() as *const _) };
         }
     }
 
     unsafe fn report_error(&self, _node: &str, code: i32) {
-        let cur = self.state.load(Ordering::Acquire);
-        if (cur as i32) == ffi::KOPAW_STATE_RUNNING {
-            self.state
-                .store(ffi::KOPAW_STATE_ERROR as u8, Ordering::Release);
+        if self
+            .state
+            .compare_exchange(
+                ffi::KOPAW_STATE_RUNNING as u8,
+                ffi::KOPAW_STATE_ERROR as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             self.fire_event(ffi::KOPAW_EVENT_ERROR, code, b"node error\0");
         }
         // 诊断细节留给日志系统（MVP 不打印）
@@ -932,9 +1164,6 @@ unsafe impl Send for GraphRef {}
 unsafe impl Sync for GraphRef {}
 
 impl GraphRef {
-    unsafe fn note_sink_input_done(&self) {
-        (*self.0).note_sink_input_done();
-    }
     unsafe fn report_error(&self, name: &str, code: i32) {
         (*self.0).report_error(name, code);
     }
@@ -955,8 +1184,10 @@ mod tests {
         KOPAW_STATE_STOPPING,
     };
     use std::mem::size_of;
+    use std::sync::atomic::AtomicI32;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
 
     /// 每测试独立的泄漏计数与引用计数头：帧的 dma_buf_handle 指向 MockHdr
     /// （mock 帧不承载媒体数据，引擎永不解码该句柄，借用它是安全的）。
@@ -1088,6 +1319,432 @@ mod tests {
             self_driven,
         )
         .expect("add_node failed")
+    }
+
+    #[test]
+    fn event_callback_can_reenter_graph_api() {
+        unsafe extern "C" fn callback(
+            user: *mut c_void,
+            _ev: KopawEventType,
+            _code: i32,
+            _msg: *const i8,
+        ) {
+            let g = &*(user as *const GraphCore);
+            let _ = g.state();
+            g.set_event_cb(None, std::ptr::null_mut());
+        }
+        let g = GraphCore::new();
+        g.set_event_cb(Some(callback), &g as *const _ as *mut _);
+        g.fire_event(ffi::KOPAW_EVENT_ERROR, ffi::KOPAW_E_GENERIC, b"reentrant\0");
+        assert!(g.state() == ffi::KOPAW_STATE_IDLE);
+    }
+
+    #[test]
+    fn repeated_start_and_stop_are_safe() {
+        let g = GraphCore::new();
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: None,
+            destroy: None,
+            bind_output: None,
+            send_port: None,
+        };
+        g.add_node(
+            "sink".into(),
+            std::ptr::null_mut(),
+            &vt,
+            0,
+            0,
+            4,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(g.start(), KOPAW_OK);
+        assert_eq!(g.start(), ffi::KOPAW_E_INVALID);
+        assert_eq!(g.stop(), KOPAW_OK);
+        assert_eq!(g.stop(), KOPAW_OK);
+        assert_eq!(g.thread_count(), 0);
+        g.shutdown();
+    }
+
+    #[test]
+    fn concurrent_start_only_one_call_succeeds() {
+        let g = GraphCore::new();
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: None,
+            destroy: None,
+            bind_output: None,
+            send_port: None,
+        };
+        g.add_node(
+            "sink".into(),
+            std::ptr::null_mut(),
+            &vt,
+            0,
+            0,
+            4,
+            true,
+            false,
+        )
+        .unwrap();
+
+        const N: usize = 8;
+        let barrier = Arc::new(Barrier::new(N));
+        let graph = &g;
+        let results = (0..N)
+            .map(|_| Arc::new(AtomicI32::new(-1)))
+            .collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            for result in &results {
+                let barrier = barrier.clone();
+                let result = result.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    result.store(graph.start(), Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.load(Ordering::SeqCst) == KOPAW_OK)
+                .count(),
+            1
+        );
+        assert_eq!(g.stop(), KOPAW_OK);
+        assert_eq!(g.thread_count(), 0);
+        g.shutdown();
+    }
+
+    #[test]
+    fn concurrent_stop_calls_are_idempotent() {
+        let g = GraphCore::new();
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: None,
+            destroy: None,
+            bind_output: None,
+            send_port: None,
+        };
+        g.add_node(
+            "sink".into(),
+            std::ptr::null_mut(),
+            &vt,
+            0,
+            0,
+            4,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(g.start(), KOPAW_OK);
+
+        const N: usize = 8;
+        let barrier = Arc::new(Barrier::new(N));
+        let graph = &g;
+        std::thread::scope(|scope| {
+            for _ in 0..N {
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(graph.stop(), KOPAW_OK);
+                });
+            }
+        });
+        assert_eq!(g.thread_count(), 0);
+        g.shutdown();
+    }
+
+    #[test]
+    fn stop_from_engine_thread_does_not_self_join() {
+        struct StopState {
+            graph: *const GraphCore,
+            called: Arc<AtomicBool>,
+        }
+        unsafe extern "C" fn run(user: *mut c_void) -> i32 {
+            let state = &*(user as *const StopState);
+            (*state.graph).stop();
+            state.called.store(true, Ordering::SeqCst);
+            KOPAW_OK
+        }
+        unsafe extern "C" fn destroy(user: *mut c_void) {
+            drop(Box::from_raw(user as *mut StopState));
+        }
+
+        let g = GraphCore::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let state = Box::into_raw(Box::new(StopState {
+            graph: &g as *const _,
+            called: called.clone(),
+        }));
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: Some(run),
+            send: None,
+            stop: None,
+            destroy: Some(destroy),
+            bind_output: None,
+            send_port: None,
+        };
+        g.add_node("source".into(), state as _, &vt, 0, 0, 4, false, false)
+            .unwrap();
+        assert_eq!(g.start(), KOPAW_OK);
+        for _ in 0..100 {
+            if called.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(g.stop(), KOPAW_OK);
+        assert_eq!(g.thread_count(), 0);
+        g.shutdown();
+    }
+
+    #[test]
+    fn stop_from_pool_worker_does_not_self_join() {
+        struct StopSendState {
+            graph: *const GraphCore,
+            called: Arc<AtomicBool>,
+        }
+        unsafe extern "C" fn send(user: *mut c_void, frame: *mut KopawFrame) -> i32 {
+            let state = &*(user as *const StopSendState);
+            release_frame(frame);
+            (*state.graph).stop();
+            state.called.store(true, Ordering::SeqCst);
+            KOPAW_OK
+        }
+        unsafe extern "C" fn destroy(user: *mut c_void) {
+            drop(Box::from_raw(user as *mut StopSendState));
+        }
+
+        unsafe {
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            assert_eq!(g.set_workers(2), 2);
+            let source = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 1,
+            }));
+            let called = Arc::new(AtomicBool::new(false));
+            let sink = Box::into_raw(Box::new(StopSendState {
+                graph: &g as *const _,
+                called: called.clone(),
+            }));
+            let source_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(send),
+                stop: None,
+                destroy: Some(destroy),
+                bind_output: None,
+                send_port: None,
+            };
+            let source_id = add_named_node(&g, "source", source as _, source_vt, 1, false, false);
+            let sink_id = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
+            (*source).out = g.node_output(source_id, 0).unwrap();
+            assert_eq!(
+                g.connect(g.node_output(source_id, 0).unwrap(), sink_id, 0, 4),
+                KOPAW_OK
+            );
+            assert_eq!(g.start(), KOPAW_OK);
+            for _ in 0..100 {
+                if called.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(called.load(Ordering::SeqCst));
+            assert_eq!(g.stop(), KOPAW_OK);
+            assert_eq!(g.thread_count(), 0);
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0);
+            let _ = Box::from_raw(source);
+        }
+    }
+
+    #[test]
+    fn start_and_stop_race_is_safe() {
+        for _ in 0..64 {
+            let g = GraphCore::new();
+            let vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            g.add_node(
+                "sink".into(),
+                std::ptr::null_mut(),
+                &vt,
+                0,
+                0,
+                4,
+                true,
+                false,
+            )
+            .unwrap();
+            let graph = &g;
+            std::thread::scope(|scope| {
+                let barrier = Arc::new(Barrier::new(2));
+                let start_barrier = barrier.clone();
+                scope.spawn(move || {
+                    start_barrier.wait();
+                    let rc = graph.start();
+                    assert!(rc == KOPAW_OK || rc == ffi::KOPAW_E_INVALID);
+                });
+                let stop_barrier = barrier;
+                scope.spawn(move || {
+                    stop_barrier.wait();
+                    assert_eq!(graph.stop(), KOPAW_OK);
+                });
+            });
+            assert_eq!(g.stop(), KOPAW_OK);
+            assert_eq!(g.thread_count(), 0);
+            g.shutdown();
+        }
+    }
+
+    #[test]
+    fn stop_callback_can_reenter_graph_api() {
+        struct StopState {
+            graph: *const GraphCore,
+            called: Arc<AtomicBool>,
+        }
+        unsafe extern "C" fn stop(user: *mut c_void) {
+            let state = &*(user as *const StopState);
+            let _ = (*state.graph).state();
+            (*state.graph).stop();
+            state.called.store(true, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn destroy(user: *mut c_void) {
+            drop(Box::from_raw(user as *mut StopState));
+        }
+
+        let g = GraphCore::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let state = Box::into_raw(Box::new(StopState {
+            graph: &g as *const _,
+            called: called.clone(),
+        }));
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: Some(stop),
+            destroy: Some(destroy),
+            bind_output: None,
+            send_port: None,
+        };
+        g.add_node("sink".into(), state as _, &vt, 0, 0, 4, true, false)
+            .unwrap();
+        assert_eq!(g.start(), KOPAW_OK);
+        assert_eq!(g.stop(), KOPAW_OK);
+        assert!(called.load(Ordering::SeqCst));
+        g.shutdown();
+    }
+
+    #[test]
+    fn destroy_callback_can_reenter_graph_api() {
+        struct DestroyState {
+            graph: *const GraphCore,
+            called: Arc<AtomicBool>,
+        }
+        unsafe extern "C" fn destroy(user: *mut c_void) {
+            let state = &*(user as *const DestroyState);
+            let _ = (*state.graph).state();
+            (*state.graph).set_event_cb(None, std::ptr::null_mut());
+            state.called.store(true, Ordering::SeqCst);
+            drop(Box::from_raw(user as *mut DestroyState));
+        }
+
+        let g = GraphCore::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let state = Box::into_raw(Box::new(DestroyState {
+            graph: &g as *const _,
+            called: called.clone(),
+        }));
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: None,
+            destroy: Some(destroy),
+            bind_output: None,
+            send_port: None,
+        };
+        g.add_node("sink".into(), state as _, &vt, 0, 0, 4, true, false)
+            .unwrap();
+        g.shutdown();
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(g.shutdown(), ());
+    }
+
+    #[test]
+    fn sink_done_is_idempotent_per_node() {
+        let g = GraphCore::new();
+        let vt = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: None,
+            stop: None,
+            destroy: None,
+            bind_output: None,
+            send_port: None,
+        };
+        let first = g
+            .add_node(
+                "sink0".into(),
+                std::ptr::null_mut(),
+                &vt,
+                0,
+                0,
+                4,
+                true,
+                false,
+            )
+            .unwrap();
+        let second = g
+            .add_node(
+                "sink1".into(),
+                std::ptr::null_mut(),
+                &vt,
+                0,
+                0,
+                4,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(g.start(), ffi::KOPAW_OK);
+        assert_eq!(g.sink_done(first), ffi::KOPAW_OK);
+        assert_eq!(g.sink_done(first), ffi::KOPAW_OK);
+        assert_eq!(g.state(), ffi::KOPAW_STATE_RUNNING);
+        assert_eq!(g.sink_done(second), ffi::KOPAW_OK);
+        assert_eq!(g.state(), ffi::KOPAW_STATE_FINISHED);
+        g.shutdown();
     }
 
     /// 源节点：发 n 帧数据 + 1 帧 EOS 后返回
@@ -1262,7 +1919,7 @@ mod tests {
                 let st = &*(user as *const DrvState);
                 loop {
                     let mut f: *mut KopawFrame = std::ptr::null_mut();
-                    match (*st.g).recv(st.node, &mut f, 10) {
+                    match (*st.g).recv_port(st.node, 0, &mut f, 10) {
                         KOPAW_OK => {
                             GOT.fetch_add(1, Ordering::SeqCst);
                             let eos = (*f).flags & KOPAW_FRAME_FLAG_EOS != 0;
@@ -1852,11 +2509,6 @@ mod tests {
                         _ => return 9,
                     }
                 }
-            }
-
-            struct Drv2Host {
-                g: *const GraphCore,
-                node: u32,
             }
 
             let leak = AtomicUsize::new(0);

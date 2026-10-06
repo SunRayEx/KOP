@@ -124,6 +124,7 @@ impl FrameQueue {
     pub fn recv(&self, timeout: Duration) -> RecvResult {
         let deadline_poll = Duration::from_millis(1);
         let mut waited = Duration::ZERO;
+        let start = std::time::Instant::now();
         loop {
             if self.state.load(Ordering::Acquire) >= STATE_STOPPING {
                 return RecvResult::Stopped;
@@ -131,11 +132,20 @@ impl FrameQueue {
             match self.rx.recv_timeout(deadline_poll) {
                 Ok(SendFrame(f)) => {
                     self.note_dequeue();
+                    // STOPPING takes precedence over a frame that became
+                    // visible concurrently with the state transition. The
+                    // receiver must not leak that ownership.
+                    if self.state.load(Ordering::Acquire) >= STATE_STOPPING {
+                        unsafe { release_frame(f) };
+                        return RecvResult::Stopped;
+                    }
                     return RecvResult::Frame(f);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     waited += deadline_poll;
-                    if timeout != Duration::ZERO && waited >= timeout {
+                    if timeout != Duration::ZERO
+                        && (waited >= timeout || start.elapsed() >= timeout)
+                    {
                         return RecvResult::Timeout;
                     }
                 }
@@ -158,8 +168,78 @@ impl FrameQueue {
     /// 停止后清空并释放全部滞留帧（只允许在所有线程退出后调用）。
     pub fn drain_release(&self) {
         while let Ok(SendFrame(f)) = self.rx.try_recv() {
+            self.note_dequeue();
             unsafe { release_frame(f) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::{KopawColorMetadata, KopawSyncFence};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counter {
+        released: AtomicUsize,
+    }
+
+    unsafe extern "C" fn release(f: *mut KopawFrame) {
+        let counter = (*f).user_data as *const Counter;
+        (*counter).released.fetch_add(1, Ordering::SeqCst);
+        drop(Box::from_raw(f));
+    }
+
+    fn frame(counter: &Counter) -> *mut KopawFrame {
+        Box::into_raw(Box::new(KopawFrame {
+            struct_size: std::mem::size_of::<KopawFrame>() as u32,
+            media_type: 0,
+            flags: 0,
+            pts: 0,
+            dts: 0,
+            format: unsafe { std::mem::zeroed() },
+            dma_buf_handle: 0,
+            size: 0,
+            stride: 0,
+            memory_type: 0,
+            dma_fd: -1,
+            plane_count: 0,
+            planes: unsafe { std::mem::zeroed() },
+            acquire_fence: KopawSyncFence {
+                kind: 0,
+                fd: -1,
+                value: 0,
+            },
+            user_data: counter as *const _ as *mut _,
+            retain: None,
+            release: Some(release),
+            drm_fourcc: 0,
+            color: KopawColorMetadata::default(),
+        }))
+    }
+
+    #[test]
+    fn timeout_is_bounded_and_stop_releases_queued_frames() {
+        let state = Arc::new(AtomicU8::new(0));
+        let counter = Counter {
+            released: AtomicUsize::new(0),
+        };
+        let q = FrameQueue::new(2, state.clone());
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            q.recv(Duration::from_millis(5)),
+            RecvResult::Timeout
+        ));
+        assert!(t0.elapsed() < Duration::from_millis(100));
+        assert!(matches!(q.send(frame(&counter)), SendResult::Ok));
+        state.store(STATE_STOPPING, Ordering::Release);
+        assert!(matches!(
+            q.recv(Duration::from_millis(1)),
+            RecvResult::Stopped
+        ));
+        assert!(matches!(q.send(frame(&counter)), SendResult::Stopped));
+        q.drain_release();
+        assert_eq!(counter.released.load(Ordering::SeqCst), 2);
     }
 }
 

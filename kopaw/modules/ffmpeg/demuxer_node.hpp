@@ -50,6 +50,12 @@ public:
         video_out_ = video_out;
         audio_out_ = audio_out;
     }
+    // 只向实际启用的下游发包。播放器使用 --no-video/--no-audio 时，
+    // 禁用流不会再被投递到未连接输出，也不会污染 dropped 统计。
+    void set_active_streams(bool video, bool audio) {
+        emit_video_ = video;
+        emit_audio_ = audio;
+    }
 
     // 引擎线程入口（vtable.run 转发至此）
     int32_t run_impl();
@@ -73,6 +79,8 @@ private:
     KopawOutput video_out_{};
     KopawOutput audio_out_{};
     std::atomic<bool> stopped_{false};
+    bool emit_video_ = true;
+    bool emit_audio_ = true;
     FfmpegIoControl io_{&stopped_};
     uint32_t timeout_ms_ = 15000;
     uint32_t buffer_ms_ = 250;

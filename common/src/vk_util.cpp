@@ -38,9 +38,11 @@ bool create_instance(const std::vector<const char*>& extra_instance_extensions,
     return check_vk(vkCreateInstance(&ci, nullptr, out), "vkCreateInstance", error);
 }
 
-bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
-                            DeviceContext* ctx, std::string* error,
-                            const std::string& prefer_name) {
+bool pick_and_create_device(
+    const std::vector<const char*>& extra_extensions,
+    const std::vector<const char*>& optional_extensions,
+    std::vector<const char*>* enabled_optional_extensions,
+    DeviceContext* ctx, std::string* error, const std::string& prefer_name) {
     if (!ctx || ctx->instance == VK_NULL_HANDLE) {
         if (error) *error = "device selection requires an instance";
         return false;
@@ -155,6 +157,24 @@ bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
     std::vector<const char*> extensions;
     for (const char* name : kBaseExtensions) extensions.push_back(name);
     for (const char* name : extra_extensions) extensions.push_back(name);
+    if (enabled_optional_extensions) enabled_optional_extensions->clear();
+    for (const char* name : optional_extensions) {
+        uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(best, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> available(n);
+        vkEnumerateDeviceExtensionProperties(best, nullptr, &n, available.data());
+        bool present = false;
+        for (const auto& ext : available) {
+            if (std::strcmp(ext.extensionName, name) == 0) {
+                present = true;
+                break;
+            }
+        }
+        if (present) {
+            extensions.push_back(name);
+            if (enabled_optional_extensions) enabled_optional_extensions->push_back(name);
+        }
+    }
 
     VkDeviceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -182,6 +202,13 @@ bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
         return false;
     }
     return true;
+}
+
+bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
+                            DeviceContext* ctx, std::string* error,
+                            const std::string& prefer_name) {
+    return pick_and_create_device(extra_extensions, {}, nullptr, ctx, error,
+                                  prefer_name);
 }
 
 uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits,

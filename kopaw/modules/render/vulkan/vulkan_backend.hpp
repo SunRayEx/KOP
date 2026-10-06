@@ -43,6 +43,7 @@ private:
     bool create_device(std::string* error);
     bool create_swapchain_objects(std::string* error);
     void destroy_swapchain_objects();
+    void update_hdr_metadata(const KopawColorMetadata* color);
     bool create_pipeline(std::string* error);
     bool build_pipeline(VkPipelineLayout layout, VkPipeline* pipeline,
                         std::string* error);
@@ -102,8 +103,10 @@ private:
     bool ext_dmabuf_ = false;
     bool ext_foreign_queue_ = false;
     bool ext_swapchain_colorspace_ = false;  // 枚举带色彩空间的表面格式（HDR10 协商）
+    bool ext_hdr_metadata_ = false;          // 提交 HDR10 mastering/CLL 元数据
     bool ycbcr_enabled_ = false;
     PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties_ = nullptr;
+    PFN_vkSetHdrMetadataEXT set_hdr_metadata_ = nullptr;
 
     VkSwapchainKHR sc_ = VK_NULL_HANDLE;
     VkFormat sc_fmt_ = VK_FORMAT_B8G8R8A8_UNORM;
@@ -146,6 +149,8 @@ private:
 
     bool device_lost_ = false;
     bool hdr_sdr_warning_logged_ = false;
+    bool hdr_metadata_valid_ = false;
+    VkHdrMetadataEXT hdr_metadata_{};
 };
 
 } // namespace kopaw

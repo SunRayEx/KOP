@@ -61,6 +61,16 @@ bool pick_and_create_device(const std::vector<const char*>& extra_extensions,
                             DeviceContext* ctx, std::string* error,
                             const std::string& prefer_name = {});
 
+// optional_extensions are enabled only when the selected physical device
+// advertises them; they never make device selection fail. The selected names
+// are reported through the caller-owned vector.
+bool pick_and_create_device(
+    const std::vector<const char*>& extra_extensions,
+    const std::vector<const char*>& optional_extensions,
+    std::vector<const char*>* enabled_optional_extensions,
+    DeviceContext* ctx, std::string* error,
+    const std::string& prefer_name = {});
+
 uint32_t find_memory_type(VkPhysicalDevice physical, uint32_t type_bits,
                           VkMemoryPropertyFlags props, std::string* error);
 

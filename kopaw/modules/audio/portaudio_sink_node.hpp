@@ -22,9 +22,10 @@ public:
     void set_output(KopawOutput out) { out_ = out; }  // 仅占位：sink 无输出
     // P1 延迟记账：ring 排空 + 播放完成后由 PA 回调线程调用
     // kopaw_node_sink_done，player 必须在入图后回填节点 id
-    void set_node_id(uint32_t id) { node_id_ = id; }
-    // 入图后回填图句柄（构造发生在 kopaw_graph_new 之前）
-    void set_graph(KopawGraph* g) { g_ = g; }
+    void set_node_id(uint32_t id) { node_id_.store(id, std::memory_order_release); }
+    // 入图后回填图句柄（构造发生在 kopaw_graph_new 之前）。open() 会先启动
+    // PortAudio，故这里必须以原子发布，避免回调线程与入图阶段形成数据竞争。
+    void set_graph(KopawGraph* g) { g_.store(g, std::memory_order_release); }
 
     int32_t send_impl(KopawFrame* f);
     void stop_impl();
@@ -33,12 +34,14 @@ private:
     static int pa_callback(const void* in, void* out, unsigned long frames,
                            const PaStreamCallbackTimeInfo* time_info,
                            PaStreamCallbackFlags status_flags, void* user);
-    int callback_impl(float* out, unsigned long frames);
+    int callback_impl(float* out, unsigned long frames,
+                      PaStreamCallbackFlags status_flags);
+    void report_sink_done();
 
-    KopawGraph* g_;
+    std::atomic<KopawGraph*> g_;
     int rate_;
     int channels_;
-    uint32_t node_id_ = 0;
+    std::atomic<uint32_t> node_id_{0};
 
     PaStream* stream_ = nullptr;
     bool null_backend_ = false;
@@ -47,8 +50,13 @@ private:
     bool primed_ = false;
     std::atomic<bool> eos_{false};
     std::atomic<bool> stopped_{false};
+    std::atomic<bool> sink_done_reported_{false};
     std::atomic<uint64_t> consumed_frames_{0};
-    std::atomic<int> underruns_{0};
+    std::atomic<uint64_t> callback_count_{0};
+    std::atomic<uint64_t> callback_frames_{0};
+    std::atomic<uint64_t> output_underflows_{0};
+    std::atomic<uint64_t> output_overflows_{0};
+    std::atomic<uint64_t> underruns_{0};
 
     KopawOutput out_{};
 };

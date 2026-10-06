@@ -121,10 +121,30 @@ mat3 kopaw_primaries_to_2020(int primaries) {
                 0.0433130, 0.0113620, 0.8955960);
 }
 
-// 完整链：非线性 RGB →（EOTF）→ 线性 →（HDR 色调映射）→（sRGB OETF）→ 输出。
-vec3 kopaw_apply_color(vec3 nonlin, int transfer, float peak_in) {
+// 内容原色 → Rec.709（sRGB/SDR）的线性矩阵。
+// SDR 输出不能直接把 BT.2020/P3 数值当作 sRGB，否则 WCG 内容会发生
+// 明显的色相与饱和度错误。矩阵采用 D65 白点，GLSL mat3 参数按列排列。
+mat3 kopaw_primaries_to_709(int primaries) {
+    if (primaries == KOPAW_P_BT2020) {
+        return mat3(1.660491, -0.124550, -0.018151,
+                    -0.587641, 1.132900, -0.100579,
+                    -0.072850, -0.008349, 1.118729);
+    }
+    if (primaries == KOPAW_P_P3) {
+        return mat3(1.224745, -0.042058, -0.019642,
+                    -0.224904, 1.042081, -0.078655,
+                    0.000000, 0.000000, 1.098537);
+    }
+    return mat3(1.0);
+}
+
+// 完整链：非线性 RGB →（EOTF）→ 原色转换到 Rec.709
+// →（HDR 色调映射）→（sRGB OETF）→ 输出。
+vec3 kopaw_apply_color(vec3 nonlin, int transfer, float peak_in,
+                       int primaries) {
     if (transfer == KOPAW_TF_UNKNOWN) return nonlin;
     vec3 lin = kopaw_eotf(nonlin, transfer);
+    lin = kopaw_primaries_to_709(primaries) * lin;
     if (transfer == KOPAW_TF_PQ) {
         lin = kopaw_tonemap(lin, peak_in);
     } else if (transfer == KOPAW_TF_HLG) {
@@ -141,7 +161,7 @@ vec3 kopaw_apply_color(vec3 nonlin, int transfer, float peak_in) {
 vec3 kopaw_apply_color_out(vec3 nonlin, int transfer, float peak_in,
                           int out_mode, int primaries, float sdr_ref) {
     if (out_mode != KOPAW_OUT_HDR10)
-        return kopaw_apply_color(nonlin, transfer, peak_in);
+        return kopaw_apply_color(nonlin, transfer, peak_in, primaries);
     if (sdr_ref <= 0.0) sdr_ref = KOPAW_SDR_REF_CD;
     if (transfer == KOPAW_TF_UNKNOWN) {
         // 未声明内容按 SDR 参考白抬升后进 HDR10。

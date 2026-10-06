@@ -31,6 +31,8 @@ bool DemuxerNode::open(const std::string& path,
         return false;
     }
     stopped_.store(false, std::memory_order_release);
+    emit_video_ = true;
+    emit_audio_ = true;
     video_stream_ = -1;
     audio_stream_ = -1;
     fmt_.reset();  // 重新打开前先归还旧上下文
@@ -215,17 +217,23 @@ int32_t DemuxerNode::run_impl() {
         }
         eagain_since = 0;
         if (pkt->stream_index == video_stream_ && video_stream_ >= 0) {
-            emit_packet(pkt.get(), fmt_->streams[video_stream_]->time_base, video_out_,
-                        KOPAW_MEDIA_VIDEO);
+            if (emit_video_) {
+                emit_packet(pkt.get(), fmt_->streams[video_stream_]->time_base, video_out_,
+                            KOPAW_MEDIA_VIDEO);
+            }
         } else if (pkt->stream_index == audio_stream_ && audio_stream_ >= 0) {
-            emit_packet(pkt.get(), fmt_->streams[audio_stream_]->time_base, audio_out_,
-                        KOPAW_MEDIA_AUDIO);
+            if (emit_audio_) {
+                emit_packet(pkt.get(), fmt_->streams[audio_stream_]->time_base, audio_out_,
+                            KOPAW_MEDIA_AUDIO);
+            }
         }
         pkt.unref();
     }
     if (clean_eof) {
-        if (video_stream_ >= 0) emit_eos(video_out_, KOPAW_MEDIA_VIDEO);
-        if (audio_stream_ >= 0) emit_eos(audio_out_, KOPAW_MEDIA_AUDIO);
+        if (video_stream_ >= 0 && emit_video_)
+            emit_eos(video_out_, KOPAW_MEDIA_VIDEO);
+        if (audio_stream_ >= 0 && emit_audio_)
+            emit_eos(audio_out_, KOPAW_MEDIA_AUDIO);
     }
     return failure;
 }

@@ -51,9 +51,22 @@ AudioSinkNode::AudioSinkNode(KopawGraph* g, int rate, int channels)
 
 AudioSinkNode::~AudioSinkNode() {
     if (stream_) {
+        // graph_stop normally calls stop_impl first. Keep destruction safe for
+        // pre-graph failures as well; Pa_CloseStream waits for the callback
+        // thread after aborting the stream.
+        Pa_AbortStream(stream_);
         Pa_CloseStream(stream_);
         stream_ = nullptr;
     }
+    KOP_LOG_INFO(kTag,
+                 "音频输出统计：callbacks=%llu frames=%llu underflow=%llu overflow=%llu "
+                 "underrun=%llu consumed=%llu",
+                 static_cast<unsigned long long>(callback_count_.load()),
+                 static_cast<unsigned long long>(callback_frames_.load()),
+                 static_cast<unsigned long long>(output_underflows_.load()),
+                 static_cast<unsigned long long>(output_overflows_.load()),
+                 static_cast<unsigned long long>(underruns_.load()),
+                 static_cast<unsigned long long>(consumed_frames_.load()));
 }
 
 bool AudioSinkNode::open(std::string* error) {
@@ -76,20 +89,58 @@ bool AudioSinkNode::open(std::string* error) {
     }
     const char* requested = std::getenv("KOPAW_AUDIO_DEVICE");
     PaDeviceIndex device = paNoDevice;
+    PaHostApiIndex required_host = -1;
+    if (backend && std::strcmp(backend, "alsa") == 0) {
+        const int host_count = Pa_GetHostApiCount();
+        for (int i = 0; i < host_count; ++i) {
+            const PaHostApiInfo* api = Pa_GetHostApiInfo(i);
+            if (api && api->name && ::strcasecmp(api->name, "ALSA") == 0) {
+                required_host = i;
+                break;
+            }
+        }
+        if (required_host < 0) {
+            *error = "PortAudio 没有 ALSA host API";
+            return false;
+        }
+    }
     if (requested && requested[0] != '\0') {
         const int count = Pa_GetDeviceCount();
+        auto usable = [this, required_host](const PaDeviceInfo* info) {
+            return info && info->name &&
+                   (required_host < 0 || info->hostApi == required_host) &&
+                   info->maxOutputChannels >= channels_;
+        };
+        // Prefer an exact name. This keeps `--audio-device default` from
+        // accidentally selecting `sysdefault` merely because it appears first
+        // in PortAudio's device list, while retaining case-insensitive partial
+        // matching as a convenience for long hardware names.
         for (int i = 0; i < count; ++i) {
             const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
-            if (info && info->maxOutputChannels >= channels_ &&
-                ::strcasestr(info->name, requested)) {
+            if (usable(info) && ::strcasecmp(info->name, requested) == 0) {
                 device = i;
                 break;
+            }
+        }
+        if (device == paNoDevice) {
+            for (int i = 0; i < count; ++i) {
+                const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+                if (usable(info) && ::strcasestr(info->name, requested)) {
+                    device = i;
+                    break;
+                }
             }
         }
         if (device == paNoDevice) {
             *error = std::string("找不到 PortAudio 输出设备: ") + requested;
             return false;
         }
+    } else if (required_host >= 0) {
+        // The explicit ALSA mode selects the ALSA host's default device rather
+        // than merely logging the mode. This remains deterministic if another
+        // PortAudio host is added in a future build.
+        const PaHostApiInfo* api = Pa_GetHostApiInfo(required_host);
+        device = api ? api->defaultOutputDevice : paNoDevice;
     } else {
         // Do not force a PipeWire PCM or reorder PortAudio devices. Detect the
         // desktop audio server, then take ownership of the system default
@@ -134,6 +185,7 @@ bool AudioSinkNode::open(std::string* error) {
         stream_ = nullptr;
         return false;
     }
+    KOP_LOG_INFO(kTag, "音频输出流已启动：rate=%d channels=%d", rate_, channels_);
     return true;
 }
 
@@ -155,7 +207,7 @@ int32_t AudioSinkNode::send_impl(KopawFrame* f) {
     if (f->flags & KOPAW_FRAME_FLAG_EOS) {
         eos_.store(true, std::memory_order_release);
         f->release(f);
-        if (null_backend_ && node_id_ != 0) kopaw_node_sink_done(g_, node_id_);
+        if (null_backend_) report_sink_done();
         return KOPAW_OK;
     }
     const uint8_t* input = cpu_data(f);
@@ -165,7 +217,11 @@ int32_t AudioSinkNode::send_impl(KopawFrame* f) {
     if (null_backend_) {
         const size_t frames = left / static_cast<size_t>(channels_);
         const uint64_t consumed = consumed_frames_.fetch_add(frames) + frames;
-        kopaw_graph_clock_set(g_, static_cast<int64_t>(consumed * 1000000ULL / rate_));
+        KopawGraph* graph = g_.load(std::memory_order_acquire);
+        if (graph) {
+            kopaw_graph_clock_set(
+                graph, static_cast<int64_t>(consumed * 1000000ULL / rate_));
+        }
         f->release(f);
         return KOPAW_OK;
     }
@@ -191,19 +247,40 @@ void AudioSinkNode::stop_impl() {
     if (stream_) Pa_AbortStream(stream_);
 }
 
-int AudioSinkNode::pa_callback(const void*, void* out, unsigned long frames,
-                               const PaStreamCallbackTimeInfo*,
-                               PaStreamCallbackFlags, void* user) {
-    return static_cast<AudioSinkNode*>(user)->callback_impl(
-        static_cast<float*>(out), frames);
+void AudioSinkNode::report_sink_done() {
+    const uint32_t node_id = node_id_.load(std::memory_order_acquire);
+    KopawGraph* graph = g_.load(std::memory_order_acquire);
+    if (node_id != 0 && graph &&
+        !sink_done_reported_.exchange(true, std::memory_order_acq_rel)) {
+        kopaw_node_sink_done(graph, node_id);
+    }
 }
 
-int AudioSinkNode::callback_impl(float* out, unsigned long frames) {
+int AudioSinkNode::pa_callback(const void*, void* out, unsigned long frames,
+                               const PaStreamCallbackTimeInfo*,
+                               PaStreamCallbackFlags status_flags, void* user) {
+    return static_cast<AudioSinkNode*>(user)->callback_impl(
+        static_cast<float*>(out), frames, status_flags);
+}
+
+int AudioSinkNode::callback_impl(float* out, unsigned long frames,
+                                 PaStreamCallbackFlags status_flags) {
+    callback_count_.fetch_add(1, std::memory_order_relaxed);
+    callback_frames_.fetch_add(frames, std::memory_order_relaxed);
+    if (status_flags & paOutputUnderflow)
+        output_underflows_.fetch_add(1, std::memory_order_relaxed);
+    if (status_flags & paOutputOverflow)
+        output_overflows_.fetch_add(1, std::memory_order_relaxed);
     const size_t need = static_cast<size_t>(frames) * channels_;
 
     if (!primed_) {
         ring_.sync_producer_pos();
-        if (ring_.read_space() < prime_target_) {
+        // Before EOS, keep the latency target to avoid starting on a tiny
+        // buffer. Once EOS is known, no producer can add more samples, so
+        // drain whatever remains instead of waiting forever for 150 ms of
+        // audio that a short clip may not contain.
+        if (!eos_.load(std::memory_order_acquire) &&
+            ring_.read_space() < prime_target_) {
             memset(out, 0, need * sizeof(float));
             return stopped_.load(std::memory_order_relaxed) ? paComplete : paContinue;
         }
@@ -214,23 +291,25 @@ int AudioSinkNode::callback_impl(float* out, unsigned long frames) {
     if (got < need) {
         memset(out + got, 0, (need - got) * sizeof(float));
         // EOS 排空期的零填充是正常收尾，不算欠载
-        if (!eos_.load(std::memory_order_acquire) &&
-            underruns_.fetch_add(1) == 0) {
-            KOP_LOG_WARN(kTag, "音频欠载");
+        if (!eos_.load(std::memory_order_acquire)) {
+            underruns_.fetch_add(1, std::memory_order_relaxed);
         }
     }
     ring_.sync_producer_pos();
 
     const uint64_t consumed = consumed_frames_.fetch_add(got / channels_) + got / channels_;
     // 主时钟：按已消费帧数上报媒体位置
-    kopaw_graph_clock_set(g_, static_cast<int64_t>(consumed * 1000000ULL / rate_));
+    KopawGraph* graph = g_.load(std::memory_order_acquire);
+    if (graph) {
+        kopaw_graph_clock_set(
+            graph, static_cast<int64_t>(consumed * 1000000ULL / rate_));
+    }
 
     // EOS 之后缓冲排空即完成播放（got < need 的最后一次也视为结束）。
     // P1 尾部修复：此刻才向引擎记账 sink_done——FINISHED 触发时
     // 全部缓冲音频都已真正播出，不再截断尾部。
     if (eos_.load(std::memory_order_acquire) && ring_.read_space() == 0) {
-        KOP_LOG_DEBUG(kTag, "ring 排空，记账 sink_done（node=%u）", node_id_);
-        if (node_id_ != 0) kopaw_node_sink_done(g_, node_id_);
+        report_sink_done();
         return paComplete;
     }
     return stopped_.load(std::memory_order_relaxed) ? paComplete : paContinue;

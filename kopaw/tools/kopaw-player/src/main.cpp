@@ -238,6 +238,15 @@ int main(int argc, char** argv) {
     }
     if (!audio_backend.empty()) setenv("KOPAW_AUDIO_BACKEND", audio_backend.c_str(), 1);
     if (!audio_device.empty()) setenv("KOPAW_AUDIO_DEVICE", audio_device.c_str(), 1);
+    const char* audio_backend_env = std::getenv("KOPAW_AUDIO_BACKEND");
+    if (audio_backend_env && std::strcmp(audio_backend_env, "auto") != 0 &&
+        std::strcmp(audio_backend_env, "alsa") != 0 &&
+        std::strcmp(audio_backend_env, "null") != 0) {
+        KOP_LOG_ERROR(kTag,
+                      "不支持的 KOPAW_AUDIO_BACKEND: %s（可选 auto|alsa|null）",
+                      audio_backend_env);
+        return 2;
+    }
     bool pa_inited = false, glfw_inited = false;
     const bool null_audio = std::getenv("KOPAW_AUDIO_BACKEND") &&
                             std::strcmp(std::getenv("KOPAW_AUDIO_BACKEND"), "null") == 0;
@@ -295,6 +304,7 @@ int main(int argc, char** argv) {
         }
         const bool use_video = want_video && demux->has_video();
         const bool use_audio = want_audio && demux->has_audio();
+        demux->set_active_streams(use_video, use_audio);
         if (!use_video && !use_audio) {
             KOP_LOG_ERROR(kTag, "没有可播放的流");
             exit_code = 2;
@@ -427,6 +437,14 @@ int main(int argc, char** argv) {
     } while (false);
 
     // ---- 阶段二：入图、连线、启动（此后节点只能经 graph_free 释放） ----
+    // 节点 id 与收尾代码同作用域：graph_free 只回收成功入图的节点，
+    // 入图失败的对象需按 id 是否为 0 补回收。
+    uint32_t demux_id = 0;
+    uint32_t vdec_id = 0;
+    uint32_t vfilter_id = 0;
+    uint32_t adec_id = 0;
+    uint32_t afilter_id = 0;
+    uint32_t asink_id = 0;
     uint32_t vrender_id = 0;
     uint32_t ins_id = 0;
     kopaw::RenderNode* vrender = nullptr;
@@ -449,11 +467,8 @@ int main(int argc, char** argv) {
         }
 
         KopawNodeDesc d_demux = demux->desc(g);
-        uint32_t demux_id = kopaw_graph_add_node(g, &d_demux);
-        uint32_t vdec_id = 0, adec_id = 0, asink_id = 0;
+        demux_id = kopaw_graph_add_node(g, &d_demux);
         bool wired = demux_id != 0;
-        uint32_t vfilter_id = 0;
-        uint32_t afilter_id = 0;
         if (vdec) {
             KopawNodeDesc d_vdec = vdec->desc(g);
             vdec_id = kopaw_graph_add_node(g, &d_vdec);
@@ -673,8 +688,21 @@ int main(int argc, char** argv) {
                                            static_cast<uint32_t>(stats_buf.size()));
             if (n > 0) KOP_LOG_INFO(kTag, "最终统计: %s", stats_buf.c_str());
         }
-        kopaw_graph_free(g);  // 逐一调用节点 destroy；节点对象在此全部析构
+        kopaw_graph_free(g);  // 逐一调用节点 destroy；成功入图的节点在此析构
         g = nullptr;
+        // graph_free 只回收成功入图的节点；入图失败的对象在此补回收
+        if (demux_id == 0) delete demux;
+        if (vdec_id == 0) delete vdec;
+        if (vfilter_id == 0) delete vfilter;
+        if (adec_id == 0) delete adec;
+        if (afilter_id == 0) delete afilter;
+        if (asink_id == 0) delete asink;
+        if (vrender_id == 0) {
+            delete vrender;  // 持有 backend_，析构一并回收渲染后端
+#if KOPAW_HAVE_KOPMS_SINK
+            delete kopms_sink;
+#endif
+        }
     } else {
         // 尚未入图：手动清理阶段一的对象
 #if KOPAW_HAVE_KOPMS_SINK
