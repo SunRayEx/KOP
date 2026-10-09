@@ -7,6 +7,7 @@
 use std::ffi::CStr;
 use std::mem::size_of;
 use std::os::raw::{c_char, c_void};
+use std::thread;
 
 // ---------------------------------------------------------------------------
 // Stable ABI identity and feature negotiation
@@ -381,6 +382,24 @@ pub unsafe extern "C" fn kopaw_graph_free(g: *mut KopawGraph) {
         return;
     }
     let core = Box::from_raw(g as *mut crate::graph::GraphCore);
+    if crate::graph::in_reentrant_callback_or_engine_thread() {
+        // Do not drop GraphCore on a node/callback stack: its node user data
+        // and thread handles are still active until this callback returns.
+        // Move teardown to an external thread, which can join the caller.
+        let core_addr = Box::into_raw(core) as usize;
+        if thread::Builder::new()
+            .name("kopaw:deferred-free".to_string())
+            .spawn(move || {
+                let core = Box::from_raw(core_addr as *mut crate::graph::GraphCore);
+                core.shutdown();
+            })
+            .is_err()
+        {
+            // Leaking is safer than freeing a graph while its callback is
+            // still executing. The host can retry cleanup after the failure.
+        }
+        return;
+    }
     core.shutdown();
 }
 
@@ -683,6 +702,9 @@ pub unsafe extern "C" fn kopaw_graph_stats_json(
 mod tests {
     use super::*;
     use crate::graph::GraphCore;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn graph_stats_json_nul_terminates_without_overread() {
@@ -701,6 +723,74 @@ mod tests {
         assert_eq!(&buf[..expected.len()], expected.as_bytes());
         assert_eq!(buf[expected.len()], 0);
         assert_eq!(buf[need], 0xa5);
+    }
+
+    #[test]
+    fn graph_free_from_engine_thread_defers_drop_until_return() {
+        struct FreeState {
+            graph: *mut KopawGraph,
+            returned: Arc<AtomicBool>,
+            destroyed: Arc<AtomicBool>,
+            early_destroy: Arc<AtomicBool>,
+        }
+
+        unsafe extern "C" fn run(user: *mut c_void) -> i32 {
+            let state = &*(user as *const FreeState);
+            kopaw_graph_free(state.graph);
+            state.returned.store(true, Ordering::SeqCst);
+            KOPAW_OK
+        }
+
+        unsafe extern "C" fn destroy(user: *mut c_void) {
+            let state = Box::from_raw(user as *mut FreeState);
+            if !state.returned.load(Ordering::SeqCst) {
+                state.early_destroy.store(true, Ordering::SeqCst);
+            }
+            state.destroyed.store(true, Ordering::SeqCst);
+        }
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let early_destroy = Arc::new(AtomicBool::new(false));
+        let graph = unsafe { kopaw_graph_new() };
+        assert!(!graph.is_null());
+        let state = Box::into_raw(Box::new(FreeState {
+            graph,
+            returned: returned.clone(),
+            destroyed: destroyed.clone(),
+            early_destroy: early_destroy.clone(),
+        }));
+        let vtable = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: Some(run),
+            send: None,
+            stop: None,
+            destroy: Some(destroy),
+            bind_output: None,
+            send_port: None,
+        };
+        let desc = KopawNodeDesc {
+            struct_size: size_of::<KopawNodeDesc>() as u32,
+            name: std::ptr::null(),
+            user_data: state as *mut c_void,
+            outputs: 0,
+            inputs: 0,
+            queue_capacity: 4,
+            is_sink: 0,
+            self_driven: 0,
+            vtable: &vtable,
+        };
+        assert_ne!(unsafe { kopaw_graph_add_node(graph, &desc) }, 0);
+        assert_eq!(unsafe { kopaw_graph_start(graph) }, KOPAW_OK);
+        for _ in 0..200 {
+            if destroyed.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(returned.load(Ordering::SeqCst));
+        assert!(destroyed.load(Ordering::SeqCst));
+        assert!(!early_destroy.load(Ordering::SeqCst));
     }
 
     #[test]

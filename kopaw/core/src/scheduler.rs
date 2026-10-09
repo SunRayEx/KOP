@@ -187,7 +187,15 @@ impl Scheduler {
                 handles.push(h);
             }
         }
+        let worker_count = handles.len();
         *sched.handles.lock().unwrap_or_else(|p| p.into_inner()) = handles;
+        if worker_count == 0 {
+            // A scheduler with no live workers cannot make progress. Close
+            // admission immediately so callers can release owned work rather
+            // than enqueueing jobs that can never execute.
+            sched.stopped_flag.store(true, Ordering::Release);
+            sched.stop.store(true, Ordering::Release);
+        }
         sched
     }
 
