@@ -73,3 +73,5 @@ changes, link relevant issues, list build/test commands run, and include logs
 or screenshots for player, compositor, or protocol-visible changes. Update
 the relevant document in `docs/` when architecture or user-facing behavior
 changes.
+
+Complete one coherent major work item before committing or pushing. A major item includes its implementation, focused regression tests, formatting, relevant sanitizer or integration verification, and documentation updates when behavior or workflow changes. Do not push intermediate fragments of an unfinished major item. Use the authenticated GitHub CLI workflow for the final remote delivery, and report the exact commit, verification commands, and any remaining unrelated worktree changes.

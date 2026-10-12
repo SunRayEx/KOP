@@ -72,6 +72,33 @@ mod tests {
     }
 
     #[test]
+    fn spawn_failure_closes_admission_when_all_workers_fail() {
+        let scheduler = Scheduler::new_with_spawn_failures(2, 2);
+        assert_eq!(scheduler.worker_count(), 0);
+        assert!(!scheduler.submit(Box::new(|| {})));
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn spawn_failure_keeps_partial_pool_usable() {
+        let scheduler = Scheduler::new_with_spawn_failures(2, 1);
+        assert_eq!(scheduler.worker_count(), 1);
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        assert!(scheduler.submit(Box::new(move || {
+            done2.store(true, Ordering::SeqCst);
+        })));
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done.load(Ordering::SeqCst));
+        scheduler.shutdown();
+    }
+
+    #[test]
     fn zero_workers_are_normalized() {
         let scheduler = Scheduler::new(0);
         assert_eq!(scheduler.worker_count(), 1);
@@ -156,6 +183,20 @@ mod tests {
 impl Scheduler {
     /// 启动 n 个工作者线程。
     pub fn new(n: usize) -> Arc<Self> {
+        Self::new_with_spawn_failures(n, 0)
+    }
+
+    #[cfg(test)]
+    fn new_with_spawn_failures(n: usize, spawn_failures: usize) -> Arc<Self> {
+        Self::new_impl(n, spawn_failures)
+    }
+
+    #[cfg(not(test))]
+    fn new_with_spawn_failures(n: usize, _spawn_failures: usize) -> Arc<Self> {
+        Self::new_impl(n, 0)
+    }
+
+    fn new_impl(n: usize, mut spawn_failures: usize) -> Arc<Self> {
         // A zero-worker pool cannot make progress; retain the public API's
         // usable invariant by creating one worker.
         let n = n.max(1);
@@ -178,11 +219,19 @@ impl Scheduler {
         for (i, w) in local_workers.into_iter().enumerate() {
             let sched2 = sched.clone();
             let stealers = stealers.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("kopaw:w{i}"))
-                .spawn(move || {
-                    worker_loop(w, &sched2, &stealers);
-                });
+            let h = if spawn_failures > 0 {
+                spawn_failures -= 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected worker spawn failure",
+                ))
+            } else {
+                std::thread::Builder::new()
+                    .name(format!("kopaw:w{i}"))
+                    .spawn(move || {
+                        worker_loop(w, &sched2, &stealers);
+                    })
+            };
             if let Ok(h) = h {
                 handles.push(h);
             }
