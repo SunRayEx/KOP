@@ -947,7 +947,7 @@ impl GraphCore {
                 let mut st = lock(&exec.mx);
                 st.drain(..).collect()
             };
-            for f in batch {
+            for (index, f) in batch.iter().copied().enumerate() {
                 if (self.state.load(Ordering::Acquire) as i32) >= ffi::KOPAW_STATE_STOPPING {
                     unsafe { release_frame(f) };
                     continue;
@@ -965,14 +965,19 @@ impl GraphCore {
                 exec.stat.busy_us.fetch_add(us, Ordering::Relaxed);
                 exec.stat.busy_max_us.fetch_max(us, Ordering::Relaxed);
                 if rc != ffi::KOPAW_OK {
-                    // 节点未接管帧；出错后清空残余并停用该执行体
+                    // 节点未接管帧；释放当前批次剩余帧和队列残余，
+                    // 然后停用该执行体。
                     unsafe { release_frame(f) };
+                    for r in batch[index + 1..].iter().copied() {
+                        unsafe { release_frame(r) };
+                    }
                     unsafe { self.report_error(&exec.name, rc) };
                     let mut st = lock(&exec.mx);
                     for r in st.drain(..) {
                         unsafe { release_frame(r) };
                     }
                     exec.stopped.store(true, Ordering::Release);
+                    exec.has_worker.store(false, Ordering::Release);
                     exec.cv.notify_all();
                     return;
                 }
@@ -2191,7 +2196,77 @@ mod tests {
     }
 
     /// P2 池调度：与 source_pass_sink 相同的图，用 worker 池代替每节点一线程。
-    /// 验证串行化 drain 的顺序性、FINISHED 与零泄漏。
+    /// 验证 send 失败后执行体停止且不会遗留 worker 认领状态。
+    #[test]
+    fn pool_scheduler_send_error_stops_exec_without_stale_worker() {
+        unsafe {
+            struct ErrorState {
+                calls: AtomicUsize,
+            }
+            unsafe extern "C" fn fail_send(user: *mut c_void, frame: *mut KopawFrame) -> i32 {
+                let state = &*(user as *const ErrorState);
+                state.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = frame;
+                ffi::KOPAW_E_GENERIC
+            }
+            unsafe extern "C" fn destroy_error(user: *mut c_void) {
+                let _ = Box::from_raw(user as *mut ErrorState);
+            }
+
+            let leak = AtomicUsize::new(0);
+            let g = GraphCore::new();
+            assert_eq!(g.set_workers(1), 1);
+            let src = Box::into_raw(Box::new(SrcState {
+                out: KopawOutput { id: 0 },
+                g: &g as *const _,
+                leak: &leak,
+                n: 2,
+            }));
+            let sink = Box::into_raw(Box::new(ErrorState {
+                calls: AtomicUsize::new(0),
+            }));
+            let src_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: Some(source_run),
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            let sink_vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: Some(fail_send),
+                stop: None,
+                destroy: Some(destroy_error),
+                bind_output: None,
+                send_port: None,
+            };
+            let n_src = add_named_node(&g, "src", src as _, src_vt, 1, false, false);
+            let n_sink = add_named_node(&g, "fail", sink as _, sink_vt, 0, true, false);
+            (*src).out = g.node_output(n_src, 0).unwrap();
+            assert_eq!(
+                g.connect(g.node_output(n_src, 0).unwrap(), n_sink, 0, 4),
+                KOPAW_OK
+            );
+            assert_eq!(g.start(), KOPAW_OK);
+            for _ in 0..200 {
+                if (*sink).calls.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!((*sink).calls.load(Ordering::SeqCst), 1);
+            assert!(lock(&g.execs).iter().all(|e| {
+                !e.has_worker.load(Ordering::SeqCst) && e.stopped.load(Ordering::SeqCst)
+            }));
+            g.shutdown();
+            assert_eq!(leak.load(Ordering::SeqCst), 0, "error path leaked frames");
+            let _ = Box::from_raw(src);
+        }
+    }
+
     #[test]
     fn pool_scheduler_source_pass_sink_no_leak() {
         unsafe {
