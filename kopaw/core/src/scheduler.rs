@@ -6,6 +6,7 @@
 //! 本地队列供未来任务内派生子任务使用（当前由窃取路径覆盖）。
 
 use crossbeam_deque::{Injector, Stealer, Worker};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, ThreadId};
@@ -49,6 +50,43 @@ mod tests {
         scheduler.shutdown();
         assert_eq!(count.load(Ordering::SeqCst), accepted);
         assert!(!scheduler.submit(Box::new(|| {})));
+    }
+
+    #[test]
+    fn panicking_job_does_not_kill_worker() {
+        let scheduler = Scheduler::new(1);
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        assert!(scheduler.submit(Box::new(|| panic!("job failure"))));
+        assert!(scheduler.submit(Box::new(move || {
+            done2.store(true, Ordering::SeqCst);
+        })));
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(scheduler.worker_count(), 1);
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn panicking_job_during_shutdown_does_not_drop_remaining_jobs() {
+        let scheduler = Scheduler::new(1);
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..4 {
+            let done = done.clone();
+            assert!(scheduler.submit(Box::new(move || {
+                done.fetch_add(1, Ordering::SeqCst);
+                if done.load(Ordering::SeqCst) == 1 {
+                    panic!("shutdown job failure");
+                }
+            })));
+        }
+        scheduler.shutdown();
+        assert_eq!(done.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -324,6 +362,12 @@ impl Drop for Scheduler {
     }
 }
 
+fn run_job(job: Job) {
+    // A plugin callback is foreign work from the scheduler's perspective. One
+    // panic must not terminate the worker and strand already accepted jobs.
+    let _ = catch_unwind(AssertUnwindSafe(job));
+}
+
 fn worker_loop(local: Worker<Job>, sched: &Scheduler, stealers: &[Stealer<Job>]) {
     let stop = &sched.stop;
     let global = &sched.global;
@@ -331,11 +375,11 @@ fn worker_loop(local: Worker<Job>, sched: &Scheduler, stealers: &[Stealer<Job>])
         if stop.load(Ordering::Acquire) {
             // 排空后退出（保证已提交任务执行完毕）
             while let Some(j) = local.pop() {
-                j();
+                run_job(j);
             }
             loop {
                 match global.steal() {
-                    crossbeam_deque::Steal::Success(j) => j(),
+                    crossbeam_deque::Steal::Success(j) => run_job(j),
                     crossbeam_deque::Steal::Empty => return,
                     crossbeam_deque::Steal::Retry => continue,
                 }
@@ -343,7 +387,7 @@ fn worker_loop(local: Worker<Job>, sched: &Scheduler, stealers: &[Stealer<Job>])
         }
         // 1) 本地（任务派生场景）→ 2) 全局窃取 → 3) 窃取他人
         if let Some(j) = local.pop() {
-            j();
+            run_job(j);
             continue;
         }
         let mut got = None;
@@ -358,7 +402,7 @@ fn worker_loop(local: Worker<Job>, sched: &Scheduler, stealers: &[Stealer<Job>])
             }
         }
         if let Some(j) = got {
-            j();
+            run_job(j);
             continue;
         }
         let mut stolen = false;
@@ -366,7 +410,7 @@ fn worker_loop(local: Worker<Job>, sched: &Scheduler, stealers: &[Stealer<Job>])
             loop {
                 match st.steal() {
                     crossbeam_deque::Steal::Success(j) => {
-                        j();
+                        run_job(j);
                         stolen = true;
                         break;
                     }
