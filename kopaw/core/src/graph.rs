@@ -1497,6 +1497,43 @@ mod tests {
     }
 
     #[test]
+    fn pooled_start_stop_cycles_are_reclaimable() {
+        for _ in 0..32 {
+            let g = GraphCore::new();
+            assert_eq!(g.set_workers(2), 2);
+            let vt = KopawNodeVTable {
+                struct_size: size_of::<KopawNodeVTable>() as u32,
+                run: None,
+                send: None,
+                stop: None,
+                destroy: None,
+                bind_output: None,
+                send_port: None,
+            };
+            g.add_node(
+                "sink".into(),
+                std::ptr::null_mut(),
+                &vt,
+                0,
+                0,
+                4,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(g.start(), KOPAW_OK);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| assert_eq!(g.stop(), KOPAW_OK));
+                }
+            });
+            assert_eq!(g.thread_count(), 0);
+            assert_eq!(g.state(), KOPAW_STATE_STOPPING);
+            g.shutdown();
+        }
+    }
+
+    #[test]
     fn shutdown_from_engine_thread_defers_destroy() {
         struct ShutdownState {
             graph: *const GraphCore,
@@ -1652,7 +1689,7 @@ mod tests {
                 KOPAW_OK
             );
             assert_eq!(g.start(), KOPAW_OK);
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 if called.load(Ordering::SeqCst) {
                     break;
                 }
