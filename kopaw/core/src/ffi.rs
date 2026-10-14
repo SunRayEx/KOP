@@ -702,6 +702,7 @@ pub unsafe extern "C" fn kopaw_graph_stats_json(
 mod tests {
     use super::*;
     use crate::graph::GraphCore;
+    use crate::queue::release_frame;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -782,6 +783,125 @@ mod tests {
         };
         assert_ne!(unsafe { kopaw_graph_add_node(graph, &desc) }, 0);
         assert_eq!(unsafe { kopaw_graph_start(graph) }, KOPAW_OK);
+        for _ in 0..200 {
+            if destroyed.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(returned.load(Ordering::SeqCst));
+        assert!(destroyed.load(Ordering::SeqCst));
+        assert!(!early_destroy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn graph_free_from_pool_worker_defers_drop_until_return() {
+        struct SourceState {
+            graph: *mut KopawGraph,
+            output: KopawOutput,
+        }
+        struct SinkState {
+            graph: *mut KopawGraph,
+            returned: Arc<AtomicBool>,
+            destroyed: Arc<AtomicBool>,
+            early_destroy: Arc<AtomicBool>,
+        }
+
+        unsafe extern "C" fn release_test_frame(frame: *mut KopawFrame) {
+            drop(Box::from_raw(frame));
+        }
+        unsafe extern "C" fn source_run(user: *mut c_void) -> i32 {
+            let state = &*(user as *const SourceState);
+            let mut frame = Box::new(std::mem::zeroed::<KopawFrame>());
+            frame.struct_size = size_of::<KopawFrame>() as u32;
+            frame.retain = None;
+            frame.release = Some(release_test_frame);
+            let frame = Box::into_raw(frame);
+            kopaw_graph_emit(state.graph, state.output, frame)
+        }
+        unsafe extern "C" fn sink_send(user: *mut c_void, frame: *mut KopawFrame) -> i32 {
+            let state = &*(user as *const SinkState);
+            kopaw_graph_free(state.graph);
+            release_frame(frame);
+            state.returned.store(true, Ordering::SeqCst);
+            KOPAW_OK
+        }
+        unsafe extern "C" fn source_destroy(user: *mut c_void) {
+            drop(Box::from_raw(user as *mut SourceState));
+        }
+        unsafe extern "C" fn sink_destroy(user: *mut c_void) {
+            let state = Box::from_raw(user as *mut SinkState);
+            if !state.returned.load(Ordering::SeqCst) {
+                state.early_destroy.store(true, Ordering::SeqCst);
+            }
+            state.destroyed.store(true, Ordering::SeqCst);
+        }
+
+        let returned = Arc::new(AtomicBool::new(false));
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let early_destroy = Arc::new(AtomicBool::new(false));
+        let graph = unsafe { kopaw_graph_new() };
+        assert!(!graph.is_null());
+        assert_eq!(unsafe { kopaw_graph_set_workers(graph, 1) }, 1);
+        let source = Box::into_raw(Box::new(SourceState {
+            graph,
+            output: KopawOutput { id: 0 },
+        }));
+        let sink = Box::into_raw(Box::new(SinkState {
+            graph,
+            returned: returned.clone(),
+            destroyed: destroyed.clone(),
+            early_destroy: early_destroy.clone(),
+        }));
+        let source_vtable = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: Some(source_run),
+            send: None,
+            stop: None,
+            destroy: Some(source_destroy),
+            bind_output: None,
+            send_port: None,
+        };
+        let sink_vtable = KopawNodeVTable {
+            struct_size: size_of::<KopawNodeVTable>() as u32,
+            run: None,
+            send: Some(sink_send),
+            stop: None,
+            destroy: Some(sink_destroy),
+            bind_output: None,
+            send_port: None,
+        };
+        let source_desc = KopawNodeDesc {
+            struct_size: size_of::<KopawNodeDesc>() as u32,
+            name: std::ptr::null(),
+            user_data: source as *mut c_void,
+            outputs: 1,
+            inputs: 0,
+            queue_capacity: 1,
+            is_sink: 0,
+            self_driven: 0,
+            vtable: &source_vtable,
+        };
+        let sink_desc = KopawNodeDesc {
+            user_data: sink as *mut c_void,
+            outputs: 0,
+            inputs: 1,
+            is_sink: 1,
+            vtable: &sink_vtable,
+            ..source_desc
+        };
+        let source_id = unsafe { kopaw_graph_add_node(graph, &source_desc) };
+        let sink_id = unsafe { kopaw_graph_add_node(graph, &sink_desc) };
+        assert_ne!(source_id, 0);
+        assert_ne!(sink_id, 0);
+        unsafe {
+            (*source).output = kopaw_graph_node_output(graph, source_id, 0);
+            assert_eq!(
+                kopaw_graph_connect(graph, (*source).output, sink_id, 0, 1),
+                KOPAW_OK
+            );
+            assert_eq!(kopaw_graph_start(graph), KOPAW_OK);
+        }
         for _ in 0..200 {
             if destroyed.load(Ordering::SeqCst) {
                 break;
