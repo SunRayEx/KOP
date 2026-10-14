@@ -1940,10 +1940,11 @@ mod tests {
     }
 
     #[test]
-    fn stop_mid_stream_no_leak() {
+    fn pool_scheduler_stop_mid_stream_no_leak() {
         unsafe {
             let leak = AtomicUsize::new(0);
             let g = GraphCore::new();
+            assert_eq!(g.set_workers(2), 2);
             // 慢速汇聚：每帧 5ms，制造队列积压与阻塞发送
             let sink = Box::into_raw(Box::new(SinkState {
                 g: &g as *const _,
