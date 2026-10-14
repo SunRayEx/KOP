@@ -947,6 +947,9 @@ impl GraphCore {
                 let mut st = lock(&exec.mx);
                 st.drain(..).collect()
             };
+            // Draining frees all queue capacity at once. Wake producers here
+            // rather than making them wait for the periodic timeout.
+            exec.cv.notify_all();
             for (index, f) in batch.iter().copied().enumerate() {
                 if (self.state.load(Ordering::Acquire) as i32) >= ffi::KOPAW_STATE_STOPPING {
                     unsafe { release_frame(f) };
@@ -1981,7 +1984,7 @@ mod tests {
             let n_sink = add_named_node(&g, "sink", sink as _, sink_vt, 0, true, false);
             (*src).out = g.node_output(n_src, 0).unwrap();
             let o = g.node_output(n_src, 0).unwrap();
-            assert_eq!(g.connect(o, n_sink, 0, 2), KOPAW_OK);
+            assert_eq!(g.connect(o, n_sink, 0, 1), KOPAW_OK);
             assert_eq!(g.start(), KOPAW_OK);
 
             std::thread::sleep(Duration::from_millis(50));
