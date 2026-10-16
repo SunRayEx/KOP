@@ -7,9 +7,9 @@ struct AVFrame;
 
 namespace kopaw {
 
-// Copies only standardized AVFrame color fields and HDR side data. The
-// resulting values remain UNKNOWN when FFmpeg did not provide them; consumers
-// must not infer a matrix from image dimensions.
+// Copies standardized AVFrame color fields and HDR side data. Unspecified
+// YUV range/matrix/chroma location use the pipeline defaults (limited,
+// BT.709, centered); transfer and primaries remain UNKNOWN when absent.
 KopawColorMetadata color_metadata_from_av_frame(const AVFrame* frame);
 
 }  // namespace kopaw

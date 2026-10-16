@@ -54,21 +54,41 @@ enum AVPixelFormat VideoDecoderNode::get_hw_format(AVCodecContext* ctx,
                       lst.c_str());
     }
     for (const enum AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == self->hw_.hw_pix_fmt) return *p;
+        if (*p == self->hw_.hw_pix_fmt) {
+            self->hw_format_selected_ = true;
+            return *p;
+        }
     }
-    // 运行期优雅回退：解码器可能在 hw 初始化失败后以纯软格式列表重新协商
-    // （老编码/驱动常见）。接受首个软格式，并动态关闭硬解帧路径。
-    KOP_LOG_WARN(kTag, "硬解协商失败（%s），运行期回退软解", self->hw_.name.c_str());
+    // 运行期优雅回退：解码器可能在 hw 初始化失败后重新协商。不能
+    // 返回 fmts[0]，因为某些 FFmpeg/驱动会把另一种硬格式排在首位；
+    // 否则后续帧会被误当成目标 hw surface，最终表现为回传或 YCbCr 失败。
+    for (const enum AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p) {
+        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            KOP_LOG_WARN(kTag, "硬解协商失败（%s），选择软件格式 %s",
+                         self->hw_.name.c_str(), av_get_pix_fmt_name(*p));
+            self->hw_active_ = false;
+            self->hw_format_selected_ = false;
+            return *p;
+        }
+    }
+    KOP_LOG_ERROR(kTag, "硬解协商失败（%s），没有可用软件格式",
+                  self->hw_.name.c_str());
     self->hw_active_ = false;
-    return fmts[0];
+    self->hw_format_selected_ = false;
+    return AV_PIX_FMT_NONE;
 }
 
 bool VideoDecoderNode::open(AVCodecParameters* params, std::string* error) {
+    hw_active_ = false;
+    hw_format_selected_ = false;
+    hardware_frame_logged_ = false;
     // 硬解探测：成功则先试硬解，打开失败自动回退软解
     if (hw_probe(params->codec_id, &hw_)) {
         if (open_context(params, true, error)) {
             hw_active_ = true;
-            KOP_LOG_INFO(kTag, "视频硬解后端已初始化：%s", hw_.name.c_str());
+            KOP_LOG_INFO(kTag, "视频硬解上下文已初始化：%s（codec=%s）",
+                         hw_.name.c_str(), avcodec_get_name(params->codec_id));
             return true;
         }
         KOP_LOG_WARN(kTag, "硬解打开失败（%s），回退软解", error->c_str());
@@ -78,7 +98,9 @@ bool VideoDecoderNode::open(AVCodecParameters* params, std::string* error) {
     }
     if (!open_context(params, false, error)) return false;
     hw_active_ = false;
-    KOP_LOG_INFO(kTag, "视频软解已启用");
+    hw_format_selected_ = false;
+    KOP_LOG_INFO(kTag, "视频软解已启用（codec=%s）",
+                 avcodec_get_name(params->codec_id));
     return true;
 }
 
@@ -170,13 +192,14 @@ int32_t VideoDecoderNode::emit_converted(AVFrame* frame) {
 }
 
 int32_t VideoDecoderNode::decode_frame_to_rgba(AVFrame* raw) {
-    if (hw_active_ && raw->format == hw_.hw_pix_fmt &&
-        !hardware_frame_logged_) {
+    const bool hardware_frame = hw_active_ && hw_format_selected_ &&
+                                 raw->format == hw_.hw_pix_fmt;
+    if (hardware_frame && !hardware_frame_logged_) {
         hardware_frame_logged_ = true;
         KOP_LOG_INFO(kTag, "硬解实际生效：输出格式=%s",
                      av_get_pix_fmt_name(static_cast<AVPixelFormat>(raw->format)));
     }
-    if (!hw_active_ || raw->format != hw_.hw_pix_fmt) {
+    if (!hardware_frame) {
         return emit_converted(raw);
     }
     // P2 硬解零拷贝：优先原生 DMA-BUF 导出（VAAPI），失败回退拉回路径

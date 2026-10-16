@@ -191,7 +191,7 @@ int64_t parse_bitrate(const std::string& text) {
 void usage() {
     fprintf(stderr,
             "用法: kopaw-transcode <输入> <输出> [选项]\n"
-            "  --vc copy|编码器       视频流复制或编码（如 mpeg4）\n"
+            "  --vc copy|编码器       视频流复制或编码（av1|vp9|hevc|h264 或 FFmpeg 名称）\n"
             "  --ac copy|编码器       音频流复制或编码（如 aac）\n"
             "  --filter SPEC          video:<链> 或 audio:<链>，可重复\n"
             "  --vb RATE              视频码率（如 2M）\n"
@@ -423,13 +423,45 @@ bool choose_channel_layout(const AVCodec* codec, const kopaw::compat::ChannelLay
     return kopaw::compat::channel_layout_copy(selected, &layouts[0]) >= 0;
 }
 
+const AVCodec* find_video_encoder(const std::string& requested,
+                                  std::string* resolved) {
+    if (const AVCodec* codec = avcodec_find_encoder_by_name(requested.c_str())) {
+        if (resolved) *resolved = requested;
+        return codec;
+    }
+    // Stable codec aliases keep the CLI portable across FFmpeg builds. The
+    // decoder side uses AVCodecID and already covers AV1/VP9 automatically.
+    const std::vector<std::string> candidates =
+        requested == "av1"   ? std::vector<std::string>{"libsvtav1", "libaom-av1", "av1"}
+        : requested == "vp9" ? std::vector<std::string>{"libvpx-vp9", "vp9"}
+        : requested == "hevc" ? std::vector<std::string>{"libx265", "hevc"}
+        : requested == "h264" || requested == "avc"
+            ? std::vector<std::string>{"libx264", "h264"}
+            : std::vector<std::string>{};
+    for (const auto& candidate : candidates) {
+        if (const AVCodec* codec = avcodec_find_encoder_by_name(candidate.c_str())) {
+            if (resolved) *resolved = candidate;
+            return codec;
+        }
+    }
+    return nullptr;
+}
+
 bool create_encoder(StreamCtx* stream, AVFrame* format_frame, AVFormatContext* output,
                     const Options& options, std::string* error) {
     if (!stream || !format_frame || !output || stream->enc) return stream && stream->enc;
-    const AVCodec* codec = avcodec_find_encoder_by_name(stream->codec_name.c_str());
+    std::string resolved_name;
+    const AVCodec* codec = stream->video
+                               ? find_video_encoder(stream->codec_name, &resolved_name)
+                               : avcodec_find_encoder_by_name(stream->codec_name.c_str());
     if (!codec) {
         if (error) *error = "找不到编码器: " + stream->codec_name;
         return false;
+    }
+    if (stream->video && resolved_name != stream->codec_name) {
+        KOP_LOG_INFO(kTag, "视频编码器别名 %s -> %s", stream->codec_name.c_str(),
+                     resolved_name.c_str());
+        stream->codec_name = resolved_name;
     }
     stream->enc = avcodec_alloc_context3(codec);
     if (!stream->enc) {

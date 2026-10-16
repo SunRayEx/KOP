@@ -16,7 +16,10 @@ uint32_t map_range(AVColorRange range) {
         case AVCOL_RANGE_JPEG:
             return KOPAW_COLOR_RANGE_FULL;
         default:
-            return KOPAW_COLOR_RANGE_UNKNOWN;
+            // Unspecified YUV video is conventionally limited range. Keeping
+            // this explicit lets Vulkan YCbCr import proceed for streams that
+            // omit container color tags; HDR transfer metadata remains unknown.
+            return KOPAW_COLOR_RANGE_LIMITED;
     }
 }
 
@@ -34,7 +37,9 @@ uint32_t map_matrix(AVColorSpace colorspace) {
         case AVCOL_SPC_BT2020_CL:
             return KOPAW_COLOR_MATRIX_BT2020_CL;
         default:
-            return KOPAW_COLOR_MATRIX_UNKNOWN;
+            // BT.709 is the conservative default for an untagged HD stream.
+            // Callers with explicit codec/container metadata still retain it.
+            return KOPAW_COLOR_MATRIX_BT709;
     }
 }
 
@@ -90,7 +95,9 @@ uint32_t map_chroma_location(AVChromaLocation location) {
         case AVCHROMA_LOC_BOTTOM:
             return KOPAW_CHROMA_LOCATION_BOTTOM;
         default:
-            return KOPAW_CHROMA_LOCATION_UNKNOWN;
+            // Most 4:2:0 decoders use centered chroma when no location is
+            // signalled. This is required to select a Vulkan sampler mode.
+            return KOPAW_CHROMA_LOCATION_CENTER;
     }
 }
 
